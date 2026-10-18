@@ -71,6 +71,10 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "InklingAudioConfig": "vllm.models.inkling.configs",
     "InklingVisionConfig": "vllm.models.inkling.configs",
     "InklingMMConfig": "vllm.models.inkling.configs",
+    "NemotronASRConfig": "vllm.models.nemotron_asr.configuration_nemotron_asr",
+    "NemotronCardServingConfig": (
+        "vllm.models.nemotron_asr.configuration_nemotron_asr"
+    ),
     # Upstream Transformers classes registered in _CONFIG_REGISTRY
     "DeepseekV3Config": "transformers",
     "HyperCLOVAXConfig": "transformers",
@@ -134,6 +138,8 @@ __all__ = [
     "InklingAudioConfig",
     "InklingVisionConfig",
     "InklingMMConfig",
+    "NemotronASRConfig",
+    "NemotronCardServingConfig",
 ]
 
 

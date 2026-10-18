@@ -1190,6 +1190,10 @@ _MULTIMODAL_EXAMPLE_MODELS = {
         "nvidia/Llama-3.1-Nemotron-Nano-VL-8B-V1",
         trust_remote_code=True,
     ),
+    "Nemotron3_5AsrForRNNT": _HfExamplesInfo(
+        "nvidia/nemotron-3.5-asr-streaming-0.6b",
+        dtype="float32",
+    ),
     "NemotronH_Nano_VL_V2": _HfExamplesInfo(
         "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16",
         max_model_len=4096,
