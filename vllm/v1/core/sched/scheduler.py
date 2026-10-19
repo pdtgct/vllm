@@ -39,7 +39,11 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
-from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+from vllm.v1.core.sched.interface import (
+    AddRequestDisposition,
+    PauseState,
+    SchedulerInterface,
+)
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
@@ -55,7 +59,15 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.core.state_slot_manager import StateSlotRetirement, validate_state_config
-from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.core.stream_admission import StreamAdmissionConfig, StreamAdmissions
+from vllm.v1.engine import (
+    EngineCoreEventType,
+    EngineCoreOutput,
+    EngineCoreOutputs,
+    FinishReason,
+    StreamOutput,
+    StreamUpdateRejection,
+)
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
@@ -470,6 +482,20 @@ class Scheduler(SchedulerInterface):
             else None
         )
         self.return_sampling_mask = vllm_config.model_config.return_sampling_mask
+        self.stream_admissions = (
+            StreamAdmissions(
+                self,
+                StreamAdmissionConfig(
+                    **(
+                        vllm_config.additional_config.get("stream_admission", {})
+                        if isinstance(vllm_config.additional_config, dict)
+                        else {}
+                    )
+                ),
+            )
+            if self.has_state_slots
+            else None
+        )
 
         self._pause_state: PauseState = PauseState.UNPAUSED
 
@@ -633,6 +659,8 @@ class Scheduler(SchedulerInterface):
         return max(num_new_tokens, 0)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        if self.stream_admissions is not None:
+            self.stream_admissions.expire()
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -1785,7 +1813,7 @@ class Scheduler(SchedulerInterface):
         Discards the last sampled output token from the prior input chunk.
         """
         # Keep all output tokens but the final sampled one.
-        keep_end = session.num_tokens - 1
+        keep_end = session.num_tokens - 1 if session.num_tokens else 0
         assert keep_end >= session.num_computed_tokens
         kept_output_tokens = session._all_token_ids[
             session.num_prompt_tokens : keep_end
@@ -2188,7 +2216,7 @@ class Scheduler(SchedulerInterface):
             perf_stats = self.perf_metrics.get_step_perf_stats_per_gpu(scheduler_output)
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
-        if self.has_state_slots:
+        if self.state_error_outputs:
             for client_index, error_output in self.state_error_outputs:
                 outputs[client_index].append(error_output)
             self.state_error_outputs.clear()
@@ -2415,6 +2443,11 @@ class Scheduler(SchedulerInterface):
                 outputs[request.client_index].append(
                     EngineCoreOutput(
                         request_id=req_id,
+                        stream_output=(
+                            StreamOutput(request.stream_admission)
+                            if request.stream_admission is not None
+                            else None
+                        ),
                         new_token_ids=new_token_ids,
                         finish_reason=finish_reason,
                         new_logprobs=new_logprobs,
@@ -2474,6 +2507,11 @@ class Scheduler(SchedulerInterface):
                         request_id=request.request_id,
                         new_token_ids=[],
                         finish_reason=request.get_finished_reason(),
+                        stream_output=(
+                            StreamOutput(request.stream_admission)
+                            if request.stream_admission is not None
+                            else None
+                        ),
                         events=request.take_events(),
                         trace_headers=request.trace_headers,
                     )
@@ -2640,6 +2678,8 @@ class Scheduler(SchedulerInterface):
         else:
             request.status = RequestStatus.WAITING_FOR_STREAMING_REQ
             self.num_waiting_for_streaming_input += 1
+            if self.stream_admissions is not None:
+                self.stream_admissions.park(request.request_id)
 
         return False
 
@@ -2768,7 +2808,16 @@ class Scheduler(SchedulerInterface):
     def has_request(self, request_id: str) -> bool:
         return request_id in self.requests
 
-    def add_request(self, request: Request) -> None:
+    def add_request(self, request: Request) -> AddRequestDisposition:
+        rejection: StreamUpdateRejection | None = None
+        if self.stream_admissions is not None:
+            self.stream_admissions.expire()
+            rejection = self.stream_admissions.accept_update(request)
+        elif request.stream_admission is not None:
+            rejection = "unsupported_admission"
+        if rejection is not None:
+            self._queue_state_error(request, rejection)
+            return AddRequestDisposition.REJECTED
         existing = self.requests.get(request.request_id)
         if existing is not None:
             update = StreamingUpdate.from_request(request)
@@ -2800,6 +2849,8 @@ class Scheduler(SchedulerInterface):
                     self._set_kv_fetch_stage(request, KV_FETCH_WAITING_TO_START)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
+
+        return AddRequestDisposition.ACCEPTED
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
@@ -2901,6 +2952,8 @@ class Scheduler(SchedulerInterface):
     def _free_blocks(self, request: Request):
         assert request.is_finished()
         self._free_request_blocks(request)
+        if self.stream_admissions is not None:
+            self.stream_admissions.finish(request.request_id)
         del self.requests[request.request_id]
 
     @property
@@ -3024,14 +3077,25 @@ class Scheduler(SchedulerInterface):
             for request in self.finish_requests(failed, RequestStatus.FINISHED_ERROR):
                 self._queue_state_error(request)
 
-    def _queue_state_error(self, request: Request) -> None:
+    def _queue_state_error(
+        self, request: Request, rejection: StreamUpdateRejection | None = None
+    ) -> None:
         self.state_error_outputs.append(
             (
                 request.client_index,
                 EngineCoreOutput(
                     request_id=request.request_id,
                     new_token_ids=[],
-                    finish_reason=request.get_finished_reason(),
+                    finish_reason=(
+                        FinishReason.ERROR
+                        if rejection
+                        else request.get_finished_reason()
+                    ),
+                    stream_output=(
+                        StreamOutput(request.stream_admission, rejection)
+                        if request.stream_admission is not None or rejection is not None
+                        else None
+                    ),
                     events=request.take_events(),
                     trace_headers=request.trace_headers,
                 ),
@@ -3049,6 +3113,8 @@ class Scheduler(SchedulerInterface):
         return num_waiting + num_running
 
     def has_finished_requests(self) -> bool:
+        if self.state_error_outputs:
+            return True
         if self.has_state_slots and self.state_retirements:
             return True
         if self.finished_req_ids:
@@ -3196,6 +3262,19 @@ class Scheduler(SchedulerInterface):
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
             ec_connector_stats=ec_connector_stats_payload,
+            stream_occupied=(
+                self.stream_admissions.occupied() if self.stream_admissions else None
+            ),
+            stream_refusals=(
+                dict(self.stream_admissions.refusals)
+                if self.stream_admissions
+                else None
+            ),
+            stream_expiries=(
+                dict(self.stream_admissions.expiries)
+                if self.stream_admissions
+                else None
+            ),
         )
 
     def make_spec_decoding_stats(

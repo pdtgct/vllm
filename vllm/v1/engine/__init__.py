@@ -110,6 +110,54 @@ class EngineCoreReadyResponse:
     coordinator_output_address: str | None = None
 
 
+class StreamAdmissionId(msgspec.Struct, frozen=True):  # type: ignore[call-arg]
+    """Server-issued owner epoch and sequence within its replay window."""
+
+    owner_epoch: str
+    sequence: int
+
+
+StreamAdmissionStatus = Literal[
+    "never_fed", "live", "parked", "draining", "awaiting_fence", "finished", "refused"
+]
+StreamAdmissionReason = Literal[
+    "owner_epoch", "expired_id", "request_id_in_use", "capacity", "active_limit"
+]
+StreamUpdateRejection = Literal[
+    "unknown_admission",
+    "identity_mismatch",
+    "input_closed",
+    "empty_update",
+    "unsupported_admission",
+    "preprocessing_error",
+    "shutdown",
+    "mm_cache_miss",
+    "engine_paused",
+    "validation_error",
+]
+
+
+class StreamAdmissionContext(msgspec.Struct, frozen=True):  # type: ignore[call-arg]
+    owner: str
+    admission_id: StreamAdmissionId
+    input_closed: bool = False
+
+
+class StreamOutput(msgspec.Struct, frozen=True, array_like=True):  # type: ignore[call-arg]
+    """Admission identity and optional ADD rejection, distinct from session end."""
+
+    context: StreamAdmissionContext | None
+    rejection: StreamUpdateRejection | None = None
+
+
+class StreamAdmissionResult(msgspec.Struct, frozen=True):  # type: ignore[call-arg]
+    accepted: bool
+    request_id: str
+    status: StreamAdmissionStatus
+    reason: StreamAdmissionReason | None = None
+    replay_floor: int = 0
+
+
 class EngineCoreRequest(
     msgspec.Struct,
     array_like=True,  # type: ignore[call-arg]
@@ -163,6 +211,7 @@ class EngineCoreRequest(
 
     session_id: str | None = None
     kv_hints: KvHintsEnvelope | None = None
+    stream_admission: StreamAdmissionContext | None = None
 
     @property
     def params(self) -> SamplingParams | PoolingParams:
@@ -245,6 +294,9 @@ class EngineCoreOutput(
 
     # Sent with FinishReason.ERROR, e.g. when a paused engine rejects a request.
     error: RequestError | None = None
+
+    # One trailing nil byte on ordinary array-like outputs.
+    stream_output: StreamOutput | None = None
 
     @property
     def finished(self) -> bool:
