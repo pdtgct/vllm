@@ -21,6 +21,7 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.encoder_runner import EncoderRunner
+from vllm.v1.worker.gpu.state_slots import StateSlotBindings
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -55,6 +56,7 @@ class ModelState(ABC):
         self.scheduler_config = vllm_config.scheduler_config
         self.model = model
         self.device = device
+        self.state_slots: StateSlotBindings | None = None
 
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
@@ -126,6 +128,10 @@ class ModelState(ABC):
 
     def apply_staged_writes(self) -> None:
         return None
+
+    def initialize_state_slots(self, bindings: StateSlotBindings) -> None:
+        """Bind session views; models register every auxiliary state-writing stream."""
+        self.state_slots = bindings
 
     def initialize_kv_cache(
         self, kv_cache_config: KVCacheConfig, block_tables: BlockTables
