@@ -481,3 +481,53 @@ def test_failure_reporting_requires_a_live_scheduled_request():
     with pytest.raises(ValueError, match="outside"):
         slots.fail_requests({"unknown"})
     assert not slots._completion.failed_req_ids
+
+
+@pytest.mark.nemotron_gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("new_request", [False, True])
+def test_cuda_state_consumer_preparation_has_no_host_sync(new_request):
+    """Real GPU bindings and input IDs use the scheduler's host token slice.
+
+    This covers preparation, not forward/commit-status or output-fence waits.
+    """
+    state = _state()
+    state.device = torch.device("cuda")
+    spec = build_nemotron_persistent_state_spec(_config())
+    slots = StateSlotBindings(
+        [KVCacheGroupSpec(["state"], spec)],
+        {
+            "state": torch.zeros(
+                3 * spec.page_size_bytes, dtype=torch.uint8, device="cuda"
+            )
+        },
+    )
+    state.initialize_state_slots(slots)
+    step = SchedulerOutput.make_empty()
+    step.state_step_seq = 1
+    step.state_slot_handles = {"left": {"state": StateSlotHandle("epoch", 1, 1)}}
+    step.num_scheduled_tokens = {"left": 1}
+    step.scheduled_cached_reqs.req_ids = ["left"]
+    step.scheduled_cached_reqs.new_token_ids = [[4]]
+    _metadata(state, ("left",))
+    if new_request:
+        step.scheduled_cached_reqs.req_ids = []
+        step.scheduled_cached_reqs.new_token_ids = []
+        step.scheduled_new_reqs = [
+            replace(state._metadata["left"], prefill_token_ids=[4])
+        ]
+    batch = _input(("left",), (4,))
+    batch.input_ids = batch.input_ids.cuda()
+    torch.cuda.synchronize()
+    previous = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        slots.begin_step(step, torch.cuda.current_stream())
+        slots.activate_requests()
+        state.prepare_step(step, dummy_run=False, is_profile=False)
+        snapshot = state.prepare_inputs(batch, object())["persistent_state_projection"]
+        snapshot.state_batch.access.validate_current()
+        assert snapshot.token_ids == (4,)
+        assert snapshot.state_batch.pools.predictor_h.is_cuda
+    finally:
+        torch.cuda.set_sync_debug_mode(previous)
