@@ -753,6 +753,43 @@ def test_prec028_test_installation_restored_after_failure():
     assert torch.bmm is before_bmm
 
 
+def test_prec028_core_initializer_side_effects_restored(monkeypatch):
+    """@spec PORT-PREC-028: core's compiler/NCCL pins cannot leak between tests."""
+    import os
+
+    from torch._inductor import config as inductor_config
+
+    from tests.models.nemotron_asr.conftest import preserve_batch_invariance
+    from vllm.model_executor.determinism import batch_invariant, batch_invariant_configs
+    from vllm.utils import nccl
+
+    monkeypatch.setattr(nccl, "_nccl_has_no_cache", lambda: True)
+    monkeypatch.setattr(nccl, "_unpinned_env", None)
+    monkeypatch.setattr(inductor_config, "batch_invariant", False)
+    env_keys = (
+        "VLLM_CUSTOM_ALLREDUCE_ALGO",
+        "VLLM_ROCM_USE_SKINNY_GEMM",
+        "NCCL_NO_CACHE",
+    )
+    before_env = {key: os.environ.get(key) for key in env_keys}
+    before_sizes = batch_invariant._BLOCK_SIZES_RESOLVED
+    before_sms = batch_invariant._NUM_SMS
+    with (
+        pytest.raises(RuntimeError, match="partial initialization"),
+        preserve_batch_invariance(batch_invariant, batch_invariant_configs),
+    ):
+        batch_invariant.override_envs_for_invariance()
+        assert inductor_config.batch_invariant
+        batch_invariant._BLOCK_SIZES_RESOLVED = not before_sizes
+        batch_invariant._NUM_SMS = before_sms + 1
+        raise RuntimeError("partial initialization")
+    assert not inductor_config.batch_invariant
+    assert nccl._unpinned_env is None
+    assert before_sizes == batch_invariant._BLOCK_SIZES_RESOLVED
+    assert before_sms == batch_invariant._NUM_SMS
+    assert {key: os.environ.get(key) for key in env_keys} == before_env
+
+
 def _packet_arms():
     from batch_invariant_packet import fingerprint_sha256
 

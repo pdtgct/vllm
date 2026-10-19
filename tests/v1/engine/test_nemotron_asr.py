@@ -3,7 +3,8 @@
 """Checkpoint-backed, in-process CUDA smoke for core persistent ASR state.
 
 Feed the existing seven-field envelope at EngineCore's processed-MM boundary.
-This exercises no tokenizer, realtime transport, segmenter, or transcript decoder.
+Startup initializes the tokenizer for multimodal profiling. Requests bypass text
+tokenization, realtime transport, the segmenter, and the transcript decoder.
 """
 
 import time
@@ -12,6 +13,35 @@ import pytest
 import torch
 
 from tests.utils import create_new_process_for_each_test
+
+
+def _engine_args(model="nvidia/nemotron-3.5-asr-streaming-0.6b"):
+    from vllm.engine.arg_utils import EngineArgs
+
+    return EngineArgs(
+        model=model,
+        dtype="float32",
+        enforce_eager=True,
+        enable_prefix_caching=False,
+        async_scheduling=False,
+        enable_chunked_prefill=False,
+        enable_cumem_allocator=False,
+        skip_tokenizer_init=False,
+        max_model_len=256,
+        max_num_seqs=2,
+        max_num_batched_tokens=256,
+        num_gpu_blocks_override=3,  # Null block plus exactly two live slots.
+        gpu_memory_utilization=0.8,
+        distributed_executor_backend="uni",
+        additional_config={
+            "stream_admission": {
+                "never_fed_timeout": 600.0,
+                "parked_idle_timeout": 600.0,
+                "draining_timeout": 600.0,
+            }
+        },
+    )
+
 
 pytestmark = [
     pytest.mark.nemotron_gpu,
@@ -25,7 +55,6 @@ def test_nemotron_engine_stream_lifecycle(monkeypatch):
     from transformers import BatchFeature
 
     from vllm import SamplingParams
-    from vllm.engine.arg_utils import EngineArgs
     from vllm.models.nemotron_asr.manifests import (
         ADMISSION_EPOCH_MODULUS_MS,
         CADENCES,
@@ -50,29 +79,7 @@ def test_nemotron_engine_stream_lifecycle(monkeypatch):
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
-    config = EngineArgs(
-        model="nvidia/nemotron-3.5-asr-streaming-0.6b",
-        dtype="float32",
-        enforce_eager=True,
-        enable_prefix_caching=False,
-        async_scheduling=False,
-        enable_chunked_prefill=False,
-        enable_cumem_allocator=False,
-        skip_tokenizer_init=True,
-        max_model_len=256,
-        max_num_seqs=2,
-        max_num_batched_tokens=256,
-        num_gpu_blocks_override=3,  # Null block plus exactly two live slots.
-        gpu_memory_utilization=0.8,
-        distributed_executor_backend="uni",
-        additional_config={
-            "stream_admission": {
-                "never_fed_timeout": 600.0,
-                "parked_idle_timeout": 600.0,
-                "draining_timeout": 600.0,
-            }
-        },
-    ).create_engine_config()
+    config = _engine_args().create_engine_config()
     assert config.use_v2_model_runner
     core = EngineCore(config, UniProcExecutor, log_stats=False)
     try:
