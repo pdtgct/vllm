@@ -1812,6 +1812,39 @@ class Scheduler(SchedulerInterface):
 
         Discards the last sampled output token from the prior input chunk.
         """
+        if self.has_state_slots:
+            if session.status not in (
+                RequestStatus.WAITING_FOR_STREAMING_REQ,
+                RequestStatus.FINISHED_STOPPED,
+            ):
+                raise ValueError("state stream replacement requires a legal park")
+            prompt = list(update.prompt_token_ids or ())
+            for feature in update.mm_features or ():
+                if not 0 <= feature.mm_position.offset < len(prompt):
+                    raise ValueError(
+                        "multimodal position is outside replacement prompt"
+                    )
+            self.encoder_cache_manager.free(session)
+            session.prompt_token_ids = prompt
+            session._all_token_ids[:] = prompt
+            session._output_token_ids.clear()
+            session.num_computed_tokens = 0
+            session.num_prompt_tokens = len(prompt)
+            session.prompt_embeds = None
+            session.prompt_is_token_ids = None
+            session.mm_features = list(update.mm_features or ())
+            session.block_hashes.clear()
+            session.update_block_hashes()
+            session.stop_reason = None
+            session.arrival_time = update.arrival_time
+            session.sampling_params = update.sampling_params
+            session.max_tokens = update.max_tokens
+            if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+                self.num_waiting_for_streaming_input -= 1
+            session.status = RequestStatus.WAITING
+            if self.log_stats:
+                session.record_event(EngineCoreEventType.QUEUED)
+            return
         # Keep all output tokens but the final sampled one.
         keep_end = session.num_tokens - 1 if session.num_tokens else 0
         assert keep_end >= session.num_computed_tokens
@@ -1871,12 +1904,15 @@ class Scheduler(SchedulerInterface):
             # NOTE: In PP+async scheduling, we consume token ids via a direct GPU
             # broadcast path (`input_batch.prev_sampled_token_ids`), so we can
             # omit this payload.
-            if self.use_pp and not self.scheduler_config.async_scheduling:
+            if self.has_state_slots or (
+                self.use_pp and not self.scheduler_config.async_scheduling
+            ):
                 # When using PP, the scheduler sends the sampled tokens back,
                 # because there's no direct communication between the first-
                 # stage worker and the last-stage worker. Otherwise, we don't
                 # need to send the sampled tokens back because the model runner
-                # will cache them.
+                # will cache them. State consumers also need the host slice
+                # for row planning without reading device input buffers.
                 num_tokens = num_scheduled_tokens[req_id] - len(
                     spec_decode_tokens.get(req_id, ())
                 )
@@ -2656,6 +2692,13 @@ class Scheduler(SchedulerInterface):
 
     def _handle_stopped_request(self, request: Request) -> bool:
         """Return True if finished (can be False for resumable requests)."""
+        # A state stream parks only at EOS; any other stop leaves model state
+        # mid-turn, so the stream ends instead of resuming.
+        if self.has_state_slots and (
+            request.status != RequestStatus.FINISHED_STOPPED
+            or request.stop_reason is not None
+        ):
+            request.resumable = False
         if not request.resumable:
             return True
 
@@ -3043,6 +3086,11 @@ class Scheduler(SchedulerInterface):
                 ):
                     with suppress(ValueError):
                         manager.complete(handle, completion.step_seq)
+                    if (
+                        req_id in completion.failed_req_ids
+                        and manager.get(req_id) == handle
+                    ):
+                        failed.add(req_id)
                 else:
                     with suppress(ValueError):
                         manager.quarantine(handle, scheduled.state_step_seq)

@@ -146,7 +146,10 @@ def can_initialize(
         return scheduler_kv_cache_config
 
     if model_arch == "Nemotron3_5AsrForRNNT":
-        pytest.skip("Nemotron ASR requires engine-managed persistent state")
+        pytest.skip(
+            "Nemotron ASR requires MRv2, eager execution and prefix caching off; "
+            "the generic initialization harness does not configure this profile"
+        )
 
     if model_arch == "MoonshotKimiaForCausalLM":
         pytest.skip(

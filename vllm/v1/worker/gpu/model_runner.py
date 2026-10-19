@@ -1032,6 +1032,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     def profile_run(self, randomize_inputs: bool = False) -> None:
+        prepare_memory = getattr(self.model, "prepare_execution_memory", None)
+        if prepare_memory is not None:
+            prepare_memory()
         if self.supports_mm_inputs and self.is_first_pp_rank:
             mm_config = self.model_config.multimodal_config
             if mm_config is not None and not mm_config.skip_mm_profiling:
@@ -1780,6 +1783,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ) -> AsyncModelRunnerOutput | ModelRunnerOutput | IntermediateTensors | None:
+        if self.state_slots is not None or getattr(
+            getattr(self, "model", None), "supports_persistent_state", False
+        ):
+            self.model_state.prepare_step(
+                scheduler_output, dummy_run=dummy_run, is_profile=is_profile
+            )
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()

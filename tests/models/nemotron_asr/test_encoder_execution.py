@@ -2527,7 +2527,6 @@ def test_exact_chunk_inventory_replaces_encoder_cell_and_requires_atomic_publica
 ):
     import json
 
-    pytest.importorskip("vllm.models.nemotron_asr.profile_execution")
     from vllm.models.nemotron_asr.chunk_bucket_graph import ExactChunkGraphBinding
 
     monkeypatch.setattr(

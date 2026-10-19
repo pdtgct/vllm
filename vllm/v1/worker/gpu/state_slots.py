@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Bounded session views and the state-write completion contract."""
 
+from collections.abc import Mapping
 from copy import copy, deepcopy
+from dataclasses import dataclass, replace
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 import torch
@@ -79,10 +82,60 @@ class StateSlotViews:
         self._epoch = handle.engine_epoch
         self._owners[handle.slot] = (request_id, handle)
 
-    def view(self, request_id: str, handle: StateSlotHandle) -> dict[str, torch.Tensor]:
+    def validate_handle(self, request_id: str, handle: StateSlotHandle) -> None:
         if self._owners.get(handle.slot) != (request_id, handle):
             raise ValueError("Stale state slot handle")
+
+    def view(self, request_id: str, handle: StateSlotHandle) -> dict[str, torch.Tensor]:
+        self.validate_handle(request_id, handle)
         return {name: tensor[handle.slot] for name, tensor in self._views.items()}
+
+
+@dataclass(frozen=True)
+class StateSlotRows:
+    """Step-scoped resident pools for trusted model execution.
+
+    Consumers must validate again before commit and write only the bound slots
+    on the runner stream or a registered writing stream. Retained tensors are
+    not revocable capabilities.
+    """
+
+    _bindings: "StateSlotBindings"
+    _step_id: object
+    layer: str
+    step_seq: int
+    request_ids: tuple[str, ...]
+    handles: tuple[StateSlotHandle, ...]
+
+    @property
+    def slot_indices_cpu(self) -> tuple[int, ...]:
+        return tuple(handle.slot for handle in self.handles)
+
+    def validate_current(self) -> None:
+        slots = self._bindings
+        completion = slots._completion
+        if (
+            completion is None
+            or slots._cleaning_up
+            or slots._step_id is not self._step_id
+            or completion.step_seq != self.step_seq
+        ):
+            raise ValueError("Stale state step access")
+        slots._validate_rows(self.layer, self.request_ids, self.handles)
+
+    @property
+    def spec(self) -> PersistentStateSpec:
+        self.validate_current()
+        return self._bindings.views[self.layer].spec
+
+    @property
+    def component_pools(self) -> Mapping[str, torch.Tensor]:
+        self.validate_current()
+        return MappingProxyType(self._bindings.views[self.layer]._views)
+
+    @property
+    def views(self) -> Mapping[str, torch.Tensor]:
+        return self.component_pools
 
 
 class StateSlotBindings:
@@ -100,6 +153,48 @@ class StateSlotBindings:
         self._completion: StateCompletion | None = None
         self._main_stream: torch.cuda.Stream | None = None
         self._cleaning_up = False
+        self._step_id: object | None = None
+
+    def _validate_rows(
+        self,
+        layer: str,
+        request_ids: tuple[str, ...],
+        handles: tuple[StateSlotHandle, ...],
+    ) -> None:
+        if self._completion is None or self._cleaning_up:
+            raise ValueError("No live state step is active")
+        if layer not in self.views:
+            raise ValueError("Unknown state group")
+        if (
+            not request_ids
+            or len(request_ids) != len(handles)
+            or len(set(request_ids)) != len(request_ids)
+            or len({handle.slot for handle in handles}) != len(handles)
+        ):
+            raise ValueError("State rows must have distinct requests and slots")
+        views = self.views[layer]
+        for request_id, handle in zip(request_ids, handles):
+            if (
+                not 0 < handle.slot < views.capacity
+                or handle.generation <= 0
+                or self._completion.handles.get(request_id, {}).get(layer) != handle
+            ):
+                raise ValueError("Stale or invalid state row handle/order")
+            views.validate_handle(request_id, handle)
+
+    def bind_rows(
+        self,
+        layer: str,
+        ordered_request_ids: tuple[str, ...],
+        expected_handles: tuple[StateSlotHandle, ...],
+    ) -> StateSlotRows:
+        """Validate full handles before exposing resident component pools."""
+        request_ids, handles = tuple(ordered_request_ids), tuple(expected_handles)
+        self._validate_rows(layer, request_ids, handles)
+        assert self._completion is not None and self._step_id is not None
+        return StateSlotRows(
+            self, self._step_id, layer, self._completion.step_seq, request_ids, handles
+        )
 
     def register_writing_stream(self, stream: torch.cuda.Stream) -> None:
         """Register a stream before enqueueing writes outside the runner stream."""
@@ -130,6 +225,7 @@ class StateSlotBindings:
         for stream in self._streams:
             stream.wait_stream(main_stream)
         self._main_stream = main_stream
+        self._step_id = object()
         self._completion = StateCompletion(
             scheduled.state_step_seq,
             deepcopy(live),
@@ -148,6 +244,17 @@ class StateSlotBindings:
             return self._completion.cleanup_handles[request_id][layer_name]
         return self._completion.handles[request_id][layer_name]
 
+    def fail_requests(self, request_ids: set[str]) -> None:
+        """Report model failures with the same fence and handle identity as writes."""
+        if self._completion is None or self._cleaning_up:
+            raise ValueError("No live state step is active")
+        if not request_ids <= self._completion.handles.keys():
+            raise ValueError("Failed request is outside the active state step")
+        self._completion = replace(
+            self._completion,
+            failed_req_ids=self._completion.failed_req_ids.union(request_ids),
+        )
+
     def finish_step(
         self,
         output: AsyncModelRunnerOutput | ModelRunnerOutput,
@@ -161,6 +268,7 @@ class StateSlotBindings:
         event.record(main_stream)
         result = StateCompletionOutput(output, event, self._completion)
         self._completion = None
+        self._step_id = None
         self._main_stream = None
         return result
 

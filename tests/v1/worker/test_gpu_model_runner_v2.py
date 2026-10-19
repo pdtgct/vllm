@@ -530,6 +530,71 @@ def test_state_only_cache_reaches_mrv2_initialization(monkeypatch):
         allocator.complete(a, 10)
 
 
+def test_state_slot_rows_validate_step_handles_and_alias_resident_pools(monkeypatch):
+    from dataclasses import replace
+
+    from tests.v1.core.utils import create_state_spec
+    from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec, StateSlotHandle
+    from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
+    from vllm.v1.worker.gpu.state_slots import StateSlotBindings
+
+    spec = create_state_spec()
+    raw = torch.zeros(4 * spec.page_size_bytes, dtype=torch.uint8)
+    slots = StateSlotBindings([KVCacheGroupSpec(["state"], spec)], {"state": raw})
+    main = SimpleNamespace(wait_stream=lambda _: None)
+    step = SchedulerOutput.make_empty()
+    step.state_step_seq = 1
+    a, b = (StateSlotHandle("epoch", i, 1) for i in (1, 3))
+    step.state_slot_handles = {"a": {"state": a}, "b": {"state": b}}
+    with pytest.raises(ValueError, match="live"):
+        slots.bind_rows("state", ("b", "a"), (b, a))
+    slots.begin_step(step, main)
+    with pytest.raises(ValueError, match="live"):
+        slots.bind_rows("state", ("b", "a"), (b, a))
+    slots.activate_requests()
+    access = slots.bind_rows("state", ("b", "a"), (b, a))
+    assert access.step_seq == 1 and access.slot_indices_cpu == (3, 1)
+    pools = access.component_pools
+    assert pools["hidden"].untyped_storage() == raw.untyped_storage()
+    assert pools["hidden"].shape == (4, 4)
+    pools["hidden"][3].fill_(19)
+    assert torch.all(slots.views["state"].view("b", b)["hidden"] == 19)
+    assert torch.all(pools["hidden"][1] == 1)
+    assert torch.all(pools["hidden"][[0, 2]] == 0)
+    for ids, handles in [
+        (("a", "a"), (a, a)),
+        (("a", "b"), (b, a)),
+        (("a",), (replace(a, engine_epoch="old"),)),
+        (("a",), (replace(a, generation=2),)),
+        (("a",), (replace(a, slot=0),)),
+        (("a",), (replace(a, slot=4),)),
+        (("a", "b"), (a,)),
+    ]:
+        with pytest.raises(ValueError):
+            slots.bind_rows("state", ids, handles)
+    with pytest.raises(ValueError, match="group"):
+        slots.bind_rows("other", ("a",), (a,))
+    slots.fail_requests({"a"})
+    access.validate_current()  # Failure reporting does not invalidate the step.
+    monkeypatch.setattr(
+        torch.cuda, "Event", lambda **_: SimpleNamespace(record=lambda _: None)
+    )
+    slots.finish_step(EMPTY_MODEL_RUNNER_OUTPUT, main)
+    with pytest.raises(ValueError, match="Stale"):
+        access.validate_current()
+    slots.begin_step(step, main)  # Even a repeated sequence/handle is a new scope.
+    slots.activate_requests()
+    with pytest.raises(ValueError, match="Stale"):
+        access.validate_current()
+    fresh = slots.bind_rows("state", ("a",), (a,))
+    slots.views["state"].bind("replacement", replace(a, generation=2))
+    before = raw.clone()
+    with pytest.raises(ValueError, match="Stale"):
+        fresh.validate_current()
+    assert torch.equal(raw, before)
+
+
 def test_state_completion_waits_for_postprocess_and_registered_stream(monkeypatch):
     """Completion follows postprocessing and all state-writing streams."""
     from tests.v1.core.utils import create_state_spec
@@ -653,6 +718,7 @@ def test_zero_token_state_step_returns_completion(monkeypatch):
         finish_step=finish,
         activate_requests=lambda: None,
     )
+    runner.model_state = SimpleNamespace(prepare_step=lambda *args, **kwargs: None)
     runner.main_stream = object()
     for name in (
         "update_pp_decode_requests",
@@ -751,7 +817,9 @@ def test_state_cleanup_is_fenced_through_real_runner(monkeypatch, lose_ack):
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.state_slots = slots
     runner.main_stream = main
-    runner.model_state = SimpleNamespace(remove_request=remove)
+    runner.model_state = SimpleNamespace(
+        remove_request=remove, prepare_step=lambda *args, **kwargs: None
+    )
     runner.req_states = SimpleNamespace(remove_request=lambda _: 0)
     runner.lora_state = SimpleNamespace(remove_request=lambda _: None)
     runner.pooling_runner = runner.pp_handler = runner.encoder_cache = None
@@ -803,3 +871,162 @@ def test_state_cleanup_is_fenced_through_real_runner(monkeypatch, lose_ack):
     result = runner.execute_model(rebind).get_output()
     assert result.state_completion.handles == rebind.state_slot_handles
     assert events.count("cleanup") == 1
+
+
+def test_nemotron_core_admission_park_cleanup_and_slot_reuse(monkeypatch):
+    """Real core/runner lifecycle; CPU tensor writes stand in for GPU execution."""
+    from tests.models.nemotron_asr.test_persistent_model_state_v2 import (
+        _config,
+        _input,
+        _state,
+    )
+    from tests.v1.core.test_scheduler import (
+        _admit_stream,
+        _state_output,
+        _stream_chunk,
+        _stream_request,
+    )
+    from tests.v1.core.utils import create_scheduler
+    from vllm.model_executor.layers.state import PersistentStateLayerBase
+    from vllm.models.nemotron_asr.state_profile import (
+        build_nemotron_persistent_state_spec,
+    )
+    from vllm.v1.core.kv_cache_planning import get_kv_cache_configs
+    from vllm.v1.core.sched.scheduler import Scheduler
+    from vllm.v1.engine.core import EngineCore
+    from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
+    from vllm.v1.worker.gpu.attn_utils import get_kv_cache_spec
+    from vllm.v1.worker.gpu.state_slots import StateSlotBindings
+
+    base = create_scheduler(max_num_seqs=2, max_model_len=32)
+    config = base.vllm_config
+    config.cache_config.kv_cache_layout = "LBNHC"
+    spec = build_nemotron_persistent_state_spec(_config())
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    PersistentStateLayerBase(spec, prefix="state", vllm_config=config)
+    discovered = get_kv_cache_spec(config)
+    assert discovered == {"state": spec}
+    plan = get_kv_cache_configs(config, [discovered], [3 * spec.page_size_bytes])[0]
+    assert plan.num_blocks == 3 and len(plan.kv_cache_groups) == 1
+    scheduler = Scheduler(
+        vllm_config=config,
+        kv_cache_config=plan,
+        block_size=1,
+        log_stats=False,
+        structured_output_manager=base.structured_output_manager,
+    )
+    core = object.__new__(EngineCore)
+    core.scheduler, core.request_block_hasher = scheduler, None
+    scheduler.stream_admissions.clock = lambda: 100.0
+    assert _admit_stream(core).accepted
+    assert _admit_stream(core, 2, _stream_request("peer")).accepted
+    assert not _admit_stream(core, 3, _stream_request("full")).accepted
+    slots = StateSlotBindings(
+        plan.kv_cache_groups,
+        {"state": torch.zeros(3 * spec.page_size_bytes, dtype=torch.uint8)},
+    )
+    state = _state()
+    state.initialize_state_slots(slots)
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.state_slots, runner.model_state = slots, state
+    runner.main_stream = SimpleNamespace(wait_stream=lambda _: None)
+    indices: dict[str, int] = {}
+
+    def add_request(**kwargs):
+        indices[kwargs["req_id"]] = len(indices)
+
+    runner.req_states = SimpleNamespace(
+        req_id_to_index=indices,
+        add_request=add_request,
+        remove_request=lambda r: indices.pop(r, None),
+        apply_staged_writes=lambda: None,
+    )
+    runner.block_tables = SimpleNamespace(
+        append_block_ids=lambda *a, **kw: None, apply_staged_writes=lambda: None
+    )
+    runner.lora_state = SimpleNamespace(
+        add_request=lambda *a: None, remove_request=lambda r: None
+    )
+    runner.pooling_runner = runner.pp_handler = runner.encoder_cache = None
+    runner.prompt_logprobs_worker = runner.sampler = None
+    runner.aux_output_connector = runner.adaptive_verification = None
+    runner.is_last_pp_rank = False
+    runner.update_pp_decode_requests = lambda: None
+    runner.update_requests = lambda _: None
+    runner.kv_connector = SimpleNamespace(
+        no_forward=lambda _: EMPTY_MODEL_RUNNER_OUTPUT
+    )
+    runner._merge_ec_connector_no_forward = lambda _, output: output
+    events = []
+
+    class Event:
+        def __init__(self, **kwargs):
+            pass
+
+        def record(self, stream):
+            events.append("record")
+
+        def synchronize(self):
+            events.append("wait")
+
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+
+    def feed():
+        chunk = _stream_chunk(core)
+        chunk.prompt_token_ids = [1]
+        chunk._all_token_ids[:] = [1]
+        chunk.num_prompt_tokens = 1
+        scheduler.add_request(chunk)
+
+    def run(token, value):
+        step = scheduler.schedule()
+        state.prepare_step(step, dummy_run=False, is_profile=False)
+        slots.begin_step(step, runner.main_stream)
+        runner.finish_requests(step)
+        slots.activate_requests()
+        runner.add_requests(step)
+        batch = _input(("stream",), (token,))
+        snapshot = state.prepare_inputs(batch, runner.req_states)[
+            "persistent_state_projection"
+        ]
+        snapshot.state_batch.access.validate_current()
+        snapshot.state_batch.pools.predictor_h[snapshot.bindings[0].slot_id].fill_(
+            value
+        )
+        state.postprocess_state(torch.tensor([0]), torch.tensor([1]))
+        output = _state_output(step)
+        output.sampled_token_ids = [[token]]
+        fenced = runner._finish_state_step(output)
+        scheduler.update_from_output(step, fenced.get_output())
+        return snapshot
+
+    feed()
+    first = run(6, 17)
+    old = first.bindings[0].handle
+    run(7, 19)
+    assert scheduler.requests["stream"].status.name == "WAITING_FOR_STREAMING_REQ"
+    peer_handle = scheduler.kv_cache_manager.coordinator.state_managers["state"].get(
+        "peer"
+    )
+    feed()
+    second = run(7, 23)
+    assert second.bindings[0].handle == old and not second.bindings[0].fresh
+    assert second.request_metadata["stream"].prompt_token_ids == [1]
+    terminal = _stream_chunk(core)
+    terminal.resumable = False
+    scheduler.add_request(terminal)
+    manager = scheduler.kv_cache_manager.coordinator.state_managers["state"]
+    assert manager.num_free_slots == 0
+    cleanup = scheduler.schedule()
+    pending = runner.execute_model(cleanup)
+    assert manager.num_free_slots == 0
+    scheduler.update_from_output(cleanup, pending.get_output())
+    assert manager.num_free_slots == 1
+    assert manager.get("peer") == peer_handle
+    assert _admit_stream(core, 4, _stream_request("replacement")).accepted
+    replacement = manager.get("replacement")
+    assert replacement.slot == old.slot and replacement.generation > old.generation
+    assert "stream" not in state._initialized
+    with pytest.raises(ValueError, match="Stale"):
+        second.state_batch.access.validate_current()
+    assert events.count("record") == events.count("wait") == 4

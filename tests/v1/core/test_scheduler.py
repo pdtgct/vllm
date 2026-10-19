@@ -8107,11 +8107,14 @@ def _stream_core():
 def _stream_request(request_id="stream"):
     from vllm.v1.engine import EngineCoreRequest
 
+    # Token 7 is the park token, which state models declare as EOS.
+    params = SamplingParams(max_tokens=4)
+    params.update_from_generation_config({}, 7)
     return EngineCoreRequest(
         request_id=request_id,
         prompt_token_ids=[],
         mm_features=None,
-        sampling_params=SamplingParams(max_tokens=4, stop_token_ids=[7]),
+        sampling_params=params,
         pooling_params=None,
         arrival_time=1.0,
         lora_request=None,
@@ -8733,14 +8736,14 @@ def test_missing_state_ack_quarantines_only_affected_slots():
 def test_parked_state_retains_slot_until_terminal():
     """Parking preserves ownership; only terminal retirement frees it."""
     scheduler = _state_scheduler()
-    (req,) = create_requests(num_requests=1, num_tokens=4, stop_token_ids=[7])
+    (req,) = create_requests(num_requests=1, num_tokens=4)
     req.resumable = True
     scheduler.add_request(req)
     step = scheduler.schedule()
     manager = scheduler.kv_cache_manager.coordinator.state_managers["state"]
     handle = manager.get(req.request_id)
     output = _state_output(step)
-    output.sampled_token_ids = [[7]]
+    output.sampled_token_ids = [[EOS_TOKEN_ID]]
     scheduler.update_from_output(step, output)
     assert req.status == RequestStatus.WAITING_FOR_STREAMING_REQ
     assert manager.get(req.request_id) == handle
@@ -9192,3 +9195,210 @@ def test_stream_admission_exhausted_owner_renews_without_replaying_old_ids():
     assert "stream" not in core.scheduler.requests
     assert admissions.owners["other"] is other
     assert len(other.records) == 1
+
+
+@pytest.mark.parametrize("queued", [False, True])
+def test_state_stream_replaces_history_only_at_legal_park(queued):
+    core = _stream_core()
+    assert _admit_stream(core).accepted
+    scheduler = core.scheduler
+    chunk = _stream_chunk(core)
+    chunk.prompt_token_ids = [3]
+    chunk._all_token_ids[:] = [3]
+    chunk.num_prompt_tokens = 1
+    scheduler.add_request(chunk)
+    step = scheduler.schedule()
+    handle = step.state_slot_handles["stream"]["state"]
+    output = _state_output(step)
+    output.sampled_token_ids = [[6]]
+    scheduler.update_from_output(step, output)
+    step = scheduler.schedule()
+    replacement = _stream_chunk(core)
+    if queued:
+        scheduler.add_request(replacement)
+    output = _state_output(step)
+    output.sampled_token_ids = [[7]]
+    scheduler.update_from_output(step, output)
+    if not queued:
+        scheduler.add_request(replacement)
+    session = scheduler.requests["stream"]
+    assert session.prompt_token_ids == [1, 2, 3]
+    assert list(session.all_token_ids) == [1, 2, 3]
+    assert session.num_computed_tokens == 0
+    assert not session.output_token_ids
+    assert (
+        scheduler.kv_cache_manager.coordinator.state_managers["state"].get("stream")
+        == handle
+    )
+    assert scheduler.num_waiting_for_streaming_input == 0
+
+
+@pytest.mark.parametrize("queued", [False, True])
+def test_state_stream_stop_token_terminates_instead_of_parking(queued):
+    """Only EOS parks a state stream; a configured stop token ends it."""
+    core = _stream_core()
+    assert _admit_stream(core).accepted
+    scheduler = core.scheduler
+    manager = scheduler.kv_cache_manager.coordinator.state_managers["state"]
+    chunk = _stream_chunk(core)
+    chunk.prompt_token_ids = [3]
+    chunk._all_token_ids[:] = [3]
+    chunk.num_prompt_tokens = 1
+    scheduler.add_request(chunk)
+    session = scheduler.requests["stream"]
+    session.sampling_params.stop_token_ids = [6]
+    free_while_held = manager.num_free_slots
+    step = scheduler.schedule()
+    old = step.state_slot_handles["stream"]["state"]
+    replacement = _stream_chunk(core)
+    if queued:
+        scheduler.add_request(replacement)
+    output = _state_output(step)
+    output.sampled_token_ids = [[6]]
+    result = scheduler.update_from_output(step, output)
+    assert session.status == RequestStatus.FINISHED_STOPPED
+    assert session.stop_reason == 6
+    assert not session.resumable
+    assert list(session.all_token_ids) == [3, 6]
+    assert "stream" not in scheduler.requests
+    outputs = [o for group in result.values() for o in group.outputs]
+    assert [(o.finish_reason, o.stop_reason) for o in outputs] == [
+        (FinishReason.STOP, 6)
+    ]
+    if not queued:
+        scheduler.add_request(replacement)
+        assert "stream" not in scheduler.requests
+    cleanup = scheduler.schedule()
+    assert cleanup.state_cleanup_handles["stream"]["state"] == old
+    assert manager.num_free_slots == free_while_held
+    scheduler.update_from_output(cleanup, _state_output(cleanup))
+    assert manager.num_free_slots == free_while_held + 1
+
+
+@pytest.mark.parametrize("queued", [False, True])
+def test_state_stream_replaces_only_after_park_not_length_stop(queued):
+    core = _stream_core()
+    assert _admit_stream(core).accepted
+    assert _admit_stream(core, 2, _stream_request("peer")).accepted
+    scheduler = core.scheduler
+    manager = scheduler.kv_cache_manager.coordinator.state_managers["state"]
+    peer_handle = manager.get("peer")
+    chunk = _stream_chunk(core)
+    chunk.prompt_token_ids = [3]
+    chunk._all_token_ids[:] = [3]
+    chunk.num_prompt_tokens = 1
+    chunk.max_tokens = chunk.sampling_params.max_tokens = 1
+    scheduler.add_request(chunk)
+    session = scheduler.requests["stream"]
+    step = scheduler.schedule()
+    old = step.state_slot_handles["stream"]["state"]
+    replacement = _stream_chunk(core)
+    if queued:
+        scheduler.add_request(replacement)
+    output = _state_output(step)
+    output.sampled_token_ids = [[6]]
+    result = scheduler.update_from_output(step, output)
+    assert session.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert not session.resumable
+    assert "stream" not in scheduler.requests
+    assert scheduler.num_waiting_for_streaming_input == 1  # The admitted peer.
+    assert [o.finish_reason for group in result.values() for o in group.outputs] == [
+        FinishReason.LENGTH
+    ]
+    if not queued:
+        scheduler.add_request(replacement)
+        assert "stream" not in scheduler.requests
+    assert manager.get("peer") == peer_handle
+    assert manager.num_free_slots == 0
+    assert not _admit_stream(core, 3, _stream_request("next")).accepted
+    cleanup = scheduler.schedule()
+    assert cleanup.state_cleanup_handles["stream"]["state"] == old
+    assert manager.num_free_slots == 0
+    scheduler.update_from_output(cleanup, _state_output(cleanup))
+    assert _admit_stream(core, 4, _stream_request("next")).accepted
+    new = manager.get("next")
+    assert new.slot == old.slot and new.generation > old.generation
+    assert manager.get("peer") == peer_handle
+
+
+@pytest.mark.parametrize("queued", [False, True])
+def test_state_stream_replaces_maximum_payload_after_park(queued):
+    from vllm.models.nemotron_asr.manifests import author_emission_manifest
+
+    budget = max(
+        g["max_emission_tokens"]
+        for g in author_emission_manifest(None)["per_geometry"].values()
+    )
+    assert budget == 142
+    core = _stream_core()
+    scheduler = core.scheduler
+    scheduler.use_v2_model_runner = True
+    scheduler.max_model_len = 1 + budget
+    assert _admit_stream(core).accepted
+    chunk = _stream_chunk(core)
+    chunk.prompt_token_ids = [3]
+    chunk._all_token_ids[:] = [3]
+    chunk.num_prompt_tokens = 1
+    chunk.max_tokens = chunk.sampling_params.max_tokens = budget
+    scheduler.add_request(chunk)
+    session = scheduler.requests["stream"]
+    replacement = _stream_chunk(core)
+    expected_input = 3
+    for index in range(budget):
+        step = scheduler.schedule()
+        if index:
+            assert step.scheduled_cached_reqs.new_token_ids == [[expected_input]]
+        else:
+            assert step.scheduled_new_reqs[0].prefill_token_ids == [3]
+        if queued and index == budget - 1:
+            scheduler.add_request(replacement)
+        output = _state_output(step)
+        # 140 labels, optional EOU, then PARK.
+        expected_input = 7 if index == budget - 1 else (8 if index == budget - 2 else 6)
+        output.sampled_token_ids = [[expected_input]]
+        result = scheduler.update_from_output(step, output)
+        if index < budget - 1:
+            assert session.status == RequestStatus.RUNNING
+    assert [o.finish_reason for group in result.values() for o in group.outputs] == [
+        FinishReason.STOP
+    ]
+    if not queued:
+        assert session.num_tokens == 143
+        assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+        scheduler.add_request(replacement)
+    assert list(session.all_token_ids) == [1, 2, 3]
+    assert session.num_computed_tokens == 0
+    assert not session.output_token_ids
+
+
+def test_state_model_failure_retires_only_matching_live_handle():
+    from dataclasses import replace
+
+    scheduler = _state_scheduler()
+    requests = create_requests(num_requests=2, num_tokens=1)
+    for request in requests:
+        scheduler.add_request(request)
+    step = scheduler.schedule()
+    output = _state_output(step)
+    failed_id, survivor_id = [r.request_id for r in requests]
+    output.state_completion = replace(
+        output.state_completion, failed_req_ids=frozenset({failed_id, "unknown"})
+    )
+    result = scheduler.update_from_output(step, output)
+    assert failed_id not in scheduler.requests
+    assert scheduler.requests[survivor_id].output_token_ids
+    failures = [
+        o
+        for values in result.values()
+        for o in values.outputs
+        if o.request_id == failed_id
+    ]
+    assert len(failures) == 1 and failures[0].finish_reason == FinishReason.ERROR
+    manager = scheduler.kv_cache_manager.coordinator.state_managers["state"]
+    old = step.state_slot_handles[failed_id]["state"]
+    cleanup = scheduler.schedule()
+    scheduler.update_from_output(cleanup, _state_output(cleanup))
+    replacement = manager.allocate(failed_id)
+    assert replacement.generation > old.generation
+    scheduler._complete_state_slots(step, output)
+    assert manager.get(failed_id) == replacement

@@ -3,9 +3,7 @@
 """Nemotron cache-aware streaming RNN-T ASR — model class.
 
 Cross-chunk state lives in one engine-managed aggregate page per request.
-The engine-side persistent-state primitive and the MRv2 ``ModelState`` are
-not yet in vLLM core, so the engine-facing class can be constructed and
-loaded, but its state-bound execution paths raise ``NotImplementedError``.
+The MRv2 ModelState projects bounded core slot views into each transaction.
 The full-context path survives only as an EVAL-tier parity probe.
 
 RNN-T emission is D-b (PORT-DEC-001/002/003): the forward that ingests
@@ -26,6 +24,7 @@ import torch
 from torch import nn
 
 from vllm.logger import init_logger
+from vllm.model_executor.layers.state import PersistentStateLayerBase
 from vllm.models.nemotron_asr.advance import (
     ENVELOPE_HEADER_SLOTS,
     DecodeRequest,
@@ -66,6 +65,7 @@ from vllm.models.nemotron_asr.lid import (
 )
 from vllm.models.nemotron_asr.manifests import (
     CADENCES,
+    author_emission_manifest,
 )
 from vllm.models.nemotron_asr.plan import (
     ObservedRow,
@@ -92,6 +92,7 @@ from vllm.models.nemotron_asr.rnnt import (
     decode_dense_masked_frames,
     greedy_decode_chunk,
 )
+from vllm.models.nemotron_asr.state_profile import build_nemotron_persistent_state_spec
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
 logger = init_logger(__name__)
@@ -104,13 +105,6 @@ _MAX_FRAMES_PER_CHUNK = 14
 _N_MELS = 128
 _STFT_FREQ_BINS = 512 // 2 + 1
 _WIN_LENGTH = 400
-
-
-def _require_persistent_state() -> None:
-    raise NotImplementedError(
-        "NemotronASRForRNNT requires engine-managed persistent state, "
-        "which is not yet available in vLLM core"
-    )
 
 
 def _served_geometry_ids(hf_config: Any) -> tuple[int, ...]:
@@ -259,8 +253,6 @@ def load_core_from_dump(
     (PORT-WGT-001); this loader serves probes and the serving prototype
     from the referee dump meanwhile.
     """
-    import json
-
     from safetensors.torch import load_file
 
     from vllm.models.nemotron_asr.convert import (
@@ -324,7 +316,12 @@ class NemotronASRForRNNT(nn.Module):
     supports_realtime = True
     supports_transcription_only = False
     supports_persistent_state = True
-    realtime_max_tokens = 142
+    is_attention_free = True
+    realtime_max_tokens = max(
+        geometry["max_emission_tokens"]
+        for geometry in author_emission_manifest(None)["per_geometry"].values()
+    )
+    realtime_input_tokens = 1
     num_logits = 13_092
 
     def __init__(self, *, vllm_config: Any = None, prefix: str = "") -> None:
@@ -332,6 +329,13 @@ class NemotronASRForRNNT(nn.Module):
         super().__init__()
         if vllm_config is None:
             raise ValueError("NemotronASRForRNNT requires vllm_config")
+        max_model_len = getattr(vllm_config.model_config, "max_model_len", None)
+        min_history = self.realtime_input_tokens + self.realtime_max_tokens
+        if max_model_len is not None and max_model_len < min_history:
+            raise ValueError(
+                "max_model_len must contain one streaming transaction "
+                f"({min_history} tokens)"
+            )
         hf_config = vllm_config.model_config.hf_config
         # Resolve the effective (stage-overridden) selector once, before any
         # state reservation, execution construction or checkpoint loading.
@@ -406,8 +410,11 @@ class NemotronASRForRNNT(nn.Module):
         )
         if policy is not FP32_BRINGUP:
             apply_policy_dtypes(self.core)
-        self._persistent_state_layer: Any = None
-        self._state_pools_cache: Any = None
+        self._persistent_state_layer = PersistentStateLayerBase(
+            build_nemotron_persistent_state_spec(hf_config),
+            prefix=f"{prefix}.state" if prefix else "state",
+            vllm_config=vllm_config,
+        )
         self._registry = SessionRegistry()
         self._plan_slot = PlanContextSlot()
         self._plan_step = 0
@@ -498,10 +505,8 @@ class NemotronASRForRNNT(nn.Module):
         self._execution_memory_prepared = False
         self._execution_memory_failed = False
 
-    def _state_pools(self) -> Any:
-        if self._state_pools_cache is None:
-            _require_persistent_state()
-        return self._state_pools_cache
+    def _state_pools(self, projection: Any) -> Any:
+        return projection.state_batch.pools
 
     def load_weights(self, weights: Any) -> set[str]:
         """Strictly load the served tree or the public HF card.
@@ -716,13 +721,8 @@ class NemotronASRForRNNT(nn.Module):
             if int(input_batch.num_scheduled_tokens[index]) != 1:
                 raise ValueError("every streaming row must be single-token")
             request = metadata[request_id]
-            token_ids = request.prefill_token_ids or request.prompt_token_ids
-            if token_ids is None:
-                raise RuntimeError("MRv2 request has no token authority")
             computed = int(input_batch.num_computed_tokens_np[index])
-            if not 0 <= computed < len(token_ids):
-                raise RuntimeError("MRv2 scheduled token is outside request data")
-            token = int(token_ids[computed])
+            token = projection.token_ids[index]
             endpoint_mode, endpoint_threshold, endpoint_residue = (
                 self._endpoint_controls(request)
             )
@@ -746,15 +746,6 @@ class NemotronASRForRNNT(nn.Module):
                     endpoint_residue_frames=endpoint_residue,
                 )
             )
-        if self._persistent_state_layer is None:
-            _require_persistent_state()
-        storage = self._persistent_state_layer.persistent_state_storage
-        for binding in projection.bindings:
-            if binding.fresh:
-                storage.initialize_fresh_state_slot(
-                    int(binding.slot_id),
-                    int(binding.generation),
-                )
         return self._stage_plan(
             rows,
             resident_request_ids=tuple(projection.req_states.req_id_to_index),
@@ -790,7 +781,6 @@ class NemotronASRForRNNT(nn.Module):
     def prepare_execution_memory(self) -> None:
         """Retain execution inventory and profile its transient headroom before state
         allocation."""
-        _require_persistent_state()
         from vllm.models.nemotron_asr.profile_execution import (
             run_persistent_state_profile,
             warmup_static_encoder_execution,
@@ -842,43 +832,6 @@ class NemotronASRForRNNT(nn.Module):
                 self._encoder_execution._discard()
             raise
         self._execution_memory_prepared = True
-
-    def warmup_resident_state(self) -> None:
-        """Warm actual resident scatter after execution memory was prepared."""
-        from vllm.models.nemotron_asr.advance import (
-            warmup_advance_model_rows_scatter,
-        )
-
-        if self._execution_memory_failed or not self._execution_memory_prepared:
-            raise RuntimeError(
-                "execution memory inventory was not prepared successfully"
-            )
-        self._require_execution_inventory_ready()
-        pools = self._state_pools()
-        device = pools.predictor_h.device
-        if device.type == "cuda":
-            warmup_advance_model_rows_scatter(
-                channel_pools=list(pools.channel),
-                time_pools=list(pools.convolution),
-                len_pools=list(pools.valid_length),
-                h_pool=pools.predictor_h,
-                c_pool=pools.predictor_c,
-                queue_pool=pools.replay_queue,
-                book_pool=pools.replay_book,
-                frontend_raw_pool=pools.frontend_raw,
-                frontend_mel_pool=pools.frontend_mel,
-                frontend_counter_pool=pools.frontend_counters,
-                endpoint_history_pool=pools.endpoint_history,
-                endpoint_book_pool=pools.endpoint_book,
-            )
-        logger.info(
-            "Nemotron execution profile ready %s",
-            json.dumps(
-                self.execution_profile_receipt(),
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-        )
 
     def execution_profile_receipt(self) -> dict[str, Any]:
         """Report the resolved execution arms and startup coverage."""
@@ -1021,7 +974,6 @@ class NemotronASRForRNNT(nn.Module):
             if not persistent_state_projection.dummy_run:
                 raise RuntimeError("no-page-I/O projection must be a dummy invocation")
             if persistent_state_projection.is_profile:
-                _require_persistent_state()
                 from vllm.models.nemotron_asr.profile_execution import (
                     run_persistent_state_profile,
                 )
@@ -1034,15 +986,18 @@ class NemotronASRForRNNT(nn.Module):
             return torch.zeros_like(inputs_embeds)
         if input_ids is None:
             raise RuntimeError("Nemotron forward requires raw ids")
-        if persistent_state_projection is not None:
-            context = self._stage_v2_projection(persistent_state_projection)
-            num_decodes = 0
-            num_prefills = len(context.request_ids)
-        else:
-            context = self._plan_slot.consume()
-            num_decodes = int(context.has_prior_state.sum().item())
-            num_prefills = len(context.request_ids) - num_decodes
-        pools = self._state_pools()
+        if persistent_state_projection is None:
+            raise ValueError("Nemotron forward requires an MRv2 state projection")
+        context = self._stage_v2_projection(persistent_state_projection)
+        state_batch = persistent_state_projection.state_batch
+        if state_batch is None:
+            raise RuntimeError("MRv2 projection omitted bounded state views")
+        pools = self._state_pools(persistent_state_projection)
+        commit_sink = state_batch.commit_sink(
+            self._ensure_commit_sink(inputs_embeds.device)
+        )
+        num_decodes = 0
+        num_prefills = len(context.request_ids)
         graph_binding = self._decode_graph_binding
         graph_covers_decode = graph_binding is not None
         chunk_rows = int(context.is_chunk.sum().item())
@@ -1063,7 +1018,7 @@ class NemotronASRForRNNT(nn.Module):
                 raise RuntimeError("native burst requires a native runner projection")
             native_handoff.prepare(persistent_state_projection)
         try:
-            return advance_model_rows(
+            result = advance_model_rows(
                 self.core,
                 input_ids.long(),
                 inputs_embeds,
@@ -1087,11 +1042,12 @@ class NemotronASRForRNNT(nn.Module):
                 bucket_transition=getattr(self, "_chunk_bucket_binding", None),
                 placeholder_id=int(self.config.audio_chunk_token_id),
                 park_id=int(self.config.eos_token_id),
-                commit_sink=self._ensure_commit_sink(inputs_embeds.device),
+                commit_sink=commit_sink,
                 staging=self._ensure_host_staging(),
                 graph_covers_decode=graph_covers_decode,
                 native_burst_handoff=native_handoff,
             )
+            return result
         except BaseException:
             if native_handoff is not None:
                 native_handoff.clear()
@@ -1120,7 +1076,6 @@ class NemotronASRForRNNT(nn.Module):
 
     @classmethod
     def get_model_state_cls(cls) -> type[Any]:
-        _require_persistent_state()
         from vllm.models.nemotron_asr.model_state_v2 import (
             NemotronASRModelState,
         )
