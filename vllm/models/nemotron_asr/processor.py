@@ -25,6 +25,7 @@ import numpy as np
 import torch
 from transformers import BatchFeature
 
+from vllm.config.multimodal import MultiModalDummyOptions
 from vllm.inputs import MultiModalDataDict
 from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
@@ -72,7 +73,7 @@ class NemotronASRDummyInputsBuilder(BaseDummyInputsBuilder[NemotronASRProcessing
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
-        mm_options: Mapping[str, object] | None = None,
+        mm_options: MultiModalDummyOptions,
     ) -> MultiModalDataDict:
         num_audios = mm_counts.get("audio", 0)
         return {
@@ -105,12 +106,10 @@ class NemotronASRMultiModalProcessor(
     def _apply_hf_processor_main(
         self,
         mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
+        hf_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         # No HF processor or featurization: the model owns the mel frontend.
-        mm_data, _, passthrough_data = self._get_hf_mm_inputs(
-            mm_items, hf_processor_mm_kwargs
-        )
+        mm_data, _, passthrough_data = self._get_hf_mm_inputs(mm_items, hf_kwargs)
         # ``_get_hf_mm_inputs`` remaps the item key ``audios`` to ``audio``,
         # which is also the output field ``embed_multimodal`` reads.
         audios = mm_data.get("audio", [])

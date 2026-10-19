@@ -15,10 +15,13 @@ from vllm.models.nemotron_asr import batch_invariance as port
 _ENV_KEYS = (
     "VLLM_BATCH_INVARIANT",
     "VLLM_ALLREDUCE_USE_SYMM_MEM",
+    "VLLM_CUSTOM_ALLREDUCE_ALGO",
+    "VLLM_ROCM_USE_SKINNY_GEMM",
     "CUBLAS_WORKSPACE_CONFIG",
     "CUBLASLT_WORKSPACE_SIZE",
     "VLLM_USE_AOT_COMPILE",
     "NCCL_LAUNCH_MODE",
+    "NCCL_NO_CACHE",
     "NCCL_COLLNET_ENABLE",
     "NCCL_NVLS_ENABLE",
     "NCCL_P2P_NET_DISABLE",
@@ -34,6 +37,10 @@ _ENV_KEYS = (
 @contextmanager
 def preserve_batch_invariance(batch_invariant, configs):
     """Undo registrations and all pinned initializer side effects, even on failure."""
+    from torch._inductor import config as inductor_config
+
+    from vllm.utils import nccl
+
     env = {key: os.environ.get(key) for key in _ENV_KEYS}
     saved: list[tuple[Any, str, Any]] = []
     for owner, names in (
@@ -62,6 +69,7 @@ def preserve_batch_invariance(batch_invariant, configs):
             ),
         ),
         (torch, ("bmm",)),
+        (nccl, ("_unpinned_env",)),
         (
             torch.backends.cuda.matmul,
             (
@@ -74,6 +82,15 @@ def preserve_batch_invariance(batch_invariant, configs):
         (torch.backends.cudnn.rnn, ("fp32_precision",)),
     ):
         saved.extend((owner, name, getattr(owner, name)) for name in names)
+    for owner, names in (
+        (batch_invariant, ("_BLOCK_SIZES_RESOLVED", "_NUM_SMS")),
+        (inductor_config, ("batch_invariant",)),
+    ):
+        saved.extend(
+            (owner, name, getattr(owner, name))
+            for name in names
+            if hasattr(owner, name)
+        )
     for name, module in tuple(sys.modules.items()):
         if name.endswith("test_encoder_batch_invariance"):
             saved.extend(
