@@ -1030,3 +1030,143 @@ def test_nemotron_core_admission_park_cleanup_and_slot_reuse(monkeypatch):
     with pytest.raises(ValueError, match="Stale"):
         second.state_batch.access.validate_current()
     assert events.count("record") == events.count("wait") == 4
+
+
+@pytest.mark.nemotron_gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_state_completion_cuda_delayed_auxiliary_write():
+    """An output copy cannot acknowledge or recycle an unfinished state writer."""
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError
+    from threading import Event
+
+    from tests.v1.core.test_scheduler import _state_output, _state_scheduler
+    from tests.v1.core.utils import create_requests, create_state_spec
+    from vllm.v1.request import RequestStatus
+    from vllm.v1.worker.gpu.state_slots import StateSlotBindings
+
+    scheduler = _state_scheduler()
+    (request,) = create_requests(num_requests=1, num_tokens=4)
+    scheduler.add_request(request)
+    step = scheduler.schedule()
+    manager = scheduler.kv_cache_manager.coordinator.state_managers["state"]
+    peer = manager.allocate("peer")
+    assert peer is not None and manager.num_free_slots == 0
+    handle = step.state_slot_handles[request.request_id]["state"]
+    main = torch.cuda.current_stream()
+    writer, copier = torch.cuda.Stream(), torch.cuda.Stream()
+    spec = create_state_spec()
+    slots = StateSlotBindings(
+        [KVCacheGroupSpec(["state"], spec)],
+        {
+            "state": torch.zeros(
+                3 * spec.page_size_bytes, dtype=torch.uint8, device="cuda"
+            )
+        },
+    )
+    slots.register_writing_stream(writer)
+    slots.begin_step(step, main)
+    slots.activate_requests()
+    resident = slots.views["state"].view(request.request_id, handle)["hidden"]
+    sampled = torch.tensor([[42]], device="cuda")
+    counts = torch.ones(1, dtype=torch.int32, device="cuda")
+    rejected = torch.zeros_like(counts)
+    # Warm CUDA initialization before the deliberately bounded race window.
+    with torch.cuda.stream(writer):
+        torch.cuda._sleep(1)
+    torch.cuda.synchronize()
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.state_slots, runner.main_stream, runner.output_copy_stream = (
+        slots,
+        main,
+        copier,
+    )
+    runner.is_last_pp_rank = True
+    runner.pcp_manager = runner.pp_handler = runner.speculator = None
+    runner.aux_output_connector = None
+    runner.num_speculative_steps = 0
+    runner.check_ep_fault = False
+    runner.eplb = SimpleNamespace(step=lambda **kwargs: None)
+    runner.kv_connector = SimpleNamespace(post_forward=lambda *a, **kw: None)
+    runner.model = SimpleNamespace(compute_logits=lambda _: None)
+    runner.req_states = SimpleNamespace(
+        all_token_ids=SimpleNamespace(gpu=None),
+        num_computed_tokens=SimpleNamespace(gpu=None),
+        prompt_len=SimpleNamespace(np=None),
+    )
+    runner.prompt_logprobs_worker = SimpleNamespace(
+        compute_prompt_logprobs=lambda *a: {},
+        compute_prompt_token_id_logprobs=lambda *a: {},
+    )
+    runner.sample = lambda *a: (
+        SimpleNamespace(
+            sampled_token_ids=sampled,
+            logprobs_tensors=None,
+            num_nans=None,
+            sampling_mask_tensors=None,
+        ),
+        counts,
+        rejected,
+    )
+
+    def delayed_postprocess(*args):
+        with torch.cuda.stream(writer):
+            torch.cuda._sleep(2_000_000_000)
+            resident.fill_(17)
+
+    runner.postprocess_sampled = delayed_postprocess
+    runner.execute_model_state = ExecuteModelState(
+        input_batch=SimpleNamespace(
+            req_ids=[request.request_id], idx_mapping=None, query_start_loc=None
+        ),
+        attn_metadata=None,
+        slot_mappings_by_layer=None,
+        hidden_states=torch.empty(1, 1, device="cuda"),
+        aux_hidden_states=None,
+        dp_sync_state=None,
+        finished_req_ids=set(),
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        num_spec_tokens_to_schedule=0,
+    )
+    pending = runner.sample_tokens(None)
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+    pending.output.copy_event.synchronize()
+    assert pending.output.copy_event.query()
+    assert not pending.event.query(), "race window elapsed before the copy check"
+    assert pending.output.model_runner_output.state_completion is None
+    assert manager.allocate("replacement") is None
+
+    entered = Event()
+
+    def retrieve():
+        torch.cuda.set_device(main.device)
+        entered.set()
+        return pending.get_output()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(retrieve)
+        assert entered.wait(timeout=5)
+        assert not pending.event.query(), "race window elapsed before retrieval check"
+        assert not future.done()
+        assert manager.num_free_slots == 0
+        with pytest.raises(TimeoutError):
+            future.result(timeout=0.05)
+        result = future.result(timeout=15)
+    assert pending.event.query()
+    assert torch.all(resident == 17).item()
+    assert result.sampled_token_ids == [[42]]
+    assert result.state_completion.handles == step.state_slot_handles
+    scheduler.update_from_output(step, result)
+    # The compute acknowledgment alone does not cover terminal cleanup.
+    assert manager.num_free_slots == 0
+    cleanup = scheduler.schedule()
+    assert cleanup.state_cleanup_handles[request.request_id]["state"] == handle
+    slots.begin_step(cleanup, main)
+    slots.activate_requests()
+    cleaned = runner._finish_state_step(_state_output(cleanup, acknowledge=False))
+    assert manager.allocate("replacement") is None
+    scheduler.update_from_output(cleanup, cleaned.get_output())
+    replacement = manager.allocate("replacement")
+    assert replacement.slot == handle.slot
+    assert replacement.generation > handle.generation
