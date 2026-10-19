@@ -3,6 +3,7 @@
 """One-block persistent state and scheduler-owned retirement."""
 
 from collections.abc import Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
@@ -111,6 +112,39 @@ class PersistentStateManager(SingleTypeKVCacheManager):
             return None
         self.allocate_new_blocks(request_id, 0, 0)
         return self.get(request_id)
+
+    def allocate_for_admission(
+        self, request_id: str, undo: ExitStack
+    ) -> StateSlotHandle | None:
+        """Journal the one free block before any allocation mutation."""
+        if not self.num_free_slots:
+            return None
+        assert self.get(request_id) is None
+        pool = self.block_pool
+        block = pool.free_block_queue.fake_free_list_head.next_free_block
+        assert block is not None and not block.is_null
+        assert block.block_id not in pool._reuse_watchers
+        slot = block.block_id
+        generation, completed = self._generations[slot], self._completed[slot]
+        metrics = pool.metrics_collector
+        old_metrics = metrics.block_metrics.get(slot) if metrics else None
+
+        def rollback() -> None:
+            self._requests.pop(request_id, None)
+            self._handles.pop(slot, None)
+            self.req_to_blocks.pop(request_id, None)
+            self._generations[slot], self._completed[slot] = generation, completed
+            if block.prev_free_block is None:
+                block.ref_cnt = 0
+                pool.free_block_queue.prepend_n([block])
+            if metrics is not None:
+                if old_metrics is None:
+                    metrics.block_metrics.pop(slot, None)
+                else:
+                    metrics.block_metrics[slot] = old_metrics
+
+        undo.callback(rollback)
+        return self.allocate(request_id)
 
     def get_num_blocks_to_allocate(
         self,
