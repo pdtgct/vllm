@@ -4550,6 +4550,7 @@ def test_grammar_compile_error_finishes_only_request(async_grammar: bool):
 
 def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler = object.__new__(Scheduler)
+    scheduler.has_state_slots = False
     sampling_params = SamplingParams(ignore_eos=True, max_tokens=4)
     sampling_params.update_from_generation_config({}, EOS_TOKEN_ID)
 
@@ -8051,3 +8052,316 @@ def test_diffusion_read_deferral_keeps_a_longer_pp_wait():
     # Deferring this step alone would ask for 6. The PP wait to 7 stands.
     assert "read" not in scheduler.schedule().num_scheduled_tokens
     assert read.next_decode_eligible_step == 7
+
+
+def _state_scheduler():
+    from tests.v1.core.utils import create_state_spec
+    from vllm.v1.core.kv_cache_planning import get_kv_cache_configs
+
+    base = create_scheduler(max_num_seqs=2, max_model_len=32)
+    base.vllm_config.cache_config.kv_cache_layout = "LBNHC"
+    spec = create_state_spec()
+    config = get_kv_cache_configs(
+        base.vllm_config, [{"state": spec}], [3 * spec.page_size_bytes]
+    )[0]
+    return Scheduler(
+        vllm_config=base.vllm_config,
+        kv_cache_config=config,
+        block_size=1,
+        log_stats=False,
+        structured_output_manager=base.structured_output_manager,
+    )
+
+
+def _state_output(step, *, acknowledge=True):
+    from copy import deepcopy
+
+    from vllm.v1.kv_cache_interface import StateCompletion
+
+    ids = list(step.num_scheduled_tokens)
+    return ModelRunnerOutput(
+        req_ids=ids,
+        req_id_to_index={req_id: i for i, req_id in enumerate(ids)},
+        sampled_token_ids=[[42] for _ in ids],
+        state_completion=(
+            StateCompletion(
+                step.state_step_seq,
+                deepcopy(step.state_slot_handles),
+                deepcopy(step.state_cleanup_handles),
+            )
+            if acknowledge
+            else None
+        ),
+    )
+
+
+def test_abort_inflight_reclaims_slot_and_reopens_admission():
+    """Abort fences the slot until state completion, without API release."""
+    scheduler = _state_scheduler()
+    a, b, c = create_requests(num_requests=3, num_tokens=4)
+    for req in (a, b):
+        scheduler.add_request(req)
+    step = scheduler.schedule()
+    manager = scheduler.kv_cache_manager.coordinator.state_managers["state"]
+    old = manager.get(a.request_id)
+    scheduler.finish_requests(a.request_id, RequestStatus.FINISHED_ABORTED)
+    scheduler.add_request(c)
+    assert manager.allocate(c.request_id) is None
+    scheduler.update_from_output(step, _state_output(step))
+    cleanup = scheduler.schedule()
+    assert c.request_id not in cleanup.num_scheduled_tokens
+    scheduler.update_from_output(cleanup, _state_output(cleanup))
+    replacement = scheduler.schedule()
+    assert c.request_id in replacement.num_scheduled_tokens
+    new = manager.get(c.request_id)
+    assert new.slot == old.slot and new.generation > old.generation
+    assert manager.get(b.request_id) == step.state_slot_handles[b.request_id]["state"]
+
+
+def test_immediate_replacement_without_external_release():
+    """A completed request releases through the same scheduler fence."""
+    scheduler = _state_scheduler()
+    a, b, c = create_requests(num_requests=3, num_tokens=4)
+    for req in (a, b):
+        scheduler.add_request(req)
+    step = scheduler.schedule()
+    scheduler.update_from_output(step, _state_output(step))
+    scheduler.finish_requests(a.request_id, RequestStatus.FINISHED_ABORTED)
+    scheduler.add_request(c)
+    cleanup = scheduler.schedule()
+    assert c.request_id not in cleanup.num_scheduled_tokens
+    scheduler.update_from_output(cleanup, _state_output(cleanup))
+    assert c.request_id in scheduler.schedule().num_scheduled_tokens
+
+
+def test_state_preemption_ends_session():
+    """State cannot be reconstructed by replaying prompt tokens."""
+    scheduler = _state_scheduler()
+    (req,) = create_requests(num_requests=1, num_tokens=4)
+    scheduler.add_request(req)
+    step = scheduler.schedule()
+    scheduler.running.remove(req)
+    scheduler._preempt_request(req, 0.0)
+    assert req.status == RequestStatus.FINISHED_ERROR
+    assert req not in scheduler.waiting
+    manager = scheduler.kv_cache_manager.coordinator.state_managers["state"]
+    assert manager.num_free_slots == 1
+    scheduler.update_from_output(step, _state_output(step))
+    assert manager.num_free_slots == 1
+    cleanup = scheduler.schedule()
+    scheduler.update_from_output(cleanup, _state_output(cleanup))
+    assert manager.num_free_slots == 2
+
+
+def test_missing_state_ack_quarantines_only_affected_slots():
+    """An unrelated later completion cannot release a missing write fence."""
+    scheduler = _state_scheduler()
+    a, b = create_requests(num_requests=2, num_tokens=4)
+    scheduler.add_request(a)
+    step = scheduler.schedule()
+    scheduler.finish_requests(a.request_id, RequestStatus.FINISHED_ABORTED)
+    scheduler.update_from_output(step, _state_output(step, acknowledge=False))
+    scheduler.add_request(b)
+    next_step = scheduler.schedule()
+    output = _state_output(next_step)
+    # Acknowledging only B does not acknowledge A's cleanup.
+    output.state_completion.cleanup_handles.clear()
+    scheduler.update_from_output(next_step, output)
+    scheduler.finish_requests(b.request_id, RequestStatus.FINISHED_ABORTED)
+    manager = scheduler.kv_cache_manager.coordinator.state_managers["state"]
+    assert manager.num_free_slots == 0
+    cleanup = scheduler.schedule()
+    output = _state_output(cleanup)
+    # Acknowledging only A does not acknowledge B's cleanup.
+    del output.state_completion.cleanup_handles[b.request_id]
+    scheduler.update_from_output(cleanup, output)
+    assert manager.num_free_slots == 1
+    assert len(scheduler.state_retirements) == 1
+    retry = scheduler.schedule()
+    scheduler.update_from_output(retry, _state_output(retry))
+    assert manager.num_free_slots == 2
+
+
+def test_parked_state_retains_slot_until_terminal():
+    """Parking preserves ownership; only terminal retirement frees it."""
+    scheduler = _state_scheduler()
+    (req,) = create_requests(num_requests=1, num_tokens=4, stop_token_ids=[7])
+    req.resumable = True
+    scheduler.add_request(req)
+    step = scheduler.schedule()
+    manager = scheduler.kv_cache_manager.coordinator.state_managers["state"]
+    handle = manager.get(req.request_id)
+    output = _state_output(step)
+    output.sampled_token_ids = [[7]]
+    scheduler.update_from_output(step, output)
+    assert req.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    assert manager.get(req.request_id) == handle
+    assert manager.num_free_slots == 1
+    scheduler.finish_requests(req.request_id, RequestStatus.FINISHED_ABORTED)
+    assert manager.num_free_slots == 1
+    cleanup = scheduler.schedule()
+    scheduler.update_from_output(cleanup, _state_output(cleanup))
+    assert manager.num_free_slots == 2
+
+
+def test_stale_state_completion_cannot_update_reused_request_id():
+    """Late progress from a retired generation cannot change its replacement."""
+    scheduler = _state_scheduler()
+    (req,) = create_requests(num_requests=1, num_tokens=4)
+    scheduler.add_request(req)
+    step = scheduler.schedule()
+    scheduler.update_from_output(step, _state_output(step))
+    scheduler.finish_requests(req.request_id, RequestStatus.FINISHED_ABORTED)
+    (replacement,) = create_requests(num_requests=1, num_tokens=4)
+    scheduler.add_request(replacement)
+    cleanup = scheduler.schedule()
+    assert replacement.request_id not in cleanup.num_scheduled_tokens
+    scheduler.update_from_output(cleanup, _state_output(cleanup))
+    scheduler.schedule()
+    scheduler.update_from_output(step, _state_output(step))
+    assert replacement.status == RequestStatus.RUNNING
+    assert replacement.num_output_tokens == 0
+
+
+def test_state_stop_output_reclaims_without_external_release():
+    scheduler = _state_scheduler()
+    (req,) = create_requests(num_requests=1, num_tokens=4, stop_token_ids=[42])
+    scheduler.add_request(req)
+    step = scheduler.schedule()
+    scheduler.update_from_output(step, _state_output(step))
+    manager = scheduler.kv_cache_manager.coordinator.state_managers["state"]
+    assert req.status == RequestStatus.FINISHED_STOPPED
+    assert manager.get(req.request_id) is None
+    assert manager.num_free_slots == 1
+    cleanup = scheduler.schedule()
+    scheduler.update_from_output(cleanup, _state_output(cleanup))
+    assert manager.num_free_slots == 2
+
+
+def test_partial_state_ack_quarantines_only_missing_request():
+    scheduler = _state_scheduler()
+    a, b = create_requests(num_requests=2, num_tokens=4)
+    scheduler.add_request(a)
+    scheduler.add_request(b)
+    step = scheduler.schedule()
+    from vllm.v1.kv_cache_interface import StateCompletion
+
+    output = _state_output(step)
+    output.state_completion = StateCompletion(
+        step.state_step_seq, {b.request_id: step.state_slot_handles[b.request_id]}
+    )
+    results = scheduler.update_from_output(step, output)
+    assert a.status == RequestStatus.FINISHED_ERROR
+    assert a.num_output_tokens == 0
+    assert b.status == RequestStatus.RUNNING
+    assert b.num_output_tokens == 1
+    assert any(
+        o.request_id == a.request_id and o.finish_reason is not None
+        for batch in results.values()
+        for o in batch.outputs
+    )
+    scheduler.finish_requests(b.request_id, RequestStatus.FINISHED_ABORTED)
+    manager = scheduler.kv_cache_manager.coordinator.state_managers["state"]
+    assert manager.num_free_slots == 0
+    assert len(scheduler.state_retirements) == 2
+    assert not scheduler.deferred_frees
+
+
+@pytest.mark.parametrize("wrong_ack", ["missing", "generation", "session", "step"])
+def test_state_cleanup_recovers_without_new_client_request(wrong_ack):
+    from dataclasses import replace
+
+    from vllm.v1.kv_cache_interface import StateCompletion
+
+    scheduler = _state_scheduler()
+    (req,) = create_requests(num_requests=1, num_tokens=4)
+    scheduler.add_request(req)
+    step = scheduler.schedule()
+    scheduler.update_from_output(step, _state_output(step))
+    scheduler.finish_requests(req.request_id, RequestStatus.FINISHED_ABORTED)
+    manager = scheduler.kv_cache_manager.coordinator.state_managers["state"]
+    assert manager.num_free_slots == 1
+    cleanup = scheduler.schedule()
+    handle = cleanup.state_cleanup_handles[req.request_id]["state"]
+    output = _state_output(cleanup, acknowledge=False)
+    handles = {req.request_id: {"state": handle}}
+    seq = cleanup.state_step_seq
+    if wrong_ack == "generation":
+        handles[req.request_id]["state"] = replace(handle, generation=99)
+    elif wrong_ack == "session":
+        handles = {"other": {"state": handle}}
+    elif wrong_ack == "step":
+        seq -= 1
+    if wrong_ack != "missing":
+        output.state_completion = StateCompletion(seq, {}, handles)
+    scheduler.update_from_output(cleanup, output)
+    assert manager.num_free_slots == 1
+    assert scheduler.has_requests()
+    retry = scheduler.schedule()
+    assert not retry.finished_req_ids
+    assert not retry.num_scheduled_tokens
+    assert retry.state_cleanup_handles == cleanup.state_cleanup_handles
+    scheduler.update_from_output(retry, _state_output(retry))
+    assert manager.num_free_slots == 2
+    assert not scheduler.has_requests()
+
+
+def test_state_cleanup_missing_ack_after_retry_fails_without_reuse():
+    """A worker that never fences cleanup stops the engine, not polls it."""
+    scheduler = _state_scheduler()
+    (req,) = create_requests(num_requests=1, num_tokens=4)
+    scheduler.add_request(req)
+    step = scheduler.schedule()
+    scheduler.update_from_output(step, _state_output(step))
+    scheduler.finish_requests(req.request_id, RequestStatus.FINISHED_ABORTED)
+    cleanup = scheduler.schedule()
+    scheduler.update_from_output(cleanup, _state_output(cleanup, acknowledge=False))
+    retry = scheduler.schedule()
+    with pytest.raises(RuntimeError, match="not acknowledged after cleanup"):
+        scheduler.update_from_output(retry, _state_output(retry, acknowledge=False))
+    manager = scheduler.kv_cache_manager.coordinator.state_managers["state"]
+    assert manager.num_free_slots == 1
+    assert len(scheduler.state_retirements) == 1
+
+
+def test_state_cleanup_late_ack_releases_without_token_replay():
+    scheduler = _state_scheduler()
+    (req,) = create_requests(num_requests=1, num_tokens=4)
+    scheduler.add_request(req)
+    step = scheduler.schedule()
+    scheduler.update_from_output(step, _state_output(step))
+    scheduler.finish_requests(req.request_id, RequestStatus.FINISHED_ABORTED)
+    cleanup = scheduler.schedule()
+    scheduler.update_from_output(cleanup, _state_output(cleanup, acknowledge=False))
+    manager = scheduler.kv_cache_manager.coordinator.state_managers["state"]
+    assert manager.num_free_slots == 1
+    scheduler._complete_state_slots(cleanup, _state_output(cleanup))
+    assert manager.num_free_slots == 2
+    assert req.num_output_tokens == 1
+
+
+def test_state_slot_never_dispatched_releases_immediately():
+    scheduler = _state_scheduler()
+    (req,) = create_requests(num_requests=1, num_tokens=4)
+    scheduler.add_request(req)
+    manager = scheduler.kv_cache_manager.coordinator.state_managers["state"]
+    assert manager.allocate(req.request_id) is not None
+    scheduler.finish_requests(req.request_id, RequestStatus.FINISHED_ABORTED)
+    assert manager.num_free_slots == 2
+    assert not scheduler.state_retirements
+
+
+def test_ordinary_deferred_free_stops_at_first_pending_fence():
+    from collections import deque
+
+    class NoScanDeque(deque):
+        def __iter__(self):
+            pytest.fail("The blocked FIFO must not be scanned")
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.processed_step_seq = 0
+    scheduler.deferred_frees = NoScanDeque([(1, [])] * 100)
+    queue = scheduler.deferred_frees
+    scheduler._drain_deferred_frees()
+    assert scheduler.deferred_frees is queue
+    assert len(queue) == 100

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
 from vllm.multimodal.utils import strip_covered_mm_data
+from vllm.v1.kv_cache_interface import StateSlotHandle
 
 if TYPE_CHECKING:
     import numpy as np
@@ -311,6 +312,10 @@ class SchedulerOutput:
     # Deprecated: cascade attention has been removed, so this is always empty.
     # Kept for out-of-tree schedulers and workers.
     num_common_prefix_blocks: list[int] = field(default_factory=list)
+
+    state_step_seq: int = 0
+    state_slot_handles: dict[str, dict[str, StateSlotHandle]] | None = None
+    state_cleanup_handles: dict[str, dict[str, StateSlotHandle]] | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
