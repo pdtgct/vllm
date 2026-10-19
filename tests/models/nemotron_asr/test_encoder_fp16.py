@@ -204,7 +204,7 @@ def test_startup_rejects_selector_before_state_construction(monkeypatch, selecti
 
     monkeypatch.setattr(model_module, "NemotronASRCore", unexpected_construction)
     monkeypatch.setattr(
-        model_module, "PersistentStateLayerBase", unexpected_construction, raising=False
+        model_module, "PersistentStateLayerBase", unexpected_construction
     )
     config = SimpleNamespace(experimental_encoder_compute_dtype=selection)
     with pytest.raises(
@@ -267,11 +267,18 @@ def test_startup_binds_effective_policy_once_and_ignores_later_config_edits(
         return core
 
     monkeypatch.setattr(model_module, "NemotronASRCore", construct_core)
+    reservations = []
+    monkeypatch.setattr(
+        model_module,
+        "PersistentStateLayerBase",
+        lambda *args, **kwargs: reservations.append((args, kwargs)),
+    )
     runtime_config = SimpleNamespace(
         model_config=SimpleNamespace(hf_config=config, dtype=torch.float32),
         scheduler_config=SimpleNamespace(max_num_seqs=1),
     )
     model = model_module.NemotronASRForRNNT(vllm_config=runtime_config)
+    assert len(reservations) == 1
     assert config.reads == 1
     assert model.core.policy is FP16_ENCODER_EXPERIMENT
     config.selection = "float32"

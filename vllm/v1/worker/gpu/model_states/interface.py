@@ -14,7 +14,7 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.tasks import GenerationTask
 from vllm.v1.attention.backend import AttentionCGSupport
-from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -119,6 +119,12 @@ class ModelState(ABC):
         if supports_realtime(self.model):
             supported_tasks.append("realtime")
         return tuple(supported_tasks)
+
+    def prepare_step(
+        self, scheduler_output: SchedulerOutput, *, dummy_run: bool, is_profile: bool
+    ) -> None:
+        """Prepare model-local state with explicit profiling/lifecycle identity."""
+        return None
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         return None

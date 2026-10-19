@@ -1712,6 +1712,7 @@ class StateCompletion:
     step_seq: int
     handles: dict[str, dict[str, StateSlotHandle]]
     cleanup_handles: dict[str, dict[str, StateSlotHandle]] = field(default_factory=dict)
+    failed_req_ids: frozenset[str] = frozenset()
 
 
 @dataclass
