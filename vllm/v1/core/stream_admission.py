@@ -125,8 +125,17 @@ class StreamAdmissions:
         return namespace.epoch
 
     def admit(
-        self, owner: str, admission_id: StreamAdmissionId, payload: EngineCoreRequest
+        self,
+        owner: str,
+        admission_id: StreamAdmissionId,
+        payload: EngineCoreRequest,
+        *,
+        reject_new_requests: bool = False,
     ) -> StreamAdmissionResult:
+        """Replay recorded results before applying the current admission policy.
+
+        A pause refusal is remembered; retry after resume with a fresh ID.
+        """
         self._validate_owner(owner)
         if type(admission_id.sequence) is not int or not (
             0 <= admission_id.sequence < 2**63
@@ -158,6 +167,8 @@ class StreamAdmissions:
         reason: StreamAdmissionReason | None = None
         if len(namespace.records) >= self.max_records and key <= min(namespace.records):
             reason = "expired_id"
+        elif reject_new_requests:
+            reason = "engine_paused"
         elif request_id in self.scheduler.requests or any(
             r.request_id == request_id for r in self.scheduler.state_retirements
         ):

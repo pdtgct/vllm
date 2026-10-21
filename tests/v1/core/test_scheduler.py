@@ -8147,6 +8147,95 @@ def _stream_chunk(core, *, closed=False):
     return Request.from_engine_core_request(payload, None)
 
 
+def _pausable_stream_core():
+    import queue
+
+    from vllm.v1.engine.core import EngineCoreProc, EngineShutdownState
+
+    core = object.__new__(EngineCoreProc)
+    core.__dict__.update(_stream_core().__dict__)
+    core.model_executor = Mock()
+    core.batch_queue = None
+    core.engines_running = False
+    core.shutdown_state = EngineShutdownState.RUNNING
+    core.reject_new_requests = False
+    core.output_queue = queue.Queue()
+    core._idle_state_callbacks = []
+    return core
+
+
+@pytest.mark.parametrize("mode", ["abort", "wait"])
+def test_stream_admission_pause_refuses_without_slots_and_replays_after_resume(mode):
+    """Pause refusals use the bounded replay window and require a fresh retry ID."""
+    core = _pausable_stream_core()
+    admissions = core.scheduler.stream_admissions
+    admissions.max_records = 2
+    free_slots = admissions.manager.num_free_slots
+    core.pause_generation(mode=mode, clear_cache=False)
+    for sequence in range(1, 4):
+        refused = _admit_stream(core, sequence)
+        assert not refused.accepted
+        assert refused.reason == "engine_paused"
+        assert refused.status == "refused"
+        assert _admit_stream(core, sequence) == refused
+        assert admissions.manager.num_free_slots == free_slots
+        assert not core.scheduler.requests and not core.scheduler.waiting
+        assert not admissions.sessions
+        assert len(admissions.owners["frontend"].records) <= 2
+    assert _admit_stream(core, 1).reason == "expired_id"
+    assert admissions.refusals["engine_paused"] == 3
+
+    core.resume_scheduler()
+    assert _admit_stream(core, 3) == refused
+    assert _admit_stream(core, 4).accepted
+    assert admissions.manager.num_free_slots == free_slots - 1
+
+
+def test_stream_admission_accepted_replay_survives_wait_pause():
+    from vllm.v1.engine import EngineCoreRequestType
+
+    core = _pausable_stream_core()
+    admissions = core.scheduler.stream_admissions
+    accepted = _admit_stream(core)
+    handle = admissions.manager.get("stream")
+    deadline = admissions.next_deadline()
+    core.pause_generation(mode="wait", clear_cache=False)
+    assert _admit_stream(core) == accepted
+    assert admissions.manager.get("stream") == handle
+    assert admissions.next_deadline() == deadline
+    assert not admissions.refusals
+    core._handle_client_request(EngineCoreRequestType.ADD, (_stream_chunk(core), 0))
+    assert admissions.sessions["stream"].status == "live"
+    assert core.output_queue.empty()
+
+
+def test_stream_admission_paused_add_rejection_preserves_incoming_identity():
+    """A tagged ADD absent from the scheduler is rejected without finishing its ID."""
+    from vllm.v1.engine import EngineCoreRequestType
+
+    core = _pausable_stream_core()
+    admissions = core.scheduler.stream_admissions
+    free_slots = admissions.manager.num_free_slots
+    core.pause_generation(mode="wait", clear_cache=False)
+    request = _stream_chunk(core)
+    request.client_index = 7
+    core._handle_client_request(EngineCoreRequestType.ADD, (request, 0))
+
+    client, batch = core.output_queue.get_nowait()
+    (output,) = batch.outputs
+    assert client == 7
+    assert output.request_id == request.request_id
+    assert output.finish_reason == FinishReason.ERROR
+    assert output.error.code == "engine_paused" and output.error.retryable
+    assert output.stream_output.context == request.stream_admission
+    assert output.stream_output.rejection == "engine_paused"
+    assert not batch.finished_requests
+    assert core.output_queue.empty()
+    assert not core.scheduler.requests and not core.scheduler.waiting
+    assert not admissions.sessions
+    assert admissions.manager.num_free_slots == free_slots
+
+
 @pytest.mark.parametrize(
     "fault",
     [
@@ -9049,12 +9138,15 @@ def test_stream_admission_ordinary_preaborted_add_still_aborts():
 
 
 @pytest.mark.parametrize("identity", ["stale", "unknown", "untagged"])
-@pytest.mark.parametrize("cause", ["preprocessing_error", "shutdown", "mm_cache_miss"])
+@pytest.mark.parametrize(
+    "cause", ["preprocessing_error", "shutdown", "mm_cache_miss", "validation_error"]
+)
 def test_stream_admission_ingress_rejection_preserves_identity(identity, cause):
     """A rejected ADD cannot report completion of a reused request ID."""
     import queue
     from copy import deepcopy
 
+    from vllm.exceptions import VLLMValidationError
     from vllm.multimodal.cache import MultiModalCacheMissError
     from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequest
     from vllm.v1.engine.core import EngineCoreProc, EngineShutdownState
@@ -9094,6 +9186,10 @@ def test_stream_admission_ingress_rejection_preserves_identity(identity, cause):
     elif cause == "shutdown":
         request, _ = proc.preprocess_add_request(payload)
         assert proc._reject_add_in_shutdown(request)
+    elif cause == "validation_error":
+        proc._handle_request_validation_error(
+            payload, VLLMValidationError("invalid stream update")
+        )
     else:
         proc._handle_mm_cache_miss(payload, MultiModalCacheMissError(["missing"]))
 
@@ -9117,6 +9213,9 @@ def test_stream_admission_ingress_rejection_preserves_identity(identity, cause):
     )
     if cause == "mm_cache_miss":
         assert batch.engine_index == 2
+    if cause == "validation_error":
+        assert output.error.code == "validation_error"
+        assert output.error.message == "invalid stream update"
     assert proc.output_queue.empty()
     assert scheduler.requests["stream"] is replacement
     assert replacement.status == RequestStatus.WAITING_FOR_STREAMING_REQ

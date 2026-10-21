@@ -121,7 +121,12 @@ StreamAdmissionStatus = Literal[
     "never_fed", "live", "parked", "draining", "awaiting_fence", "finished", "refused"
 ]
 StreamAdmissionReason = Literal[
-    "owner_epoch", "expired_id", "request_id_in_use", "capacity", "active_limit"
+    "owner_epoch",
+    "expired_id",
+    "request_id_in_use",
+    "capacity",
+    "active_limit",
+    "engine_paused",
 ]
 StreamUpdateRejection = Literal[
     "unknown_admission",

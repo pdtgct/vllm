@@ -511,7 +511,12 @@ class EngineCore:
         if admissions is None:
             raise ValueError("Stream admission requires persistent state")
         admissions.expire()
-        return admissions.admit(owner, admission_id, request)
+        return admissions.admit(
+            owner,
+            admission_id,
+            request,
+            reject_new_requests=getattr(self, "reject_new_requests", False),
+        )
 
     def add_request(self, request: Request, request_wave: int = 0):
         """Add request to the scheduler.
