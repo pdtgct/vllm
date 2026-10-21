@@ -6,24 +6,17 @@ Run in a fresh process: installing vLLM overrides is process-wide. The synthetic
 matrix uses the production optimized graph owner and real encoder dimensions.
 It is a necessary numerical falsifier, never a complete qualification verdict.
 
-Transcript and cost tests validate supplied lab packets, not synthetic substitutes.
-NEMOTRON_BI_TRANSCRIPT_IDENTITY_MANIFEST names the matched FP32 arms' exact
-20-cell final transcripts, fingerprints, receipts and mode-off NeMo parity.
-NEMOTRON_BI_COST_MANIFEST names matched unprofiled raw observations and medians.
-Missing transcript evidence leaves the verdict unqualified; missing/invalid cost
-disclosure blocks publication only, without changing readiness or the verdict.
+Lab transcript and cost packet validators live in the harness falsifier experiment.
 """
 
 from __future__ import annotations
 
 import copy
 import importlib
-import json
 import os
 from contextlib import contextmanager
 from dataclasses import replace
 from itertools import combinations, product
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -389,50 +382,6 @@ def test_prec020_023_graph_row_invariance(mode_on, policy, padded):
             for chunk_a, chunk_b in zip(actual, repeat, strict=True):
                 for a, b in zip(chunk_a, chunk_b, strict=True):
                     _assert_snapshot(a, b, (context, "independent reset"))
-
-
-def _manifest(variable):
-    value = os.environ.get(variable)
-    assert value, (
-        f"provide pre-existing lab evidence via {variable}; no goldens are generated "
-        "here"
-    )
-    path = Path(value)
-    assert path.name != ".env"
-    return json.loads(path.read_text()), path.parent
-
-
-@cuda_only
-def test_prec024_fp32_mode_transcript_identity():
-    """@spec PORT-PREC-024: validate supplied 20-cell, byte-identical FP32 finals.
-
-    No mode-on NeMo tensor gate, WER tolerance, experiment or mode installation.
-    """
-    from batch_invariant_packet import validate_transcript_identity
-
-    manifest, _ = _manifest("NEMOTRON_BI_TRANSCRIPT_IDENTITY_MANIFEST")
-    validate_transcript_identity(manifest)
-
-
-@cuda_only
-def test_prec022_disclosure_manifest():
-    """@spec PORT-PREC-022: invalid disclosure blocks publication only.
-
-    Failure does not invalidate PREC-024 evidence, change readiness or change
-    the verdict. Supplied unprofiled paired cost has no performance threshold.
-    """
-    from batch_invariant_packet import (
-        PUBLICATION_ONLY,
-        installed_inventory,
-        validate_cost_disclosure,
-    )
-
-    try:
-        manifest, _ = _manifest("NEMOTRON_BI_COST_MANIFEST")
-        inventory, source_sha256 = installed_inventory()
-        validate_cost_disclosure(manifest, inventory, source_sha256)
-    except (AssertionError, OSError, ValueError) as error:
-        raise AssertionError(f"{PUBLICATION_ONLY}: {error}") from error
 
 
 @pytest.mark.parametrize("ndim", [1, 2])
