@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
 import os
+import sys
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -9,6 +11,7 @@ import torch
 import torch.distributed as dist
 
 import vllm.envs as envs
+from vllm.model_executor.determinism import schema_adapters
 from vllm.model_executor.determinism.batch_invariant_configs import (
     _get_descriptor_matmul_config,
     _get_matmul_config,
@@ -1277,6 +1280,10 @@ _fp32_block_size_n = 128
 _fp32_num_stages = 3
 _BLOCK_SIZES_RESOLVED = False
 _NUM_SMS: int = 0
+_init_failure: Exception | None = None
+# Serializes the flag check, kernel and adapter registration, and failure
+# publication; observers hold it to read only completed or failed state.
+_init_lock = threading.RLock()
 
 
 def _resolve_block_sizes():
@@ -1303,6 +1310,25 @@ def _resolve_block_sizes():
 
 
 def enable_batch_invariant_mode():
+    """Install the overrides once; a failed install is raised on every call.
+
+    The mode flag is set before registration starts, so without the lock a
+    concurrent call would return early during registration, and without the
+    recorded failure a later call would return as if installation completed.
+    """
+    global _init_failure
+    with _init_lock:
+        if _init_failure is not None:
+            raise _init_failure
+        try:
+            _register_batch_invariant_kernels()
+            schema_adapters.install_schema_adapters(sys.modules[__name__])
+        except Exception as error:
+            _init_failure = error
+            raise
+
+
+def _register_batch_invariant_kernels():
     global _batch_invariant_MODE, _batch_invariant_LIB
     global _fp16_block_size_n, _fp32_block_size_n, _fp32_num_stages
     global _NUM_SMS

@@ -11,6 +11,7 @@ import torch
 from utils import skip_unsupported
 
 import vllm.model_executor.determinism.batch_invariant as bi
+from vllm.model_executor.determinism import schema_adapters
 from vllm.model_executor.determinism.batch_invariant import (
     enable_batch_invariant_mode,
     matmul_batch_invariant,
@@ -142,6 +143,10 @@ def batch_invariant_mode():
     enable_batch_invariant_mode()
     yield
     assert bi._batch_invariant_LIB is not None
+    assert schema_adapters._library is not None
+    schema_adapters._library._destroy()
+    schema_adapters._library, schema_adapters._source = None, None
+    schema_adapters._installed = ()
     bi._batch_invariant_LIB._destroy()
     bi._batch_invariant_MODE = False
 

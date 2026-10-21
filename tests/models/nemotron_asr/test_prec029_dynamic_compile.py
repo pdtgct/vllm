@@ -329,10 +329,14 @@ def test_prec029_dynamic_batch_cuda_capture(
     """@spec PORT-PREC-029, PORT-PERF-011:
     real CUDA tier captures use the two frames.
     """
+    from vllm.model_executor.determinism import batch_invariant
     from vllm.models.nemotron_asr.batch_invariance import installed_batch_invariant_mode
 
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
-    assert installed_batch_invariant_mode().enabled
+    # The worker initializer owns installation; the model only reads it.
+    assert installed_batch_invariant_mode(
+        module=batch_invariant, initialize=batch_invariant.init_batch_invariance
+    ).enabled
     with monkeypatch.context() as run_patch:
         _, frames, expected, results = _exercise(
             run_patch,

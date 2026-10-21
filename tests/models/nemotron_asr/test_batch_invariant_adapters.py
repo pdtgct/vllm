@@ -1,111 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU schema and arithmetic oracles; these do not qualify CUDA kernels."""
+"""CPU installation-witness oracles; these do not qualify CUDA kernels.
+
+Schema and arithmetic tests for the adapters themselves live with vLLM's
+determinism tests (tests/v1/determinism/test_schema_adapters.py).
+"""
 
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from vllm.model_executor.determinism import schema_adapters
 from vllm.models.nemotron_asr import batch_invariance as port
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.core_model]
 
 
-def kernels():
-    # Independent CPU references, not replacement production kernels.
-    return SimpleNamespace(
-        mm_batch_invariant=lambda a, b: torch.mm(a, b),
-        addmm_batch_invariant=lambda bias, a, b: torch.addmm(bias, a, b),
-        bmm_batch_invariant=lambda a, b: torch.bmm(a, b),
-        matmul_batch_invariant=lambda a, b: torch.matmul(a, b),
-        linear_batch_invariant=lambda x, w, bias: torch.nn.functional.linear(
-            x, w, bias
-        ),
-        softmax_batch_invariant=lambda x, dim: torch.softmax(x, dim),
-        _log_softmax_batch_invariant=lambda x, dim, half: torch.log_softmax(
-            x.float() if half else x, dim
-        ),
-        mean_batch_invariant=lambda x, dim, keepdim, dtype: x.mean(
-            tuple(dim), keepdim, dtype=dtype
-        ),
-    )
-
-
-@pytest.mark.parametrize("beta,alpha", [(1, 1), (0, 1), (2, -0.5), (-1, 0), (0, 0)])
-@pytest.mark.parametrize("bias_shape", [(), (3,), (2, 3)])
-def test_prec021_addmm_scalars(beta, alpha, bias_shape):
-    """@spec PORT-PREC-021: scaling and broadcasting happen in FP32."""
-    op = port._schema_wrappers(kernels())["addmm"]
-    a = torch.arange(8, dtype=torch.float32).reshape(2, 4) / 4
-    b = torch.arange(12, dtype=torch.float32).reshape(4, 3) / 2
-    bias = torch.full(bias_shape, float("nan") if beta == 0 else 0.5)
-    expected = torch.addmm(bias, a, b, beta=beta, alpha=alpha)
-    out = torch.empty_like(expected)
-    assert torch.equal(op(bias, a, b, beta=beta, alpha=alpha), expected)
-    assert op(bias, a, b, beta=beta, alpha=alpha, out=out) is out
-    assert torch.equal(out, expected)
-
-
-def test_prec021_addmm_bias_before_cast():
-    """@spec PORT-PREC-021: preserve vLLM's fused path for unit scaling."""
-    source = kernels()
-    calls = []
-
-    def fused(bias, a, b):
-        calls.append(True)
-        return torch.addmm(bias.float(), a.float(), b.float()).to(a.dtype)
-
-    source.addmm_batch_invariant = fused
-    op = port._schema_wrappers(source)["addmm"]
-    a = torch.tensor([[1, 2**-11]], dtype=torch.float16)
-    b = torch.ones(2, 1, dtype=torch.float16)
-    bias = torch.tensor([-1], dtype=torch.float16)
-    assert op(bias, a, b).item() == 2**-11
-    assert calls == [True]
-    assert op(bias, a, b, beta=2, alpha=2).item() == 2**-10
-
-
-@pytest.mark.parametrize("name", ["mm", "bmm"])
-def test_prec021_positional_dtype_and_out(name):
-    """@spec PORT-PREC-021, PORT-PREC-027: accept dtype and out call shapes."""
-    op = port._schema_wrappers(kernels())[name]
-    a = torch.ones((2, 3) if name == "mm" else (1, 2, 3), dtype=torch.float16)
-    b = torch.ones((3, 4) if name == "mm" else (1, 3, 4), dtype=torch.float16)
-    expected = torch.full((2, 4) if name == "mm" else (1, 2, 4), 3.0)
-    out = torch.empty_like(expected)
-    assert torch.equal(op(a, b, torch.float32), expected)
-    assert op(a, b, torch.float32, out=out) is out
-    assert torch.equal(out, expected)
-    with pytest.raises((ValueError, TypeError)):
-        op(a, b, torch.float64)
-
-
-def test_prec021_reduction_schema_arguments():
-    """@spec PORT-PREC-021: half_to_float, dtype, and optional dim are honored."""
-    ops = port._schema_wrappers(kernels())
-    x = torch.tensor([[1, 2]], dtype=torch.float16)
-    for name in ("_softmax", "_log_softmax"):
-        result = ops[name](x, dim=-1, half_to_float=True)
-        assert result.dtype == torch.float32
-        out = torch.empty_like(result)
-        assert ops[name](x, -1, True, out=out) is out
-        assert torch.equal(result, out)
-    assert ops["softmax.int"](x, -1, dtype=torch.float32).dtype == torch.float32
-    assert ops["mean.dim"](x, None).dtype == torch.float16
-    assert ops["mean.dim"](x, [], dtype=torch.float32).item() == 1.5
-
-
-def test_prec018_schema_installation_lifetime(monkeypatch):
-    """@spec PORT-PREC-018, PORT-PREC-022, PORT-PREC-028: ordered and reversible."""
+def test_prec018_schema_installation_witness():
+    """@spec PORT-PREC-018, PORT-PREC-022, PORT-PREC-028: vLLM installs, model reads."""
     from tests.models.nemotron_asr.conftest import preserve_batch_invariance
 
-    source = kernels()
-    source.mm_batch_invariant = lambda a, b: (a.unsqueeze(-1) * b.unsqueeze(0)).sum(1)
+    source = SimpleNamespace(
+        mm_batch_invariant=lambda a, b: (a.unsqueeze(-1) * b.unsqueeze(0)).sum(1),
+        bmm_batch_invariant=lambda a, b: (a.unsqueeze(-1) * b.unsqueeze(1)).sum(2),
+    )
     source.addmm_batch_invariant = (
         lambda bias, a, b: source.mm_batch_invariant(a, b) + bias
     )
-    source.bmm_batch_invariant = lambda a, b: (a.unsqueeze(-1) * b.unsqueeze(1)).sum(2)
     source._batch_invariant_MODE = False
     source._batch_invariant_LIB = None
     source._fp16_block_size_n, source._fp32_block_size_n, source._fp32_num_stages = (
@@ -116,64 +38,176 @@ def test_prec018_schema_installation_lifetime(monkeypatch):
     configs = SimpleNamespace(
         _TUNED_MATMUL_CONFIGS_FOR_DEVICE=None, _TUNED_MATMUL_CONFIGS_RESOLVED=False
     )
-    before = port._schema_library
-    original_bmm = torch.bmm
-    monkeypatch.setattr(port, "_schema_library", None)
-    monkeypatch.setattr(port, "_schema_source", None)
-    monkeypatch.setattr(port, "_schema_installed", ())
+    original_bmm, before = torch.bmm, schema_adapters._library
     with preserve_batch_invariance(source, configs):
+        schema_adapters._library, schema_adapters._source = None, None
+        schema_adapters._installed, schema_adapters._failure = (), None
         events = []
 
         def initialize():
+            # Mirrors vLLM's initializer: register kernels, then adapters.
             events.append("vllm initialized")
             source._batch_invariant_MODE = True
             source._batch_invariant_LIB = torch.library.Library("aten", "IMPL")
-            source._batch_invariant_LIB.impl(
-                "mm", source.mm_batch_invariant, "CPU", allow_override=True
-            )
-            source._batch_invariant_LIB.impl(
-                "addmm", source.addmm_batch_invariant, "CPU", allow_override=True
-            )
-            source._batch_invariant_LIB.impl(
-                "bmm", source.bmm_batch_invariant, "CPU", allow_override=True
-            )
+            for op in ("mm", "addmm", "bmm"):
+                source._batch_invariant_LIB.impl(
+                    op,
+                    getattr(source, f"{op}_batch_invariant"),
+                    "CPU",
+                    allow_override=True,
+                )
+            schema_adapters.install_schema_adapters(source)
 
         off = port.installed_batch_invariant_mode(
             module=source, initialize=lambda: None
         )
-        assert off.schema_adapters == () and port._schema_library is None
+        assert off.schema_adapters == () and schema_adapters._library is None
+        # A real library without completed adapters is not an installed mode.
+        source._batch_invariant_MODE = True
+        source._batch_invariant_LIB = torch.library.Library("aten", "IMPL")
+        with pytest.raises(RuntimeError, match="incomplete"):
+            port.installed_batch_invariant_mode(module=source, initialize=lambda: None)
+        source._batch_invariant_LIB._destroy()
+        source._batch_invariant_MODE = False
         record = port.installed_batch_invariant_mode(
             module=source, initialize=initialize
         )
         assert events == ["vllm initialized"]
-        assert record.enabled and "aten::addmm/CPU" in record.schema_adapters
+        assert record.enabled and record.schema_adapters == schema_adapters._installed
+        assert "aten::addmm/CPU" in record.schema_adapters
         assert "aten::bmm.out/CPU" in record.schema_adapters
-        library = port._schema_library
-        assert port._install_schema_adapters(source) == record.schema_adapters
-        assert port._schema_library is library
-        a, b, bias = torch.ones(2, 3), torch.ones(3, 4), torch.ones(4)
-        assert torch.equal(
-            torch.ops.aten.addmm(a.new_ones(4), a, b, beta=2, alpha=2),
-            a.new_full((2, 4), 8),
+        # Overloads beyond vLLM's own registrations are all disclosed.
+        registered = {
+            "aten::" + entry.split("/")[1]
+            for entry in source._batch_invariant_LIB._op_impls
+        }
+        overloads: tuple[str, ...] = record.schema_adapters
+        adapted = {item.split("/")[0] for item in overloads}
+        added = adapted - registered
+        assert added and added <= set(port.SCHEMA_ADAPTER_SIDE_EFFECTS)
+        # Snapshotting again reads the same installation; it never reinstalls.
+        library = schema_adapters._library
+        again = port.installed_batch_invariant_mode(
+            module=source, initialize=lambda: None
         )
-        out = torch.empty(2, 4)
-        assert torch.ops.aten.addmm.out(bias, a, b, out=out) is out
-        assert torch.equal(out, a.new_full((2, 4), 4))
+        assert again == record and schema_adapters._library is library
+        a, b = torch.ones(2, 3), torch.ones(3, 4)
         a3, b3 = a[None], b[None]
-        assert torch.equal(torch.ops.aten.bmm(a3, b3), a.new_full((1, 2, 4), 3))
-        # Exercise actual dtype overload dispatch where this Torch exposes it.
         if "dtype" in torch.ops.aten.bmm._schemas:
-            assert (
-                torch.ops.aten.bmm.dtype(a3.half(), b3.half(), torch.float32).dtype
-                == torch.float32
-            )
-        assert torch.bmm(a3.half(), b3.half(), torch.float32).dtype == torch.float32
-    assert port._schema_library is None
+            assert torch.bmm(a3.half(), b3.half(), torch.float32).dtype == torch.float32
+        assert torch.bmm is original_bmm
+    assert schema_adapters._library is before
     assert torch.bmm is original_bmm
     assert torch.equal(
         torch.mm(torch.ones(1, 2), torch.ones(2, 1)), torch.tensor([[2.0]])
     )
-    monkeypatch.setattr(port, "_schema_library", before)
+
+
+def set_requested(monkeypatch, enabled):
+    # vllm.envs may hold a concrete attribute left by an earlier monkeypatch,
+    # which would mask the environment; set both, as core determinism tests do.
+    import vllm.envs as envs
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", enabled)
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1" if enabled else "0")
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_prec018_production_witness_fails_closed(monkeypatch, enabled):
+    """@spec PORT-PREC-018: a requested mode vLLM did not install is an error."""
+    from vllm.model_executor.determinism import batch_invariant
+
+    monkeypatch.setattr(batch_invariant, "_batch_invariant_MODE", False)
+    monkeypatch.setattr(batch_invariant, "_batch_invariant_LIB", None)
+    monkeypatch.setattr(batch_invariant, "_init_failure", None)
+    set_requested(monkeypatch, enabled)
+    if enabled:
+        with pytest.raises(RuntimeError, match="did not initialize"):
+            port.installed_batch_invariant_mode()
+    else:
+        assert port.installed_batch_invariant_mode() == port.MODE_OFF
+
+
+def test_prec018_production_witness_raises_initializer_failure(monkeypatch):
+    """@spec PORT-PREC-018: a failed native install is never a usable mode."""
+    from vllm.model_executor.determinism import batch_invariant
+
+    error = RuntimeError("registration failed")
+    monkeypatch.setattr(batch_invariant, "_batch_invariant_MODE", True)
+    monkeypatch.setattr(batch_invariant, "_batch_invariant_LIB", object())
+    monkeypatch.setattr(batch_invariant, "_init_failure", error)
+    set_requested(monkeypatch, True)
+    with pytest.raises(RuntimeError) as caught:
+        port.installed_batch_invariant_mode()
+    assert caught.value is error
+
+
+@pytest.mark.parametrize("outcome", ["complete", "failure"])
+def test_prec018_observer_waits_for_native_install(monkeypatch, outcome):
+    """@spec PORT-PREC-018: an in-progress install is awaited, never attested."""
+    import threading
+
+    from vllm.model_executor.determinism import batch_invariant
+
+    for owner, names in (
+        (batch_invariant, ("_batch_invariant_MODE", "_batch_invariant_LIB")),
+        (batch_invariant, ("_init_failure",)),
+        (schema_adapters, ("_library", "_source", "_installed", "_failure")),
+    ):
+        for name in names:
+            monkeypatch.setattr(owner, name, getattr(owner, name))
+    batch_invariant._init_failure = None
+    schema_adapters._library, schema_adapters._source = None, None
+    schema_adapters._installed, schema_adapters._failure = (), None
+    set_requested(monkeypatch, True)
+    error = RuntimeError("registration failed")
+    source = torch.library.Library("aten", "IMPL")
+    adapters = torch.library.Library("aten", "IMPL")
+    holding, finish = threading.Event(), threading.Event()
+    results: dict = {}
+
+    def initializer():
+        # The native initializer's state while registration is in progress.
+        with batch_invariant._init_lock:
+            batch_invariant._batch_invariant_MODE = True
+            batch_invariant._batch_invariant_LIB = source
+            holding.set()
+            assert finish.wait(10)
+            if outcome == "failure":
+                batch_invariant._init_failure = error
+            else:
+                schema_adapters._library, schema_adapters._source = adapters, source
+                schema_adapters._installed = ("aten::bmm.out/CPU",)
+
+    def observe():
+        try:
+            results["record"] = port.installed_batch_invariant_mode()
+        except RuntimeError as caught:
+            results["error"] = caught
+
+    native = threading.Thread(target=initializer, daemon=True)
+    native.start()
+    try:
+        assert holding.wait(10)
+        observer = threading.Thread(target=observe, daemon=True)
+        observer.start()
+        observer.join(0.2)
+        assert observer.is_alive(), "observer attested an in-progress install"
+        finish.set()
+        native.join(10)
+        observer.join(10)
+        assert not observer.is_alive()
+        if outcome == "failure":
+            assert results == {"error": error}
+        else:
+            assert results == {
+                "record": port.BatchInvariantExecution(True, ("aten::bmm.out/CPU",))
+            }
+    finally:
+        finish.set()
+        native.join(10)
+        adapters._destroy()
+        source._destroy()
 
 
 def test_prec022_schema_disclosure_is_additive():

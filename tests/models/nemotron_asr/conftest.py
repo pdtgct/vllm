@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 import torch
 
-from vllm.models.nemotron_asr import batch_invariance as port
+from vllm.model_executor.determinism import schema_adapters
 
 _ENV_KEYS = (
     "VLLM_BATCH_INVARIANT",
@@ -59,14 +59,8 @@ def preserve_batch_invariance(batch_invariant, configs):
             ("_TUNED_MATMUL_CONFIGS_FOR_DEVICE", "_TUNED_MATMUL_CONFIGS_RESOLVED"),
         ),
         (
-            port,
-            (
-                "_installed",
-                "_install_failure",
-                "_schema_library",
-                "_schema_source",
-                "_schema_installed",
-            ),
+            schema_adapters,
+            ("_library", "_source", "_installed", "_failure"),
         ),
         (torch, ("bmm",)),
         (nccl, ("_unpinned_env",)),
@@ -83,7 +77,7 @@ def preserve_batch_invariance(batch_invariant, configs):
     ):
         saved.extend((owner, name, getattr(owner, name)) for name in names)
     for owner, names in (
-        (batch_invariant, ("_BLOCK_SIZES_RESOLVED", "_NUM_SMS")),
+        (batch_invariant, ("_BLOCK_SIZES_RESOLVED", "_NUM_SMS", "_init_failure")),
         (inductor_config, ("batch_invariant",)),
     ):
         saved.extend(
@@ -102,7 +96,7 @@ def preserve_batch_invariance(batch_invariant, configs):
                     "_REDUCED_PRECISION_NOTE",
                 )
             )
-    adapter_library = port._schema_library
+    adapter_library = schema_adapters._library
     library = batch_invariant._batch_invariant_LIB
     blas = torch.backends.cuda.preferred_blas_library()
     try:
@@ -111,10 +105,10 @@ def preserve_batch_invariance(batch_invariant, configs):
         # Drop compiled artifacts that could retain a mode-on specialization.
         torch._dynamo.reset()
         if (
-            port._schema_library is not None
-            and port._schema_library is not adapter_library
+            schema_adapters._library is not None
+            and schema_adapters._library is not adapter_library
         ):
-            port._schema_library._destroy()
+            schema_adapters._library._destroy()
         installed = batch_invariant._batch_invariant_LIB
         if installed is not None and installed is not library:
             installed._destroy()
