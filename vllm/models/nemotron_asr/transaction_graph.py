@@ -261,6 +261,9 @@ class _TransactionGraph:
     progress_out: torch.Tensor
     replay: Callable[[], None]
     retained_bytes: int | None = None
+    warmup_seconds: float | None = None
+    capture_seconds: float | None = None
+    capture_index: int | None = None
     capture_graph: Callable[[], None] | None = None
     verify: Callable[[], None] | None = None
 
@@ -375,6 +378,7 @@ class TransactionGraphBinding:
         self._runtime = runtime
         self._graphs: dict[TransactionCell, _TransactionGraph] = {}
         self._pool_signature: tuple[Any, ...] | None = None
+        self._retained_bytes_total: int | None = None
         self._replays: dict[TransactionCell, int] = {}
         self._fallbacks: dict[tuple[str, str], int] = {}
         self._prologue_ns_last = 0
@@ -392,6 +396,7 @@ class TransactionGraphBinding:
     def discard(self) -> None:
         self._graphs = {}
         self._pool_signature = None
+        self._retained_bytes_total = None
 
     # ------------------------------------------------------------- capture
     @torch.inference_mode()
@@ -443,9 +448,24 @@ class TransactionGraphBinding:
             # extended module buffers must not be rebound under a graph that
             # already recorded their addresses. Every graph is then verified
             # after the last capture.
-            for graph in pending.values():
+            # Graphs share the platform's global pool and replay serially, and
+            # no pool tensor outlives its capture (outputs are copied into
+            # owned buffers). Capturing the largest population first lets the
+            # smaller cells reuse its freed segments, so the retained pool is
+            # about the largest cell's transient peak rather than the sum.
+            reserved = (
+                torch.cuda.memory_reserved(device) if device.type == "cuda" else None
+            )
+            order = sorted(pending.values(), key=lambda g: -g.cell.population)
+            for index, graph in enumerate(order):
                 assert graph.capture_graph is not None
+                graph.capture_index = index
                 graph.capture_graph()
+            retained_total = (
+                None
+                if reserved is None
+                else torch.cuda.memory_reserved(device) - reserved
+            )
             for graph in pending.values():
                 assert graph.verify is not None
                 graph.verify()
@@ -453,6 +473,7 @@ class TransactionGraphBinding:
             consume_batch_stats()
         self._graphs = pending
         self._pool_signature = signature
+        self._retained_bytes_total = retained_total
         self._runtime = runtime
 
     def _capture_cell(
@@ -469,6 +490,7 @@ class TransactionGraphBinding:
         hidden_size: int,
         device: torch.device,
     ) -> _TransactionGraph:
+        started = time.perf_counter()
         geometry = self._replay_geometry if cell.kind == CELL_REPLAY else cell.geometry
         plan = _capture_plan(
             cell,
@@ -603,9 +625,11 @@ class TransactionGraphBinding:
             status_out=status_out,
             progress_out=progress_out,
             replay=lambda: launch(runtime.graph_mode),
+            warmup_seconds=time.perf_counter() - started,
         )
 
         def capture_graph() -> None:
+            started = time.perf_counter()
             reserved = (
                 torch.cuda.memory_reserved(device) if device.type == "cuda" else None
             )
@@ -626,6 +650,7 @@ class TransactionGraphBinding:
                 runtime.set_capture_enabled(False)
             if reserved is not None:
                 graph.retained_bytes = torch.cuda.memory_reserved(device) - reserved
+            graph.capture_seconds = time.perf_counter() - started
 
         def verify() -> None:
             for value in owned:
@@ -729,27 +754,38 @@ class TransactionGraphBinding:
         return counts
 
     def receipt(self) -> dict[str, Any]:
+        """Startup coverage and per-cell capture cost.
+
+        ``retained_bytes`` is each capture's reserved-memory growth; the cells
+        share one graph pool, so a later, smaller cell often adds nothing and
+        ``retained_bytes_total`` is the pool's growth over all captures.
+        ``warmup_seconds`` covers the cell's eager reference and warm-ups,
+        ``capture_seconds`` its capture and instantiation.
+        """
+        fields = (
+            "retained_bytes",
+            "warmup_seconds",
+            "capture_seconds",
+            "capture_index",
+        )
+
+        def cell_entry(cell: TransactionCell) -> dict[str, Any]:
+            graph = self._graphs.get(cell)
+            entry: dict[str, Any] = {
+                "cell": cell.label,
+                "captured": graph is not None,
+                "arena_bytes": None if graph is None else graph.arena.nbytes,
+            }
+            for name in fields:
+                entry[name] = None if graph is None else getattr(graph, name)
+            return entry
+
         return {
             "ready": self.ready,
             "worker_pid": os.getpid(),
             "instance_id": self._instance_id,
-            "cells": [
-                {
-                    "cell": cell.label,
-                    "captured": cell in self._graphs,
-                    "arena_bytes": (
-                        self._graphs[cell].arena.nbytes
-                        if cell in self._graphs
-                        else None
-                    ),
-                    "retained_bytes": (
-                        self._graphs[cell].retained_bytes
-                        if cell in self._graphs
-                        else None
-                    ),
-                }
-                for cell in self._cells
-            ],
+            "retained_bytes_total": self._retained_bytes_total,
+            "cells": [cell_entry(cell) for cell in self._cells],
             "counters": self.counters(),
         }
 

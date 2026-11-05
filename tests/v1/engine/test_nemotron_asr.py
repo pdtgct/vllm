@@ -240,11 +240,14 @@ _G0_BASE_OVERRIDES = {
 }
 
 
-def _run_g0_stream(hf_overrides, num_chunks):
-    """Feed one fresh g0 session ``num_chunks`` CHUNKs, each through its park.
+def _run_g0_stream(hf_overrides, num_chunks, sessions=1):
+    """Feed ``sessions`` fresh g0 sessions ``num_chunks`` CHUNKs in lockstep.
 
-    Returns per-chunk output tokens, the resident state storage after each
-    park, and the model's transaction graph counters.
+    Every session's CHUNK is queued before the step that carries them, and the
+    next CHUNKs wait until every session has parked, so each CHUNK step holds
+    the whole population. Returns per-chunk output tokens per session, the
+    resident state storage after each park, the model's transaction graph
+    counters and the number of executed steps after each CHUNK step.
     """
     import gc
     from dataclasses import replace
@@ -273,8 +276,8 @@ def _run_g0_stream(hf_overrides, num_chunks):
 
     args = replace(
         _engine_args(),
-        max_num_seqs=1,
-        num_gpu_blocks_override=2,
+        max_num_seqs=sessions,
+        num_gpu_blocks_override=sessions + 1,
         gpu_memory_utilization=0.4,
         hf_overrides=hf_overrides,
     )
@@ -286,12 +289,13 @@ def _run_g0_stream(hf_overrides, num_chunks):
         hf = config.model_config.hf_config
         owner = "transaction-graph"
         epoch = core.get_stream_admission_epoch(owner)
+        names = ["audio"] if sessions == 1 else [f"audio-{i}" for i in range(sessions)]
 
-        def request():
+        def request(name):
             params = SamplingParams(temperature=0, max_tokens=142, detokenize=False)
             params.update_from_generation_config({}, hf.eos_token_id)
             return EngineCoreRequest(
-                request_id="audio",
+                request_id=name,
                 prompt_token_ids=[],
                 mm_features=None,
                 sampling_params=params,
@@ -303,61 +307,71 @@ def _run_g0_stream(hf_overrides, num_chunks):
                 resumable=True,
             )
 
-        assert core.admit_stream(owner, StreamAdmissionId(epoch, 0), request()).accepted
+        for index, name in enumerate(names):
+            assert core.admit_stream(
+                owner, StreamAdmissionId(epoch, index), request(name)
+            ).accepted
         size = RAW_SAMPLES_PER_CHUNK["80ms"]
-        generator = torch.Generator().manual_seed(0)
-        tokens, pages = [], []
+        generators = [torch.Generator().manual_seed(i) for i in range(sessions)]
+        tokens, pages, echo_steps = [], [], []
         for sequence in range(num_chunks):
-            if sequence == 0:
-                samples = torch.zeros(size)
-            else:
-                samples = 0.05 * torch.randn(size, generator=generator)
-            envelope = torch.cat(
-                (
-                    torch.tensor([2, size, 0, 0, 0, sequence, 1], dtype=torch.float32),
-                    samples,
+            for index, name in enumerate(names):
+                if sequence == 0:
+                    samples = torch.zeros(size)
+                else:
+                    samples = 0.05 * torch.randn(size, generator=generators[index])
+                envelope = torch.cat(
+                    (
+                        torch.tensor(
+                            [2, size, 0, 0, 0, sequence, 1], dtype=torch.float32
+                        ),
+                        samples,
+                    )
                 )
-            )
-            items = MultiModalKwargsItems.from_hf_inputs(
-                BatchFeature({"audio": [envelope]}),
-                {"audio": MultiModalFieldConfig.batched("audio")},
-            )
-            payload = request()
-            payload.prompt_token_ids = [hf.audio_chunk_token_id]
-            payload.mm_features = [
-                MultiModalFeatureSpec(
-                    data=items["audio"][0],
-                    modality="audio",
-                    identifier=f"g0-{sequence}",
-                    mm_position=PlaceholderRange(0, 1),
+                items = MultiModalKwargsItems.from_hf_inputs(
+                    BatchFeature({"audio": [envelope]}),
+                    {"audio": MultiModalFieldConfig.batched("audio")},
                 )
-            ]
-            payload.stream_admission = StreamAdmissionContext(
-                owner, StreamAdmissionId(epoch, 0), False
-            )
-            core.add_request(*core.preprocess_add_request(payload))
-            received = []
+                payload = request(name)
+                payload.prompt_token_ids = [hf.audio_chunk_token_id]
+                payload.mm_features = [
+                    MultiModalFeatureSpec(
+                        data=items["audio"][0],
+                        modality="audio",
+                        identifier=f"g0-{name}-{sequence}",
+                        mm_position=PlaceholderRange(0, 1),
+                    )
+                ]
+                payload.stream_admission = StreamAdmissionContext(
+                    owner, StreamAdmissionId(epoch, index), False
+                )
+                core.add_request(*core.preprocess_add_request(payload))
+            received = {name: [] for name in names}
+            executed_steps = 0
             for _ in range(144):
                 outputs, executed = core.step()
                 core.post_step(executed)
-                received.extend(
-                    token
-                    for batch in outputs.values()
-                    for item in batch.outputs
-                    for token in item.new_token_ids
-                )
-                status = core.scheduler.requests["audio"].status
-                if status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+                executed_steps += int(bool(executed))
+                for batch in outputs.values():
+                    for item in batch.outputs:
+                        received[item.request_id].extend(item.new_token_ids)
+                if all(
+                    core.scheduler.requests[name].status
+                    == RequestStatus.WAITING_FOR_STREAMING_REQ
+                    for name in names
+                ):
                     break
             else:
                 pytest.fail("g0 chunk did not park within its emission bound")
-            assert received and received[-1] == hf.eos_token_id
-            tokens.append(received)
+            for name in names:
+                assert received[name] and received[name][-1] == hf.eos_token_id
+            tokens.append([received[name] for name in names])
+            echo_steps.append(executed_steps - 1)
             torch.accelerator.synchronize()
             pages.append(view._tensor.cpu().clone())
         counters = transaction_graph_counters(core)
-        core.abort_requests(["audio"])
-        return tokens, pages, counters
+        core.abort_requests(names)
+        return tokens, pages, counters, echo_steps
     finally:
         core.shutdown()
         del core
@@ -375,11 +389,11 @@ def test_nemotron_engine_transaction_graph_matches_eager(monkeypatch):
     """
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     num_chunks = 12
-    eager_tokens, eager_pages, eager_counters = _run_g0_stream(
+    eager_tokens, eager_pages, eager_counters, _ = _run_g0_stream(
         dict(_G0_BASE_OVERRIDES), num_chunks
     )
     assert eager_counters == {}
-    tokens, pages, counters = _run_g0_stream(
+    tokens, pages, counters, _ = _run_g0_stream(
         {**_G0_BASE_OVERRIDES, "transaction_graph_populations": [1]}, num_chunks
     )
     assert tokens == eager_tokens
@@ -389,5 +403,47 @@ def test_nemotron_engine_transaction_graph_matches_eager(monkeypatch):
     assert counters["fallbacks"] == 0
     assert counters["replays:chunk-fresh:g0:b1"] == 1
     assert counters["replays:chunk-continuing:g0:b1"] == num_chunks - 1
-    echo_steps = sum(len(chunk) for chunk in tokens) - num_chunks
+    echo_steps = sum(len(chunk[0]) for chunk in tokens) - num_chunks
     assert counters["replays:replay:b1"] >= echo_steps
+
+
+@create_new_process_for_each_test(method="spawn")
+def test_nemotron_engine_transaction_graph_b31_lockstep_matches_eager(monkeypatch):
+    """31 lockstep g0 sessions replay every CHUNK step bitwise exactly.
+
+    Every CHUNK step holds all 31 rows (fresh once, then continuing) and must
+    replay the B31 cell. Echo steps replay ``replay:b31`` while every row still
+    echoes; once rows park, the shrunken population is undeclared and runs the
+    eager path, counted. Tokens and the resident storage after every park
+    match the eager arm.
+    """
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    num_chunks, sessions = 6, 31
+    eager_tokens, eager_pages, eager_counters, eager_echoes = _run_g0_stream(
+        dict(_G0_BASE_OVERRIDES), num_chunks, sessions
+    )
+    assert eager_counters == {}
+    tokens, pages, counters, echoes = _run_g0_stream(
+        {**_G0_BASE_OVERRIDES, "transaction_graph_populations": [sessions]},
+        num_chunks,
+        sessions,
+    )
+    assert tokens == eager_tokens
+    assert echoes == eager_echoes
+    for actual, expected in zip(pages, eager_pages, strict=True):
+        assert torch.equal(actual, expected)
+    assert counters["captured_cells"] == 3
+    assert counters[f"replays:chunk-fresh:g0:b{sessions}"] == 1
+    assert counters[f"replays:chunk-continuing:g0:b{sessions}"] == num_chunks - 1
+    fallbacks = {
+        key: value
+        for key, value in counters.items()
+        if key.startswith("fallbacks:") and value
+    }
+    assert all(
+        key.startswith("fallbacks:replay:b") and key.endswith(":undeclared")
+        for key in fallbacks
+    ), fallbacks
+    assert counters[f"replays:replay:b{sessions}"] + sum(fallbacks.values()) == sum(
+        echoes
+    )
