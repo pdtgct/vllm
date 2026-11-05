@@ -24,6 +24,7 @@ from vllm.models.nemotron_asr.advance import (
     advance_chunk_bucket,
 )
 from vllm.models.nemotron_asr.batch_invariance import execution_mode
+from vllm.models.nemotron_asr.capture_scope import nested_graph_mode
 from vllm.models.nemotron_asr.decode_graph import GraphRuntime, platform_graph_runtime
 from vllm.models.nemotron_asr.encoder_execution import _tensor_signature
 from vllm.models.nemotron_asr.manifests import CADENCES
@@ -249,7 +250,7 @@ def capture_chunk_bucket(
         ):
             raise ValueError("bucket caller aliases graph-owned scratch")
         stage(values)
-        output = call(runtime.graph_mode)
+        output = call(nested_graph_mode(runtime))
         for destination, source in zip(
             _state_tensors(actual_state), _state_tensors(static_state), strict=True
         ):

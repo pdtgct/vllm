@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -111,6 +112,13 @@ class NemotronASRModelState(ModelState):
         layer = self.model._persistent_state_layer.prefix
         if set(bindings.views) != {layer}:
             raise ValueError("Nemotron requires exactly its aggregate state group")
+        capture = getattr(self.model, "capture_transaction_graphs", None)
+        if (
+            capture is not None
+            and getattr(self.model, "_transaction_graph", None) is not None
+        ):
+            (views,) = bindings.views.values()
+            capture(SimpleNamespace(spec=views.spec, views=views._views))
         # All resident writes run on the runner stream. Inner graphs also replay
         # there; no auxiliary state-writing stream is created by this consumer.
 

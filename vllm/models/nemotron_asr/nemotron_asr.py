@@ -500,6 +500,30 @@ class NemotronASRForRNNT(nn.Module):
                 self._decode_graph_binding,
                 chunk_populations,
             )
+        self._transaction_graph = None
+        transaction_populations = getattr(
+            hf_config, "transaction_graph_populations", ()
+        )
+        if not isinstance(transaction_populations, (tuple, list)):
+            raise ValueError("transaction_graph_populations must be a sequence")
+        if transaction_populations:
+            from vllm.models.nemotron_asr.transaction_graph import (
+                TransactionGraphBinding,
+            )
+
+            if native_burst_enabled:
+                raise ValueError("transaction graphs require native burst disabled")
+            if getattr(hf_config, "decode_dispatch_arm", None) not in (
+                "dense-graphed",
+                "dense-eager",
+            ):
+                raise ValueError("transaction graphs require a dense decode arm")
+            self._transaction_graph = TransactionGraphBinding(
+                populations=list(transaction_populations),
+                geometries=served_geometry_ids,
+                maximum_population=self._max_num_seqs,
+                vllm_config=vllm_config,
+            )
         self._commit_sink: BoundedCommitSink | None = None
         self._host_staging: HostStaging | None = None
         self._execution_memory_prepared = False
@@ -833,6 +857,91 @@ class NemotronASRForRNNT(nn.Module):
             raise
         self._execution_memory_prepared = True
 
+    @torch.inference_mode()
+    def capture_transaction_graphs(self, storage: Any) -> None:
+        """Capture the declared transaction cells over allocated resident pools.
+
+        ``storage`` exposes the aggregate state group's ``spec`` and named
+        component ``views``. Runs once the execution inventory is ready; a later
+        call with relocated pools recaptures.
+        """
+        binding = self._transaction_graph
+        if binding is None:
+            return
+        from vllm.models.nemotron_asr.advance import (
+            TransactionPools,
+            warmup_advance_model_rows_scatter,
+        )
+        from vllm.models.nemotron_asr.state_profile import (
+            project_nemotron_state_pools,
+        )
+        from vllm.models.nemotron_asr.transaction_graph import (
+            TransactionCallBindings,
+        )
+        from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
+        self._require_execution_inventory_ready()
+        pools = project_nemotron_state_pools(
+            storage, n_layers=int(self.config.n_layers)
+        )
+        resident = TransactionPools(
+            channel=list(pools.channel),
+            time=list(pools.convolution),
+            valid_length=list(pools.valid_length),
+            h=pools.predictor_h,
+            c=pools.predictor_c,
+            queue=pools.replay_queue,
+            book=pools.replay_book,
+            frontend_raw=pools.frontend_raw,
+            frontend_mel=pools.frontend_mel,
+            frontend_counter=pools.frontend_counters,
+            endpoint_history=pools.endpoint_history,
+            endpoint_book=pools.endpoint_book,
+        )
+        device = pools.replay_queue.device
+        if device.type == "cuda":
+            warmup_advance_model_rows_scatter(
+                channel_pools=resident.channel,
+                time_pools=resident.time,
+                len_pools=resident.valid_length,
+                h_pool=resident.h,
+                c_pool=resident.c,
+                queue_pool=resident.queue,
+                book_pool=resident.book,
+                frontend_raw_pool=resident.frontend_raw,
+                frontend_mel_pool=resident.frontend_mel,
+                frontend_counter_pool=resident.frontend_counter,
+                endpoint_history_pool=resident.endpoint_history,
+                endpoint_book_pool=resident.endpoint_book,
+            )
+        graph_binding = self._decode_graph_binding
+        try:
+            binding.capture(
+                self.core,
+                pools=resident,
+                call=TransactionCallBindings(
+                    adapter=self._emission_adapter,
+                    decode_resolver=self._decode_resolver,
+                    encoder_transition=self._encoder_execution.transition,
+                    bucket_transition=getattr(self, "_chunk_bucket_binding", None),
+                    placeholder_id=int(self.config.audio_chunk_token_id),
+                    park_id=int(self.config.eos_token_id),
+                    eou_token_id=int(self.config.eou_token_id),
+                    graph_covers_decode=graph_binding is not None,
+                    execution_tier=(
+                        graph_binding.execution_tier
+                        if graph_binding is not None
+                        else (lambda population: 0)
+                    ),
+                ),
+                hidden_size=int(self.config.hidden_size),
+                device=device,
+                null_block_id=int(NULL_BLOCK_ID),
+            )
+        except Exception:
+            binding.discard()
+            raise
+
     def execution_profile_receipt(self) -> dict[str, Any]:
         """Report the resolved execution arms and startup coverage."""
         binding = self._decode_graph_binding
@@ -852,6 +961,9 @@ class NemotronASRForRNNT(nn.Module):
         chunk_binding = getattr(self, "_chunk_bucket_binding", None)
         if chunk_binding is not None:
             receipt["chunk"] = chunk_binding.receipt()
+        transaction_graph = getattr(self, "_transaction_graph", None)
+        if transaction_graph is not None:
+            receipt["transaction"] = transaction_graph.receipt()
         return execution_mode(getattr(self, "core", None)).readiness_receipt(receipt)
 
     def _ensure_commit_sink(self, device: torch.device) -> BoundedCommitSink:
@@ -1046,6 +1158,7 @@ class NemotronASRForRNNT(nn.Module):
                 staging=self._ensure_host_staging(),
                 graph_covers_decode=graph_covers_decode,
                 native_burst_handoff=native_handoff,
+                transaction_graph=getattr(self, "_transaction_graph", None),
             )
             return result
         except BaseException:

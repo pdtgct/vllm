@@ -40,12 +40,14 @@ never a second legacy forward path).
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
 import torch
 
+from vllm.models.nemotron_asr.capture_scope import reject_host_staging_in_capture
 from vllm.models.nemotron_asr.profiling import phase
 from vllm.models.nemotron_asr.state_scatter import (
     _execute_masked_page_scatter_,
@@ -1596,6 +1598,7 @@ def _h2d(t: torch.Tensor, device: torch.device) -> torch.Tensor:
     fresh ``pin_memory()`` allocation every call — the un-pooled
     fallback :class:`HostStaging` exists to avoid), plain move
     elsewhere."""
+    reject_host_staging_in_capture()
     if device.type == "cuda":
         return t.pin_memory().to(device, non_blocking=True)
     return t.to(device)
@@ -1693,6 +1696,7 @@ class HostStaging:
                 ``capacity``, or ``slot_name`` names no known slot.
 
         """
+        reject_host_staging_in_capture()
         n = int(cpu_tensor.shape[0])
         if n > self.capacity:
             raise ValueError(
@@ -1730,6 +1734,7 @@ class HostStaging:
                 or ``geometry`` is outside the per-geometry arena.
 
         """
+        reject_host_staging_in_capture()
         n = int(cpu_tensor.shape[0])
         if n > self.capacity:
             raise ValueError(
@@ -2533,6 +2538,204 @@ def consume_batch_stats() -> list[tuple[str, int]] | None:
     return stats
 
 
+@dataclass(frozen=True)
+class TransactionPools:
+    """The resident pools one transaction reads and commits."""
+
+    channel: Sequence[torch.Tensor]
+    time: Sequence[torch.Tensor]
+    valid_length: Sequence[torch.Tensor]
+    h: torch.Tensor
+    c: torch.Tensor
+    queue: torch.Tensor
+    book: torch.Tensor
+    frontend_raw: torch.Tensor
+    frontend_mel: torch.Tensor
+    frontend_counter: torch.Tensor
+    endpoint_history: torch.Tensor | None
+    endpoint_book: torch.Tensor | None
+
+    def sequence(self) -> tuple[torch.Tensor, ...]:
+        return _resident_pool_sequence(
+            channel_pools=self.channel,
+            time_pools=self.time,
+            len_pools=self.valid_length,
+            h_pool=self.h,
+            c_pool=self.c,
+            queue_pool=self.queue,
+            book_pool=self.book,
+            frontend_raw_pool=self.frontend_raw,
+            frontend_mel_pool=self.frontend_mel,
+            frontend_counter_pool=self.frontend_counter,
+            endpoint_history_pool=self.endpoint_history,
+            endpoint_book_pool=self.endpoint_book,
+        )
+
+
+@dataclass(frozen=True)
+class TransactionBucket:
+    """One resolved CHUNK geometry bucket, in deadline order."""
+
+    geometry: int
+    positions: torch.Tensor
+    resolved: ResolvedDecode
+    transition: Callable[..., ChunkBucketResult]
+    fresh: torch.Tensor
+    endpoint_mode: torch.Tensor
+    endpoint_threshold_frames: torch.Tensor
+    endpoint_residue_frames: torch.Tensor
+
+    @property
+    def n_fresh(self) -> int:
+        return int(self.fresh.sum())
+
+
+#: Per-bucket host vectors, by staged-field name.
+BUCKET_VECTOR_FIELDS: tuple[str, ...] = (
+    "positions",
+    "endpoint_mode",
+    "endpoint_threshold_frames",
+    "endpoint_residue_frames",
+)
+
+
+@dataclass(frozen=True)
+class TransactionInputs:
+    """Validated host authority and bindings for one transaction.
+
+    Every host vector the device body stages comes from this record, so a
+    caller can upload all of them through one persistent arena instead.
+    """
+
+    plan: RowPlan
+    n_real: int
+    hidden: int
+    device: torch.device
+    queue_capacity: int
+    blank_id: int
+    hop_length: int
+    lookaheads: tuple[int, ...]
+    endpoint_enabled: bool
+    eou_token_id: int | None
+    placeholder_id: int
+    park_id: int
+    capture: bool
+    adapter: EmissionAdapter
+    encoder_transition: EncoderTransition | None
+    native_burst_handoff: Any | None
+    pools: TransactionPools
+    composed_indices: torch.Tensor
+    fresh_mask: torch.Tensor
+    fresh_positions: torch.Tensor
+    fresh_init_book: torch.Tensor
+    prior_prompt: torch.Tensor
+    cadence_frames: torch.Tensor
+    chunk_all: torch.Tensor
+    buckets: tuple[TransactionBucket, ...]
+
+    @property
+    def n_fresh(self) -> int:
+        return int(self.fresh_positions.numel())
+
+    def vector(self, name: str) -> torch.Tensor:
+        """Return one once-per-call host vector by its staging name."""
+        plan = self.plan
+        vectors = {
+            "composed_indices": self.composed_indices,
+            "fresh_positions": self.fresh_positions,
+            "fresh_init_book": self.fresh_init_book,
+            "is_chunk": plan.is_chunk,
+            "geometry": plan.geometry_id,
+            "admitted_prompt": plan.prompt_index,
+            "prior_prompt": self.prior_prompt,
+            "cadence_frames": self.cadence_frames,
+            "chunk_all": self.chunk_all,
+        }
+        try:
+            return vectors[name]
+        except KeyError:
+            raise ValueError(f"unknown transaction vector {name!r}") from None
+
+    def bucket_vector(self, index: int, field: str) -> torch.Tensor:
+        if field not in BUCKET_VECTOR_FIELDS:
+            raise ValueError(f"unknown transaction bucket vector {field!r}")
+        return getattr(self.buckets[index], field)
+
+    def staged_vectors(self) -> tuple[tuple[str, torch.Tensor], ...]:
+        """Every host vector the device body may stage, keyed by name."""
+        names = (
+            "composed_indices",
+            "fresh_positions",
+            "fresh_init_book",
+            "is_chunk",
+            "geometry",
+            "admitted_prompt",
+            "prior_prompt",
+            "cadence_frames",
+            "chunk_all",
+        )
+        items = [(name, self.vector(name)) for name in names]
+        for index in range(len(self.buckets)):
+            fields = BUCKET_VECTOR_FIELDS if self.endpoint_enabled else ("positions",)
+            items.extend(
+                (bucket_vector_name(index, field), self.bucket_vector(index, field))
+                for field in fields
+            )
+        return tuple(items)
+
+
+def bucket_vector_name(index: int, field: str) -> str:
+    return f"bucket.{index}.{field}"
+
+
+class TransactionStager(Protocol):
+    """Source of the device copies of a transaction's host vectors."""
+
+    def vector(self, name: str) -> torch.Tensor: ...
+
+    def bucket_vector(self, index: int, field: str) -> torch.Tensor: ...
+
+
+class LiveTransactionStager:
+    """Stage each vector when the body first needs it.
+
+    Once-per-call vectors and bucket positions ride ``staging`` when given;
+    endpoint policy vectors and the un-pooled case use :func:`_h2d`.
+    """
+
+    def __init__(self, inputs: TransactionInputs, staging: HostStaging | None):
+        self._inputs = inputs
+        self._staging = staging
+
+    def vector(self, name: str) -> torch.Tensor:
+        host = self._inputs.vector(name)
+        if self._staging is not None:
+            return self._staging.stage(name, host, self._inputs.device)
+        return _h2d(host, self._inputs.device)
+
+    def bucket_vector(self, index: int, field: str) -> torch.Tensor:
+        inputs = self._inputs
+        host = inputs.bucket_vector(index, field)
+        if field == "positions" and self._staging is not None:
+            return self._staging.stage_bucket(
+                inputs.buckets[index].geometry, host, inputs.device
+            )
+        return _h2d(host, inputs.device)
+
+
+@dataclass
+class TransactionBody:
+    """Device results of one transaction before its reservation and commit."""
+
+    projection_rows: torch.Tensor
+    status: torch.Tensor
+    progress: torch.Tensor
+    scatter_ops: list[_ScatterDescriptor]
+    capture_plan: CapturePlan | None
+    records: tuple[CaptureRecord, ...]
+    native_stage: Callable[[], None] | None
+
+
 # @spec PORT-ADV-003, PORT-ADV-004, PORT-HOOK-001, PORT-LID-003,
 # @spec PORT-PERF-001, PORT-PERF-004, PORT-STATE-007, PORT-STATE-008
 def advance_model_rows(
@@ -2566,6 +2769,7 @@ def advance_model_rows(
     memory_profile: bool = False,
     staging: HostStaging | None = None,
     native_burst_handoff: Any | None = None,
+    transaction_graph: Any | None = None,
 ) -> torch.Tensor:
     """The ONE shared outer transaction (PORT-ADV-003).
 
@@ -2601,6 +2805,11 @@ def advance_model_rows(
        no store), then perform the reservation's one no-fail combined
        status/candidate stage.
 
+    Steps 1-2 and every host-only check form the host prologue
+    (:func:`prepare_transaction`); steps 3-5 form the device body
+    (:func:`run_transaction_body`); step 6 is the commit
+    (:func:`commit_transaction_body`).
+
     Suppression (PORT-STATE-008): any structural defect fails the
     whole call before a read; an expected per-row defect resolves to
     a device status bit and a masked park-only no-op. An unexpected
@@ -2614,6 +2823,10 @@ def advance_model_rows(
     for already-gathered CHUNK scratch. The default uses the same canonical
     tensor helper eagerly. It never owns resident gathers, endpoint processing,
     adapter execution, reservations, or scatter.
+
+    ``transaction_graph`` is an optional startup-captured replay of the device
+    body and commit scatters. It returns ``None`` for any call outside its
+    captured keys, and such calls run the eager path below unchanged.
 
     Host staging (PORT-PERF-001): ``staging`` is optional reusable
     pinned H2D buffering (:class:`HostStaging`) for the once-per-call
@@ -2638,26 +2851,107 @@ def advance_model_rows(
             always before any resident mutation.
 
     """
-    from vllm.models.nemotron_asr.encoder_execution import (
-        encoder_geometry_shape,
+    started_ns = time.perf_counter_ns() if transaction_graph is not None else 0
+    inputs = prepare_transaction(
+        core,
+        input_ids,
+        inputs_embeds,
+        plan,
+        pools=TransactionPools(
+            channel=channel_pools,
+            time=time_pools,
+            valid_length=len_pools,
+            h=h_pool,
+            c=c_pool,
+            queue=queue_pool,
+            book=book_pool,
+            frontend_raw=frontend_raw_pool,
+            frontend_mel=frontend_mel_pool,
+            frontend_counter=frontend_counter_pool,
+            endpoint_history=endpoint_history_pool,
+            endpoint_book=endpoint_book_pool,
+        ),
+        eou_token_id=eou_token_id,
+        adapter=adapter,
+        decode_resolver=decode_resolver,
+        encoder_transition=encoder_transition,
+        bucket_transition=bucket_transition,
+        placeholder_id=placeholder_id,
+        park_id=park_id,
+        has_commit_sink=commit_sink is not None,
+        capture=capture,
+        graph_covers_decode=graph_covers_decode,
+        memory_profile=memory_profile,
+        native_burst_handoff=native_burst_handoff,
     )
-    from vllm.models.nemotron_asr.frontend import (
-        CTR_EXPECTED_CHUNK_SEQUENCE,
-        CTR_FINALIZED,
+    if transaction_graph is not None:
+        replayed = transaction_graph.execute(
+            core,
+            input_ids,
+            inputs_embeds,
+            inputs,
+            commit_sink=commit_sink,
+            graph_covers_decode=graph_covers_decode,
+            memory_profile=memory_profile,
+            started_ns=started_ns,
+        )
+        if replayed is not None:
+            return replayed
+    body = run_transaction_body(
+        core,
+        input_ids,
+        inputs_embeds,
+        inputs,
+        LiveTransactionStager(inputs, staging),
     )
+    return commit_transaction_body(body, inputs, commit_sink)
+
+
+def prepare_transaction(
+    core: NemotronASRCore,
+    input_ids: torch.Tensor,
+    inputs_embeds: torch.Tensor,
+    plan: RowPlan,
+    *,
+    pools: TransactionPools,
+    eou_token_id: int | None,
+    adapter: EmissionAdapter,
+    decode_resolver: DecodeResolver,
+    encoder_transition: EncoderTransition | None,
+    bucket_transition: Callable[..., ChunkBucketResult] | None,
+    placeholder_id: int,
+    park_id: int,
+    has_commit_sink: bool,
+    capture: bool,
+    graph_covers_decode: bool,
+    memory_profile: bool,
+    native_burst_handoff: Any | None,
+) -> TransactionInputs:
+    """Host prologue: validate structure and resolve every bucket.
+
+    Reads no resident state and issues no device work. Records the
+    per-executed-bucket batch stats (PORT-OBS-008).
+    """
     from vllm.models.nemotron_asr.manifests import (
         CADENCES,
     )
     from vllm.models.nemotron_asr.rnnt import (
-        BOOK_EXPECTED_LABEL,
         BOOK_GEOMETRY,
-        BOOK_PENDING_ECHO,
         MAX_SYMBOLS_PER_STEP,
-        QUEUE_HEAD,
         QUEUE_LAST_LABEL,
-        QUEUE_LEN,
         QUEUE_PROMPT,
     )
+
+    channel_pools = pools.channel
+    time_pools = pools.time
+    len_pools = pools.valid_length
+    h_pool, c_pool = pools.h, pools.c
+    queue_pool, book_pool = pools.queue, pools.book
+    frontend_raw_pool = pools.frontend_raw
+    frontend_mel_pool = pools.frontend_mel
+    frontend_counter_pool = pools.frontend_counter
+    endpoint_history_pool = pools.endpoint_history
+    endpoint_book_pool = pools.endpoint_book
 
     if not callable(decode_resolver):
         raise ValueError(
@@ -2687,7 +2981,7 @@ def advance_model_rows(
         raise ValueError("memory profile cannot claim graph coverage")
     if memory_profile and capture:
         raise ValueError("memory profile cannot publish capture records")
-    if capture and commit_sink is None:
+    if capture and not has_commit_sink:
         raise ValueError("capture requires a composite commit sink")
     lookaheads = [right for (_, right) in CADENCES.values()]
     hop = int(core.featurizer.hop_length)
@@ -2731,20 +3025,7 @@ def advance_model_rows(
             f"({required_hidden})"
         )
 
-    pools = _resident_pool_sequence(
-        channel_pools=channel_pools,
-        time_pools=time_pools,
-        len_pools=len_pools,
-        h_pool=h_pool,
-        c_pool=c_pool,
-        queue_pool=queue_pool,
-        book_pool=book_pool,
-        frontend_raw_pool=frontend_raw_pool,
-        frontend_mel_pool=frontend_mel_pool,
-        frontend_counter_pool=frontend_counter_pool,
-        endpoint_history_pool=endpoint_history_pool,
-        endpoint_book_pool=endpoint_book_pool,
-    )
+    resident = pools.sequence()
     endpoint_enabled = any(
         value is not None
         for value in (
@@ -2768,11 +3049,11 @@ def advance_model_rows(
             or endpoint_book_pool.shape[1] != 6
         ):
             raise ValueError("endpoint resident pools disagree with the manifest")
-    if any(pool.dim() < 1 for pool in pools):
+    if any(pool.dim() < 1 for pool in resident):
         raise ValueError("every resident pool must have a block dimension")
-    if any(int(pool.shape[0]) != plan.num_pool_blocks for pool in pools):
+    if any(int(pool.shape[0]) != plan.num_pool_blocks for pool in resident):
         raise ValueError("resident pool extent disagrees with RowPlan authority")
-    if any(pool.device != device for pool in pools):
+    if any(pool.device != device for pool in resident):
         raise ValueError("every resident pool must share the compute device")
     if queue_pool.dtype != torch.int32 or book_pool.dtype != torch.int32:
         raise ValueError("queue and book pools must use int32")
@@ -2860,7 +3141,7 @@ def advance_model_rows(
     # above is already a plain int, no device sync; ``cadence_labels`` is
     # a python list index, not a tensor read), independent of ``capture``
     # or export being enabled. ``bucket_pos`` is exactly the executed set
-    # (the loop below processes every entry; nothing filters it further).
+    # (the device body processes every entry; nothing filters it further).
     # Cadence is resolved HERE, at the manifest-table authority, so every
     # downstream consumer (metrics, orchestrator) stays model-agnostic.
     cadence_labels = list(CADENCES)
@@ -2871,35 +3152,13 @@ def advance_model_rows(
         ]
     )
 
-    # ---- small continuing-row gather + metadata-only fresh init ----
-    def _stage(slot_name: str, cpu_tensor: torch.Tensor) -> torch.Tensor:
-        """Route one once-per-call vector through ``staging`` when
-        given, else the un-pooled :func:`_h2d` path."""
-        if staging is not None:
-            return staging.stage(slot_name, cpu_tensor, device)
-        return _h2d(cpu_tensor, device)
-
-    didx = _stage("composed_indices", idx_cpu)
     fresh_local = (~plan.has_initial_states_p).nonzero(as_tuple=True)[0]
     fresh_mask_cpu = torch.zeros(n_real, dtype=torch.bool)
+    fresh_pos_cpu = torch.zeros(0, dtype=torch.long)
+    finit = torch.zeros(0, 7, dtype=torch.int64)
     if int(fresh_local.numel()):
         fresh_pos_cpu = plan.num_decodes + fresh_local
         fresh_mask_cpu[fresh_pos_cpu] = True
-    book = _gather_initialized_rows(book_pool, didx, fresh_mask_cpu)
-    queue = _gather_initialized_rows(queue_pool, didx, fresh_mask_cpu)
-    counters_small = _gather_initialized_rows(
-        frontend_counter_pool, didx, fresh_mask_cpu
-    )
-    endpoint_history = (
-        _gather_initialized_rows(endpoint_history_pool, didx, fresh_mask_cpu)
-        if endpoint_enabled
-        else None
-    )
-    endpoint_book = (
-        _gather_initialized_rows(endpoint_book_pool, didx, fresh_mask_cpu)
-        if endpoint_enabled
-        else None
-    )
     endpoint_mode_cpu = (
         plan.endpoint_mode
         if plan.endpoint_mode.numel()
@@ -2922,24 +3181,157 @@ def advance_model_rows(
     ):
         raise ValueError("endpoint policy is outside the admitted vocabulary")
     if int(fresh_local.numel()):
-        finit = torch.zeros(int(fresh_local.numel()), book.shape[1], dtype=torch.int64)
+        finit = torch.zeros(
+            int(fresh_local.numel()), book_pool.shape[1], dtype=torch.int64
+        )
         finit[:, QUEUE_LAST_LABEL] = blank
         finit[:, QUEUE_PROMPT] = plan.prompt_index.index_select(0, fresh_pos_cpu)
         finit[:, BOOK_GEOMETRY] = plan.geometry_id.index_select(0, fresh_pos_cpu)
-        fresh_dev = _stage("fresh_positions", fresh_pos_cpu)
-        book.index_copy_(0, fresh_dev, _stage("fresh_init_book", finit).to(book.dtype))
+    # Build the per-geometry cadence table on the HOST and index it by the
+    # CPU RowPlan geometry authority; the body stages the per-row result.
+    # A ``torch.tensor(list, device=cuda)`` construction would synchronize.
+    cadence_frames = torch.tensor(
+        [8 * (lookahead + 1) for lookahead in lookaheads],
+        dtype=torch.int64,
+    ).index_select(0, plan.geometry_id)
+    prior_prompt = torch.tensor(
+        [binding.prior_prompt_index for binding in plan.bindings],
+        dtype=torch.int64,
+    )
+    default_transition = (
+        advance_chunk_bucket if bucket_transition is None else bucket_transition
+    )
+    buckets = tuple(
+        TransactionBucket(
+            geometry=g,
+            positions=pos_t,
+            resolved=resolved,
+            transition=bucket_transitions.get(g, default_transition),
+            fresh=fresh_mask_cpu.index_select(0, pos_t),
+            endpoint_mode=endpoint_mode_cpu.index_select(0, pos_t),
+            endpoint_threshold_frames=endpoint_threshold_cpu.index_select(0, pos_t),
+            endpoint_residue_frames=endpoint_residue_cpu.index_select(0, pos_t),
+        )
+        for g, pos_t, resolved in bucket_pos
+    )
+    chunk_all_t = (
+        torch.cat([positions for _, positions, _ in bucket_pos])
+        if bucket_pos
+        else torch.zeros(0, dtype=torch.long)
+    )
+    return TransactionInputs(
+        plan=plan,
+        n_real=n_real,
+        hidden=hidden,
+        device=device,
+        queue_capacity=cap,
+        blank_id=blank,
+        hop_length=hop,
+        lookaheads=tuple(lookaheads),
+        endpoint_enabled=endpoint_enabled,
+        eou_token_id=eou_token_id,
+        placeholder_id=placeholder_id,
+        park_id=park_id,
+        capture=capture,
+        adapter=adapter,
+        encoder_transition=encoder_transition,
+        native_burst_handoff=native_burst_handoff,
+        pools=pools,
+        composed_indices=idx_cpu,
+        fresh_mask=fresh_mask_cpu,
+        fresh_positions=fresh_pos_cpu,
+        fresh_init_book=finit,
+        prior_prompt=prior_prompt,
+        cadence_frames=cadence_frames,
+        chunk_all=chunk_all_t,
+        buckets=buckets,
+    )
+
+
+def run_transaction_body(
+    core: NemotronASRCore,
+    input_ids: torch.Tensor,
+    inputs_embeds: torch.Tensor,
+    inputs: TransactionInputs,
+    stager: TransactionStager,
+) -> TransactionBody:
+    """Device body: gathers through the validated scatter plan.
+
+    Mutates no resident page. Python control flow depends only on
+    ``inputs`` structure (row counts, bucket order, fresh masks, flags),
+    never on device values, and every host vector arrives via ``stager``.
+    """
+    from vllm.models.nemotron_asr.encoder_execution import (
+        encoder_geometry_shape,
+    )
+    from vllm.models.nemotron_asr.frontend import (
+        CTR_EXPECTED_CHUNK_SEQUENCE,
+        CTR_FINALIZED,
+    )
+    from vllm.models.nemotron_asr.rnnt import (
+        BOOK_EXPECTED_LABEL,
+        BOOK_GEOMETRY,
+        BOOK_PENDING_ECHO,
+        QUEUE_HEAD,
+        QUEUE_LAST_LABEL,
+        QUEUE_LEN,
+        QUEUE_PROMPT,
+    )
+
+    plan = inputs.plan
+    pools = inputs.pools
+    channel_pools = pools.channel
+    time_pools = pools.time
+    len_pools = pools.valid_length
+    h_pool, c_pool = pools.h, pools.c
+    queue_pool, book_pool = pools.queue, pools.book
+    frontend_raw_pool = pools.frontend_raw
+    frontend_mel_pool = pools.frontend_mel
+    frontend_counter_pool = pools.frontend_counter
+    endpoint_history_pool = pools.endpoint_history
+    endpoint_book_pool = pools.endpoint_book
+    n_real = inputs.n_real
+    hidden = inputs.hidden
+    device = inputs.device
+    cap = inputs.queue_capacity
+    blank = inputs.blank_id
+    hop = inputs.hop_length
+    lookaheads = inputs.lookaheads
+    endpoint_enabled = inputs.endpoint_enabled
+    eou_token_id = inputs.eou_token_id
+    placeholder_id = inputs.placeholder_id
+    park_id = inputs.park_id
+    adapter = inputs.adapter
+    encoder_transition = inputs.encoder_transition
+    native_burst_handoff = inputs.native_burst_handoff
+    fresh_mask_cpu = inputs.fresh_mask
+
+    # ---- small continuing-row gather + metadata-only fresh init ----
+    didx = stager.vector("composed_indices")
+    book = _gather_initialized_rows(book_pool, didx, fresh_mask_cpu)
+    queue = _gather_initialized_rows(queue_pool, didx, fresh_mask_cpu)
+    counters_small = _gather_initialized_rows(
+        frontend_counter_pool, didx, fresh_mask_cpu
+    )
+    endpoint_history = (
+        _gather_initialized_rows(endpoint_history_pool, didx, fresh_mask_cpu)
+        if endpoint_enabled
+        else None
+    )
+    endpoint_book = (
+        _gather_initialized_rows(endpoint_book_pool, didx, fresh_mask_cpu)
+        if endpoint_enabled
+        else None
+    )
+    if inputs.n_fresh:
+        fresh_dev = stager.vector("fresh_positions")
+        book.index_copy_(0, fresh_dev, stager.vector("fresh_init_book").to(book.dtype))
 
     # ---- device role/protocol/invariant composition ----
-    is_chunk_dev = _stage("is_chunk", plan.is_chunk)
-    plan_geom_dev = _stage("geometry", plan.geometry_id)
-    admitted_prompt_dev = _stage("admitted_prompt", plan.prompt_index)
-    prior_prompt_dev = _stage(
-        "prior_prompt",
-        torch.tensor(
-            [binding.prior_prompt_index for binding in plan.bindings],
-            dtype=torch.int64,
-        ),
-    )
+    is_chunk_dev = stager.vector("is_chunk")
+    plan_geom_dev = stager.vector("geometry")
+    admitted_prompt_dev = stager.vector("admitted_prompt")
+    prior_prompt_dev = stager.vector("prior_prompt")
     ids_dev = input_ids.long()
     head_all = book[:, QUEUE_HEAD].long()
     len_all = book[:, QUEUE_LEN].long()
@@ -3000,21 +3392,7 @@ def advance_model_rows(
         mel_tail_capacity=int(frontend_mel_pool.shape[2]),
         hop_length=hop,
         n_fft=int(core.featurizer.n_fft),
-        # Build the per-geometry cadence table on the HOST and index it
-        # by the CPU RowPlan geometry authority, THEN stage the per-row
-        # result to the device — never ``torch.tensor(list,
-        # device=cuda)``, which is a synchronizing host→device
-        # construction on the per-turn hot path (the full-turn probe's
-        # sync tripwire named exactly this call). Mirrors how
-        # ``prior_prompt`` etc. are staged: CPU build, pooled
-        # non-blocking H2D.
-        cadence_frames=_stage(
-            "cadence_frames",
-            torch.tensor(
-                [8 * (lookahead + 1) for lookahead in lookaheads],
-                dtype=torch.int64,
-            ).index_select(0, plan.geometry_id),
-        ),
+        cadence_frames=stager.vector("cadence_frames"),
     )
     status = torch.zeros(n_real, dtype=torch.int32, device=device)
     status |= (is_chunk_dev != (ids_dev == placeholder_id)).to(
@@ -3084,22 +3462,21 @@ def advance_model_rows(
     roles = torch.where(is_chunk_dev, torch.full_like(roles, ROLE_CHUNK), roles)
 
     # ---- deadline-ordered buckets → fresh-aware gather → transition ----
-    capture_on = capture
+    capture_on = inputs.capture
     executed: list[dict[str, Any]] = []
-    for g, pos_t, resolved in bucket_pos:
+    for bucket_index, bucket_inputs in enumerate(inputs.buckets):
+        g = bucket_inputs.geometry
+        pos_t = bucket_inputs.positions
+        resolved = bucket_inputs.resolved
         # Routed through ``staging`` by GEOMETRY: each geometry resolves
         # at most once per call, so its dedicated per-geometry buffer's
         # non-blocking copy is never overwritten by a later bucket in
         # this call — allocation-free without the overwrite race a
         # single shared bucket slot would carry. Falls back to the
         # un-pooled _h2d path (probes/CPU) when no staging is given.
-        rows_dev = (
-            staging.stage_bucket(g, pos_t, device)
-            if staging is not None
-            else _h2d(pos_t, device)
-        )
+        rows_dev = stager.bucket_vector(bucket_index, "positions")
         blocks_dev = didx.index_select(0, rows_dev)
-        fresh_bucket = fresh_mask_cpu.index_select(0, pos_t)
+        fresh_bucket = bucket_inputs.fresh
         capture_geometry = encoder_geometry_shape(core, g) if capture_on else None
         cadence = (
             capture_geometry.cadence_frames
@@ -3139,10 +3516,7 @@ def advance_model_rows(
             c=_gather_initialized_rows(c_pool, blocks_dev, fresh_bucket),
             last_label=safe_last.index_select(0, rows_dev),
         )
-        transition = bucket_transitions.get(
-            g, advance_chunk_bucket if bucket_transition is None else bucket_transition
-        )
-        bucket = transition(
+        bucket = bucket_inputs.transition(
             core,
             env,
             state,
@@ -3214,12 +3588,12 @@ def advance_model_rows(
                 token_ids=result.token_ids,
                 token_lengths=result.token_lengths,
                 final_tail=batch.final_tail.to(device),
-                mode=_h2d(endpoint_mode_cpu.index_select(0, pos_t), device),
-                threshold_frames=_h2d(
-                    endpoint_threshold_cpu.index_select(0, pos_t), device
+                mode=stager.bucket_vector(bucket_index, "endpoint_mode"),
+                threshold_frames=stager.bucket_vector(
+                    bucket_index, "endpoint_threshold_frames"
                 ),
-                residue_frames=_h2d(
-                    endpoint_residue_cpu.index_select(0, pos_t), device
+                residue_frames=stager.bucket_vector(
+                    bucket_index, "endpoint_residue_frames"
                 ),
                 eou_token_id=int(eou_token_id),
                 row_clean=result.row_status == 0,
@@ -3292,12 +3666,8 @@ def advance_model_rows(
         )
 
     # ---- merged results + adapter projection (still fallible) ----
-    chunk_all_t = (
-        torch.cat([positions for _, positions, _ in bucket_pos])
-        if bucket_pos
-        else torch.zeros(0, dtype=torch.long)
-    )
-    chunk_all_dev = _stage("chunk_all", chunk_all_t)
+    chunk_all_t = inputs.chunk_all
+    chunk_all_dev = stager.vector("chunk_all")
     b_total = int(chunk_all_t.numel())
     k_max = max(
         (int(ex["result"].token_ids.shape[1]) for ex in executed),
@@ -3629,7 +3999,7 @@ def advance_model_rows(
     for op in scatter_ops:
         validate_masked_page_scatter(op.pool, op.scratch, op.blocks, op.row_status)
 
-    # ---- records + ONE composite reservation, still pre-commit ----
+    # ---- capture records, still pre-commit ----
     records: list[CaptureRecord] = []
     if capture_on and b_total:
         for ex in executed:
@@ -3644,7 +4014,7 @@ def advance_model_rows(
                     CaptureRecord(
                         row=pos,
                         request_id=plan.request_ids[pos],
-                        block_id=int(idx_cpu[pos]),
+                        block_id=int(inputs.composed_indices[pos]),
                         admission_generation=int(plan.admission_generation[pos]),
                         geometry=int(ex["geometry"]),
                         chunk_sequence=ex["batch"].chunk_sequence[i],
@@ -3695,32 +4065,62 @@ def advance_model_rows(
         (progress_sequence, projection.book[:, QUEUE_HEAD].long(), progress_phase),
         dim=1,
     )
-    prepared_records = tuple(records)
-    reservation: CommitReservation | None = None
+    return TransactionBody(
+        projection_rows=projection_rows,
+        status=status,
+        progress=progress,
+        scatter_ops=scatter_ops,
+        capture_plan=capture_plan,
+        records=tuple(records),
+        native_stage=native_stage,
+    )
+
+
+def reserve_transaction_commit(
+    commit_sink: CommitSink, plan: CommitPlan
+) -> tuple[Callable[[], None], Callable[[torch.Tensor], None]]:
+    """Reserve one composite commit and bind its cancel/stage exactly once."""
+    reservation = commit_sink.reserve(plan)
+    cancel_candidate = getattr(reservation, "cancel", None)
+    if not callable(cancel_candidate):
+        raise ValueError("commit sink returned a reservation without cancel()")
+    cancel_reservation = cancel_candidate
+    try:
+        stage_candidate = getattr(reservation, "stage", None)
+    except BaseException:
+        cancel_reservation()
+        raise
+    if not callable(stage_candidate):
+        cancel_reservation()
+        raise ValueError("commit sink returned a reservation without stage()")
+    return cancel_reservation, stage_candidate
+
+
+def execute_transaction_scatters(scatter_ops: Sequence[_ScatterDescriptor]) -> None:
+    """Issue the prevalidated, allocation-free predicated page scatters."""
+    for op in scatter_ops:
+        _execute_masked_page_scatter_(op.pool, op.scratch, op.blocks, op.row_status)
+
+
+def commit_transaction_body(
+    body: TransactionBody,
+    inputs: TransactionInputs,
+    commit_sink: CommitSink | None,
+) -> torch.Tensor:
+    """Reserve, scatter and stage one eager transaction body."""
+    # ---- ONE composite reservation, still pre-commit ----
     cancel_reservation: Callable[[], None] | None = None
     stage_reservation: Callable[[torch.Tensor], None] | None = None
     if commit_sink is not None:
-        reservation = commit_sink.reserve(
+        cancel_reservation, stage_reservation = reserve_transaction_commit(
+            commit_sink,
             CommitPlan(
-                bindings=plan.bindings,
-                capture=capture_plan,
-                records=prepared_records,
-                progress=progress,
-            )
+                bindings=inputs.plan.bindings,
+                capture=body.capture_plan,
+                records=body.records,
+                progress=body.progress,
+            ),
         )
-        cancel_candidate = getattr(reservation, "cancel", None)
-        if not callable(cancel_candidate):
-            raise ValueError("commit sink returned a reservation without cancel()")
-        cancel_reservation = cancel_candidate
-        try:
-            stage_candidate = getattr(reservation, "stage", None)
-        except BaseException:
-            cancel_reservation()
-            raise
-        if not callable(stage_candidate):
-            cancel_reservation()
-            raise ValueError("commit sink returned a reservation without stage()")
-        stage_reservation = stage_candidate
 
     # ---- commit: prevalidated, allocation-free scatters + no-fail stage ----
     # Every descriptor was already validated above (the complete-plan
@@ -3728,17 +4128,14 @@ def advance_model_rows(
     # executor directly so no descriptor is re-validated here.
     with phase("port.scatter"):
         try:
-            for op in scatter_ops:
-                _execute_masked_page_scatter_(
-                    op.pool, op.scratch, op.blocks, op.row_status
-                )
+            execute_transaction_scatters(body.scatter_ops)
         except BaseException:
             if cancel_reservation is not None:
                 cancel_reservation()
             raise
         # ---- ONE no-fail combined stage through the reserved ticket ----
         if stage_reservation is not None:
-            stage_reservation(status)
-        if native_stage is not None:
-            native_stage()
-    return projection_rows
+            stage_reservation(body.status)
+        if body.native_stage is not None:
+            body.native_stage()
+    return body.projection_rows
