@@ -102,7 +102,18 @@ def _tensor_layout(tensor: torch.Tensor) -> tuple[Any, ...]:
     )
 
 
+def _lazy_buffer_signature(core: Any) -> tuple[Any, ...]:
+    """Addresses of encoder buffers that eager calls may rebind lazily."""
+    encoder = getattr(core, "encoder", None)
+    pe = getattr(getattr(encoder, "pos_enc", None), "pe", None)
+    return (
+        None if pe is None else _tensor_layout(pe),
+        tuple(getattr(encoder, "_stream_relative_position_lengths", ())),
+    )
+
+
 def transaction_signature(
+    core: Any,
     inputs: TransactionInputs,
     input_ids: torch.Tensor,
     inputs_embeds: torch.Tensor,
@@ -134,6 +145,7 @@ def transaction_signature(
         _callable_identity(inputs.adapter),
         _callable_identity(inputs.encoder_transition),
         tuple(_tensor_layout(pool) for pool in inputs.pools.sequence()),
+        _lazy_buffer_signature(core),
         (tuple(input_ids.shape), input_ids.dtype, input_ids.device),
         (tuple(inputs_embeds.shape), inputs_embeds.dtype, inputs_embeds.device),
     )
@@ -249,6 +261,8 @@ class _TransactionGraph:
     progress_out: torch.Tensor
     replay: Callable[[], None]
     retained_bytes: int | None = None
+    capture_graph: Callable[[], None] | None = None
+    verify: Callable[[], None] | None = None
 
 
 def _capture_plan(
@@ -425,6 +439,16 @@ class TransactionGraphBinding:
                     hidden_size=hidden_size,
                     device=device,
                 )
+            # Eager warm-up of every cell precedes the first capture: lazily
+            # extended module buffers must not be rebound under a graph that
+            # already recorded their addresses. Every graph is then verified
+            # after the last capture.
+            for graph in pending.values():
+                assert graph.capture_graph is not None
+                graph.capture_graph()
+            for graph in pending.values():
+                assert graph.verify is not None
+                graph.verify()
         finally:
             consume_batch_stats()
         self._graphs = pending
@@ -558,37 +582,15 @@ class TransactionGraphBinding:
                 for pool, page in zip(pools.sequence(), pages, strict=True)
             )
 
-        reserved_before = (
-            torch.cuda.memory_reserved(device) if device.type == "cuda" else None
-        )
         for _ in range(3):
             arena.upload(inputs)
             launch(runtime.eager_mode)
         if not matches():
             raise RuntimeError(f"transaction eager twin differs for {cell.label}")
-        arena.upload(inputs)
-        runtime.synchronize(device)
-        runtime.set_capture_enabled(True)
-        try:
-            with runtime.capture_context(device):
-                launch(runtime.graph_mode)
-        finally:
-            runtime.set_capture_enabled(False)
-        for value in owned:
-            value.fill_(-1)
-        arena.upload(inputs)
-        launch(runtime.graph_mode)
-        runtime.synchronize(device)
-        if not matches():
-            raise RuntimeError(f"transaction graph replay differs for {cell.label}")
-        retained = (
-            torch.cuda.memory_reserved(device) - reserved_before
-            if reserved_before is not None
-            else None
-        )
-        return _TransactionGraph(
+        graph = _TransactionGraph(
             cell=cell,
             signature=transaction_signature(
+                core,
                 inputs,
                 static_ids,
                 static_embeds,
@@ -601,8 +603,42 @@ class TransactionGraphBinding:
             status_out=status_out,
             progress_out=progress_out,
             replay=lambda: launch(runtime.graph_mode),
-            retained_bytes=retained,
         )
+
+        def capture_graph() -> None:
+            reserved = (
+                torch.cuda.memory_reserved(device) if device.type == "cuda" else None
+            )
+            graph.signature = transaction_signature(
+                core,
+                inputs,
+                static_ids,
+                static_embeds,
+                graph_covers_decode=call.graph_covers_decode,
+            )
+            arena.upload(inputs)
+            runtime.synchronize(device)
+            runtime.set_capture_enabled(True)
+            try:
+                with runtime.capture_context(device):
+                    launch(runtime.graph_mode)
+            finally:
+                runtime.set_capture_enabled(False)
+            if reserved is not None:
+                graph.retained_bytes = torch.cuda.memory_reserved(device) - reserved
+
+        def verify() -> None:
+            for value in owned:
+                value.fill_(-1)
+            arena.upload(inputs)
+            launch(runtime.graph_mode)
+            runtime.synchronize(device)
+            if not matches():
+                raise RuntimeError(f"transaction graph replay differs for {cell.label}")
+
+        graph.capture_graph = capture_graph
+        graph.verify = verify
+        return graph
 
     # ----------------------------------------------------------- execution
     def _fallback(self, cell: TransactionCell | None, reason: str) -> None:
@@ -622,7 +658,6 @@ class TransactionGraphBinding:
         started_ns: int,
     ) -> torch.Tensor | None:
         """Replay the call's captured cell, or return ``None`` to run eagerly."""
-        del core
         cell, reason = classify_transaction(inputs)
         if inputs.capture:
             reason = "capture"
@@ -636,6 +671,7 @@ class TransactionGraphBinding:
         if reason is None:
             assert graph is not None
             signature = transaction_signature(
+                core,
                 inputs,
                 input_ids,
                 inputs_embeds,

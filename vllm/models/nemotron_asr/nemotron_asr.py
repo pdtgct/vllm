@@ -1085,7 +1085,11 @@ class NemotronASRForRNNT(nn.Module):
         ):
             if not persistent_state_projection.dummy_run:
                 raise RuntimeError("no-page-I/O projection must be a dummy invocation")
-            if persistent_state_projection.is_profile:
+            # A sealed static encoder domain was already profiled with its
+            # complete inventory by prepare_execution_memory.
+            if persistent_state_projection.is_profile and not getattr(
+                self._encoder_execution, "_sealed", False
+            ):
                 from vllm.models.nemotron_asr.profile_execution import (
                     run_persistent_state_profile,
                 )
