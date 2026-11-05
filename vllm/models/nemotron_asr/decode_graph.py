@@ -12,6 +12,7 @@ from typing import Any
 import torch
 
 from vllm.models.nemotron_asr.batch_invariance import MODE_OFF, BatchInvariantExecution
+from vllm.models.nemotron_asr.capture_scope import nested_graph_mode
 from vllm.models.nemotron_asr.rnnt import (
     MAX_SYMBOLS_PER_STEP,
     DecodeState,
@@ -417,7 +418,9 @@ class DenseGraphBinding:
             entry.last_label.fill_(self._blank_id)
             entry.last_label[:live].copy_(state.last_label)
             output = self._call(
-                entry, runtime, runtime.graph_mode if captured else runtime.eager_mode
+                entry,
+                runtime,
+                nested_graph_mode(runtime) if captured else runtime.eager_mode,
             )
             (
                 token_ids,

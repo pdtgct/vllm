@@ -29,6 +29,7 @@ from vllm.models.nemotron_asr.batch_invariance import (
     BatchInvariantExecution,
     execution_mode,
 )
+from vllm.models.nemotron_asr.capture_scope import nested_graph_mode
 from vllm.models.nemotron_asr.decode_graph import (
     GraphRuntime,
     platform_graph_runtime,
@@ -1562,7 +1563,7 @@ class ResolvedEncoderExecution:
             if entry.mel_lengths is not None and mel_lengths is not None:
                 entry.mel_lengths.copy_(mel_lengths)
         with phase("port.encode.replay"):
-            self._call_graph_entry(entry, mode=runtime.graph_mode)
+            self._call_graph_entry(entry, mode=nested_graph_mode(runtime))
         with phase("port.encode.stage_out"):
             _copy_cache_storage_(caller_storage, entry.cache_storage())
             return entry.raw.clone(), entry.conditioned.clone()
@@ -1629,7 +1630,7 @@ class ResolvedEncoderExecution:
                 destination[:live].copy_(source)
         try:
             with phase("port.encode.replay"):
-                self._call_graph_entry(entry, mode=runtime.graph_mode)
+                self._call_graph_entry(entry, mode=nested_graph_mode(runtime))
         except Exception:
             self._discard()
             raise

@@ -3,6 +3,7 @@
 
 from collections.abc import Callable
 from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -203,6 +204,50 @@ def test_runtime_pads_with_zero_lengths_and_returns_only_live_rows() -> None:
     assert not result.state.h.is_contiguous()
     assert not result.state.c.is_contiguous()
     assert result.state.last_label.tolist() == [7, 8, 9]
+
+
+def test_captured_decode_runs_eagerly_inside_an_outer_transaction_capture() -> None:
+    from vllm.models.nemotron_asr.capture_scope import outer_transaction_capture
+
+    _, decode = _decode_calls()
+    base = _runtime()
+    modes: list[str] = []
+
+    def context(*args: object, cudagraph_runtime_mode: str, **kwargs: object):
+        modes.append(cudagraph_runtime_mode)
+        return base.forward_context(
+            *args, cudagraph_runtime_mode=cudagraph_runtime_mode, **kwargs
+        )
+
+    binding = DenseGraphBinding(
+        decode_fn=decode,
+        predictor=object(),
+        joint=object(),
+        vllm_config=object(),
+        frame_widths=(2,),
+        tiers=(1,),
+        encoder_hidden=3,
+        predictor_layers=2,
+        predictor_hidden=5,
+        blank_id=7,
+        runtime=replace(base, forward_context=context),
+    )
+    binding.warmup(torch.device("cpu"), torch.float32)
+    graph_decode = binding.decode_fn(geometry=0, tier=1)
+    state = DecodeState(
+        h=torch.ones(2, 1, 5), c=torch.ones(2, 1, 5), last_label=torch.tensor([4])
+    )
+    args = (torch.ones(1, 2, 3), torch.tensor([2]), object(), object(), state)
+
+    modes.clear()
+    expected = graph_decode(*args)
+    with outer_transaction_capture():
+        actual = graph_decode(*args)
+    graph_decode(*args)
+
+    assert modes == ["graph", "none", "graph"]
+    assert torch.equal(actual.token_ids, expected.token_ids)
+    assert torch.equal(actual.state.h, expected.state.h)
 
 
 # @spec PORT-PERF-004
