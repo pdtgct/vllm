@@ -108,8 +108,13 @@ def _rerun_runtime() -> GraphRuntime:
 
 
 def _cuda_runtime() -> GraphRuntime:
-    """Capture on the first graph-mode call, then replay the CUDA graph."""
+    """Capture on the first graph-mode call, then replay the CUDA graph.
+
+    Every cell's graph is captured into one shared memory pool, as the
+    platform wrapper does with its global pool.
+    """
     mode = {"value": "none"}
+    pool = torch.cuda.graph_pool_handle()
 
     class Wrapper:
         def __init__(self, runnable: Callable[[], Any], *_: Any, **__: Any):
@@ -122,7 +127,7 @@ def _cuda_runtime() -> GraphRuntime:
                 return self.runnable()
             if self.graph is None:
                 self.graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(self.graph):
+                with torch.cuda.graph(self.graph, pool=pool):
                     self.output = self.runnable()
                 return self.output
             self.graph.replay()
@@ -400,6 +405,163 @@ def _replay_parity(device: torch.device, runtime: GraphRuntime) -> None:
         assert counts[f"replays:{label}"] >= 1, label
 
 
+#: Endpoint policy (mode, threshold, residue) per CHUNK step of the drive.
+_STEP_POLICIES = ((1, 2, 1), (0, 0, 0), (1, 1, 0))
+
+
+def _drive_population(
+    core: Any,
+    pools: Pools,
+    call: tg.TransactionCallBindings,
+    graph: Any,
+    population: int,
+    *,
+    chunks: int,
+) -> tuple[list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]], int]:
+    """``population`` sessions in lockstep: one fresh, then continuing CHUNKs.
+
+    Sessions own descending block ids and mixed prompts, the row order changes
+    every CHUNK and every CHUNK drains its echoes before the next one, so
+    every CHUNK step is one declared cell. Echo steps shrink as rows park.
+    Returns the records and the number of echo transactions.
+    """
+    device = pools["book_pool"].device
+    names = [f"s{index}" for index in range(population)]
+    block = {name: population - index for index, name in enumerate(names)}
+    prompt = {name: index % 4 for index, name in enumerate(names)}
+    records: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    echoes = 0
+    for seq in range(chunks):
+        shift = (seq * 7) % population
+        order = names[shift:] + names[:shift]
+        if seq % 2:
+            order.reverse()
+        mode, threshold, residue = _STEP_POLICIES[seq % len(_STEP_POLICIES)]
+        embeds = torch.stack(
+            [
+                _chunk(
+                    101 * seq + names.index(name),
+                    seq=seq,
+                    geometry=GEOM_REG,
+                    final=False,
+                    prompt=prompt[name],
+                )
+                for name in order
+            ]
+        ).to(device)
+        plan = _plan(
+            prefills=[block[name] for name in order],
+            num_pool_blocks=population + 1,
+            has_initial=[seq > 0] * population,
+            prompts=[prompt[name] for name in order],
+            request_ids=tuple(order),
+        )
+        record = _step(
+            core,
+            pools,
+            call,
+            [PLACEHOLDER_ID] * population,
+            embeds,
+            _policy(plan, mode, threshold, residue),
+            graph,
+        )
+        records.append(record)
+        tokens = {name: int(record[0][row, 0]) for row, name in enumerate(order)}
+        for _ in range(CAP + 2):
+            active = [name for name in order if tokens[name] != PARK_ID]
+            if not active:
+                break
+            plan = _plan(
+                decodes=[block[name] for name in active],
+                num_pool_blocks=population + 1,
+                prompts=[prompt[name] for name in active],
+                request_ids=tuple(active),
+            )
+            record = _step(
+                core,
+                pools,
+                call,
+                [tokens[name] for name in active],
+                torch.zeros(len(active), CARRIER_HIDDEN, device=device),
+                _policy(plan, mode, threshold, residue),
+                graph,
+            )
+            records.append(record)
+            echoes += 1
+            for row, name in enumerate(active):
+                tokens[name] = int(record[0][row, 0])
+        else:
+            raise AssertionError("replay queue did not drain")
+    return records, echoes
+
+
+def _population_parity(
+    device: torch.device, runtime: GraphRuntime, population: int, *, chunks: int
+) -> None:
+    """Lockstep CHUNKs at ``population`` replay their cells bitwise exactly.
+
+    Only ``population`` is declared, so every CHUNK must replay and only echo
+    steps whose population shrank may fall back, as ``undeclared``.
+    """
+    core = _core(device)
+    call = _call_bindings(core)
+    eager_pools = _endpoint_pools(population + 1, device)
+    graph_pools = _clone_pools(eager_pools)
+    binding = tg.TransactionGraphBinding(
+        populations=[population],
+        geometries=(GEOM_REG, GEOM_FINAL),
+        maximum_population=population,
+        vllm_config=object(),
+        runtime=runtime,
+    )
+    if device.type == "cuda":
+        advance.warmup_advance_model_rows_scatter(**graph_pools)
+    binding.capture(
+        core,
+        pools=_transaction_pools(graph_pools),
+        call=call,
+        hidden_size=CARRIER_HIDDEN,
+        device=device,
+    )
+    _assert_pools_equal(graph_pools, eager_pools)
+    assert binding.ready
+
+    expected, echoes = _drive_population(
+        core, eager_pools, call, None, population, chunks=chunks
+    )
+    actual, _ = _drive_population(
+        core, graph_pools, call, binding, population, chunks=chunks
+    )
+
+    _assert_records_equal(actual, expected)
+    _assert_pools_equal(graph_pools, eager_pools)
+    assert all(not bool(status.any()) for _rows, status, _progress in expected)
+    emitted = {
+        int(token)
+        for rows, _status, _progress in expected
+        for token in rows[:, 0].tolist()
+    }
+    assert emitted - {PARK_ID}, "the trajectory must emit labels"
+    counts = binding.counters()
+    assert counts[f"replays:chunk-fresh:g0:b{population}"] == 1
+    assert counts[f"replays:chunk-continuing:g0:b{population}"] == chunks - 1
+    echo_replays = counts[f"replays:replay:b{population}"]
+    fallbacks = {
+        key: value
+        for key, value in counts.items()
+        if key.startswith("fallbacks:") and value
+    }
+    for key in fallbacks:
+        assert key.startswith("fallbacks:replay:b") and key.endswith(":undeclared"), key
+    assert echo_replays + sum(fallbacks.values()) == echoes
+    assert counts["replays"] == chunks + echo_replays
+    assert echoes > 0, "the trajectory must echo"
+
+
+#: CHUNK steps per population; B63 runs fewer to keep runtime sane.
+_POPULATION_CHUNKS = [(1, 3), (31, 3), (63, 2)]
+
+
 # ---- CPU: arena, guard, classification and replay plumbing -----------------
 
 
@@ -552,6 +714,131 @@ def test_replay_matches_eager_across_varied_plans_on_cpu() -> None:
 
 
 @pytest.mark.cpu_test
+@pytest.mark.parametrize(("population", "chunks"), _POPULATION_CHUNKS)
+def test_population_lockstep_replays_every_chunk_on_cpu(
+    population: int, chunks: int
+) -> None:
+    _population_parity(CPU, _rerun_runtime(), population, chunks=chunks)
+
+
+def _corrupt_row_in_population(
+    device: torch.device, runtime: GraphRuntime, population: int
+) -> None:
+    """One out-of-sequence row in a continuing population is rejected alone."""
+    core = _core(device)
+    call = _call_bindings(core)
+    eager_pools = _endpoint_pools(population + 1, device)
+    graph_pools = _clone_pools(eager_pools)
+    binding = tg.TransactionGraphBinding(
+        populations=[population],
+        geometries=(GEOM_REG,),
+        maximum_population=population,
+        vllm_config=object(),
+        runtime=runtime,
+    )
+    if device.type == "cuda":
+        advance.warmup_advance_model_rows_scatter(**graph_pools)
+    binding.capture(
+        core,
+        pools=_transaction_pools(graph_pools),
+        call=call,
+        hidden_size=CARRIER_HIDDEN,
+        device=device,
+    )
+    blocks = list(range(1, population + 1))
+    bad = population // 2
+
+    def run(pools: Pools, graph: Any) -> list[Any]:
+        records = []
+        for seq in range(2):
+            rows = []
+            for index in range(population):
+                stamped = seq + 3 if seq and index == bad else seq
+                rows.append(
+                    _chunk(
+                        7 * seq + index,
+                        seq=stamped,
+                        geometry=GEOM_REG,
+                        final=False,
+                        prompt=0,
+                    )
+                )
+            plan = _plan(
+                prefills=blocks,
+                num_pool_blocks=population + 1,
+                has_initial=[seq > 0] * population,
+            )
+            before = _clone_pools(pools)
+            records.append(
+                _step(
+                    core,
+                    pools,
+                    call,
+                    [PLACEHOLDER_ID] * population,
+                    torch.stack(rows).to(device),
+                    plan,
+                    graph,
+                )
+            )
+            if seq:
+                for key in pools:
+                    values = (
+                        pools[key] if isinstance(pools[key], list) else [pools[key]]
+                    )
+                    olds = (
+                        before[key] if isinstance(before[key], list) else [before[key]]
+                    )
+                    for value, old in zip(values, olds, strict=True):
+                        torch.testing.assert_close(
+                            value[blocks[bad]], old[blocks[bad]], atol=0, rtol=0
+                        )
+            # Drain echoes eagerly between CHUNKs (not under test here).
+            tokens = records[-1][0][:, 0].long().tolist()
+            for _ in range(CAP + 2):
+                active = [
+                    index
+                    for index, token in enumerate(tokens)
+                    if token != PARK_ID and not (seq and index == bad)
+                ]
+                if not active:
+                    break
+                out = _step(
+                    core,
+                    pools,
+                    call,
+                    [tokens[index] for index in active],
+                    torch.zeros(len(active), CARRIER_HIDDEN, device=device),
+                    _plan(
+                        decodes=[blocks[index] for index in active],
+                        num_pool_blocks=population + 1,
+                    ),
+                    None,
+                )
+                for row, index in enumerate(active):
+                    tokens[index] = int(out[0][row, 0])
+        return records
+
+    expected = run(eager_pools, None)
+    actual = run(graph_pools, binding)
+    _assert_records_equal(actual, expected)
+    _assert_pools_equal(graph_pools, eager_pools)
+    status = expected[1][1]
+    assert int(status[bad]) != 0
+    assert not bool(status[torch.arange(population) != bad].any())
+    counts = binding.counters()
+    assert counts["fallbacks"] == 0
+    assert counts[f"replays:chunk-continuing:g0:b{population}"] == 1
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("population", [31, 63])
+def test_one_corrupt_row_in_a_population_is_rejected_alone_on_cpu(
+    population: int,
+) -> None:
+    _corrupt_row_in_population(CPU, _rerun_runtime(), population)
+
+
+@pytest.mark.cpu_test
 def test_capture_input_stores_no_page_and_publishes_every_cell() -> None:
     core = _core()
     call = _call_bindings(core)
@@ -570,6 +857,38 @@ def test_capture_input_stores_no_page_and_publishes_every_cell() -> None:
         "replay:b1",
     ]
     assert advance.consume_batch_stats() is None
+
+
+@pytest.mark.cpu_test
+def test_receipt_captures_largest_population_first_and_reports_cost() -> None:
+    core = _core()
+    call = _call_bindings(core)
+    pools = _endpoint_pools(5)
+    binding = tg.TransactionGraphBinding(
+        populations=[1, 4, 2],
+        geometries=(GEOM_REG,),
+        maximum_population=4,
+        vllm_config=object(),
+        runtime=_rerun_runtime(),
+    )
+    binding.capture(
+        core,
+        pools=_transaction_pools(pools),
+        call=call,
+        hidden_size=CARRIER_HIDDEN,
+        device=CPU,
+    )
+    receipt = binding.receipt()
+    cells = {entry["cell"]: entry for entry in receipt["cells"]}
+    assert len(cells) == 9 and all(entry["captured"] for entry in cells.values())
+    order = sorted(cells.values(), key=lambda entry: entry["capture_index"])
+    populations = [int(entry["cell"].rsplit(":b", 1)[1]) for entry in order]
+    assert populations == sorted(populations, reverse=True)
+    assert sorted(entry["capture_index"] for entry in order) == list(range(9))
+    for entry in order:
+        assert entry["warmup_seconds"] > 0 and entry["capture_seconds"] >= 0
+        assert entry["retained_bytes"] is None  # no device allocator on CPU
+    assert receipt["retained_bytes_total"] is None
 
 
 def _first_step(
@@ -856,6 +1175,28 @@ def exact_fp32() -> Iterator[None]:
 @torch.inference_mode()
 def test_cuda_graph_replay_matches_eager_across_varied_plans() -> None:
     _replay_parity(torch.device("cuda"), _cuda_runtime())
+
+
+@pytest.mark.nemotron_gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("exact_fp32")
+@torch.inference_mode()
+@pytest.mark.parametrize(("population", "chunks"), _POPULATION_CHUNKS)
+def test_cuda_population_lockstep_replays_every_chunk(
+    population: int, chunks: int
+) -> None:
+    _population_parity(torch.device("cuda"), _cuda_runtime(), population, chunks=chunks)
+
+
+@pytest.mark.nemotron_gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("exact_fp32")
+@torch.inference_mode()
+@pytest.mark.parametrize("population", [31, 63])
+def test_cuda_one_corrupt_row_in_a_population_is_rejected_alone(
+    population: int,
+) -> None:
+    _corrupt_row_in_population(torch.device("cuda"), _cuda_runtime(), population)
 
 
 @pytest.mark.nemotron_gpu
