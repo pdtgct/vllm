@@ -587,7 +587,7 @@ def _first_step(
             _chunk(5 + i, seq=0, geometry=GEOM_REG, final=False, prompt=0)
             for i in range(len(blocks))
         ]
-    )
+    ).to(pools["book_pool"].device)
     plan = _plan(
         prefills=blocks,
         num_pool_blocks=4,
@@ -832,8 +832,27 @@ def test_counters_reach_the_model_from_an_engine_core() -> None:
 # ---- CUDA: real graph replay -----------------------------------------------
 
 
+@pytest.fixture
+def exact_fp32() -> Iterator[None]:
+    """Disable TF32 so eager and replay both run IEEE FP32 kernels."""
+    targets = (
+        torch.backends.cuda.matmul,
+        torch.backends.cudnn.conv,
+        torch.backends.cudnn.rnn,
+    )
+    saved = [target.fp32_precision for target in targets]
+    for target in targets:
+        target.fp32_precision = "ieee"
+    try:
+        yield
+    finally:
+        for target, value in zip(targets, saved, strict=True):
+            target.fp32_precision = value
+
+
 @pytest.mark.nemotron_gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("exact_fp32")
 @torch.inference_mode()
 def test_cuda_graph_replay_matches_eager_across_varied_plans() -> None:
     _replay_parity(torch.device("cuda"), _cuda_runtime())
@@ -841,6 +860,7 @@ def test_cuda_graph_replay_matches_eager_across_varied_plans() -> None:
 
 @pytest.mark.nemotron_gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("exact_fp32")
 @torch.inference_mode()
 @pytest.mark.parametrize("corruption", ["sequence", "echo", "book"])
 def test_cuda_graph_replay_rejects_corrupt_rows_like_eager(corruption: str) -> None:
@@ -858,6 +878,7 @@ def test_cuda_graph_replay_rejects_corrupt_rows_like_eager(corruption: str) -> N
         token = int(records[0][0][0, 0])
         if corruption == "sequence":
             embeds = _chunk(9, seq=5, geometry=GEOM_REG, final=False, prompt=0)
+            embeds = embeds.to(device)
             plan = _plan(prefills=[2], num_pool_blocks=4, has_initial=[True])
             ids, rows = [PLACEHOLDER_ID], embeds.unsqueeze(0).to(device)
         else:
@@ -882,6 +903,7 @@ def test_cuda_graph_replay_rejects_corrupt_rows_like_eager(corruption: str) -> N
 
 @pytest.mark.nemotron_gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("exact_fp32")
 @torch.inference_mode()
 def test_cuda_replayed_rows_survive_another_cells_replay() -> None:
     device = torch.device("cuda")
