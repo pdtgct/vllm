@@ -23,6 +23,7 @@ from vllm.v1.kv_cache_interface import (
     CrossAttentionSpec,
     KVCacheSpec,
     MambaSpec,
+    PersistentStateSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.request import Request
@@ -96,6 +97,13 @@ def run_mixed_prefill_decode_warmup(
     """Run a V2 mixed prefill+decode step through normal scheduler inputs."""
     if model_runner.is_pooling_model or model_runner.max_num_reqs < 2 or num_tokens < 3:
         return False
+    kv_cache_groups = model_runner.kv_cache_config.kv_cache_groups
+    if any(isinstance(g.kv_cache_spec, PersistentStateSpec) for g in kv_cache_groups):
+        # A persistent-state request holds one state record for its lifetime,
+        # not one block per token, and its first step is a model-defined
+        # transaction rather than a token prefill. Synthetic token requests
+        # fit neither, so state-slot models skip this warmup.
+        return False
 
     decode_req_id = f"{req_id_prefix}_decode_"
     prefill_req_id = f"{req_id_prefix}_prefill_"
@@ -105,7 +113,6 @@ def run_mixed_prefill_decode_warmup(
     decode_token_ids = list(range(decode_prompt_len))
     prefill_token_ids = list(range(prefill_len))
 
-    kv_cache_groups = model_runner.kv_cache_config.kv_cache_groups
     block_count = _warmup_block_counter(model_runner)
     kv_cache_specs = [g.kv_cache_spec for g in kv_cache_groups]
     decode_prefill_block_counts = [

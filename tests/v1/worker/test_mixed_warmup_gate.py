@@ -32,6 +32,32 @@ def test_mixed_warmup_skipped_for_single_seq(max_num_reqs):
     )
 
 
+def test_mixed_warmup_skipped_for_persistent_state_groups():
+    """A state-slot group reserves one record per request, so the synthetic
+    token prefill/decode warmup must be skipped before any worker call."""
+    from vllm.v1.kv_cache_interface import PersistentStateSpec
+
+    spec = PersistentStateSpec.__new__(PersistentStateSpec)
+    runner = SimpleNamespace(
+        is_pooling_model=False,
+        max_num_reqs=31,
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)],
+            num_blocks=32,
+        ),
+    )
+
+    assert (
+        run_mixed_prefill_decode_warmup(
+            runner,
+            worker_execute_model=_fail,
+            worker_sample_tokens=_fail,
+            num_tokens=16,
+        )
+        is False
+    )
+
+
 def test_mixed_warmup_disables_watermarking():
     outputs: list[SchedulerOutput] = []
     runner = SimpleNamespace(
