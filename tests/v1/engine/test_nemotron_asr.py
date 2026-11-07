@@ -542,6 +542,40 @@ def _read_where_admission_reads(monkeypatch):
     monkeypatch.setattr(profile_execution, "run_persistent_state_profile", profiled)
 
 
+def _record_peak_resets(monkeypatch):
+    """Record every peak-statistics reset made inside ``prepare_execution_memory``.
+
+    The profiler's transient peak headroom is the device's peak allocation since
+    the window opened; a reset inside the model's hook would hide part of it.
+    """
+    from vllm.models.nemotron_asr.nemotron_asr import NemotronASRForRNNT
+
+    inside = []
+    resets = []
+    prepare = NemotronASRForRNNT.prepare_execution_memory
+
+    def prepared(self):
+        inside.append(True)
+        try:
+            return prepare(self)
+        finally:
+            inside.pop()
+
+    for name in ("_cuda_resetPeakMemoryStats", "_accelerator_resetPeakStats"):
+        reset = getattr(torch._C, name, None)
+        if reset is None:
+            continue
+
+        def counted(*args, _reset=reset, _name=name):
+            if inside:
+                resets.append(_name)
+            return _reset(*args)
+
+        monkeypatch.setattr(torch._C, name, counted)
+    monkeypatch.setattr(NemotronASRForRNNT, "prepare_execution_memory", prepared)
+    return resets
+
+
 def _startup_memory(
     hf_overrides, gpu_memory_utilization, max_num_seqs=8, admission_readings=False
 ):
@@ -567,6 +601,7 @@ def _startup_memory(
     with pytest.MonkeyPatch.context() as patch:
         if admission_readings:
             _read_where_admission_reads(patch)
+        resets = _record_peak_resets(patch)
         core = EngineCore(args.create_engine_config(), UniProcExecutor, log_stats=False)
     try:
         worker = core.model_executor.driver_worker.worker
@@ -577,6 +612,9 @@ def _startup_memory(
             "total_consumed": worker.total_consumed,
             "headroom": headroom,
             "non_kv": worker.total_consumed + headroom,
+            "requested": worker.requested_memory,
+            "available": worker.available_kv_cache_memory_bytes,
+            "peak_resets": resets,
             "budget": core.available_gpu_memory_for_kv_cache,
             "page": view.spec.page_size_bytes,
             "count": view.capacity,
@@ -595,13 +633,16 @@ def _startup_memory(
 def test_nemotron_engine_transaction_graph_admission_is_charged(monkeypatch):
     """Admitted graph memory is charged before resident capacity is fixed.
 
-    Option-on minus option-off at equal utilization must cover ``A`` in
-    ``non_kv_cache_memory`` and in retained consumption, without shrinking the
-    transient peak. The first engine in a process also creates process-wide
-    device memory that later engines start with, so the option-off arm runs
-    twice, first, and the option-on arm is compared with its second run; the
-    spread between the two option-off runs is reported. Both option-off runs
-    take admission's normalized readings where admission takes them. A final,
+    Option-on minus option-off at equal utilization must cover ``A`` in retained
+    consumption. The transient peak headroom is the profiler's own measurement:
+    the model resets no peak statistics inside ``prepare_execution_memory`` and
+    the KV budget is the requested memory less retained consumption and that
+    headroom. The differences in ``non_kv_cache_memory`` and headroom are
+    reported. The first engine in a process also creates process-wide device
+    memory that later engines start with, so the option-off arm runs twice,
+    first, and the option-on arm is compared with its second run; the spread
+    between the two option-off runs is reported. Both option-off runs take
+    admission's normalized readings where admission takes them. A final,
     memory-bound run sized from the option-on figures must hold exactly the
     pages core derives from its reduced budget.
     """
@@ -624,17 +665,20 @@ def test_nemotron_engine_transaction_graph_admission_is_charged(monkeypatch):
         "on - off": {key: on[key] - off[key] for key in charged},
         "first off - off": {key: first[key] - off[key] for key in charged},
         "startup free": (first["free"], off["free"], on["free"]),
+        "peak resets": [arm["peak_resets"] for arm in (first, off, on)],
     }
     print(f"admission charge figures: {figures}")
     assert first["admitted"] is None and off["admitted"] is None
     assert admitted is not None and admitted > 0
-    assert on["non_kv"] - off["non_kv"] >= admitted, figures
     assert on["total_consumed"] - off["total_consumed"] >= admitted, figures
-    assert on["headroom"] >= off["headroom"], figures
+    for arm in (first, off, on):
+        assert arm["peak_resets"] == [], figures
+        assert arm["available"] == arm["requested"] - arm["non_kv"], figures
 
     # Aim the budget at 5.5 pages so memory, not max_num_seqs + 1, binds.
     utilization = (on["non_kv"] + 5.5 * on["page"]) / on["total"]
     bound = _startup_memory(option, utilization, max_num_seqs)
-    assert 2 <= bound["count"] < max_num_seqs + 1
+    assert bound["peak_resets"] == [], bound
+    assert 2 <= bound["count"] < max_num_seqs + 1, bound
     # ``capacity`` counts every allocated page, the null slot 0 included.
-    assert bound["count"] == bound["budget"] // bound["page"]
+    assert bound["count"] == bound["budget"] // bound["page"], bound

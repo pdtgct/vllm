@@ -61,6 +61,7 @@ from tests.models.nemotron_asr.test_decode_graph_binding import (
     _runtime as _decode_runtime,
 )
 from tests.models.nemotron_asr.test_plan_local import _bind, _feature, _row
+from tests.utils import create_new_process_for_each_test
 from vllm.config.compilation import CUDAGraphMode
 from vllm.models.nemotron_asr import profile_execution
 from vllm.models.nemotron_asr import transaction_graph as tg
@@ -4167,8 +4168,8 @@ def test_counters_raise_when_the_model_is_unreachable(target: Any) -> None:
 # ---- CUDA: real graph replay -----------------------------------------------
 
 
-@pytest.fixture
-def exact_fp32() -> Iterator[None]:
+@contextmanager
+def _exact_fp32() -> Iterator[None]:
     """Disable TF32 so eager and replay both run IEEE FP32 kernels."""
     targets = (
         torch.backends.cuda.matmul,
@@ -4183,6 +4184,13 @@ def exact_fp32() -> Iterator[None]:
     finally:
         for target, value in zip(targets, saved, strict=True):
             target.fp32_precision = value
+
+
+@pytest.fixture
+def exact_fp32() -> Iterator[None]:
+    """Run the test under ``_exact_fp32``."""
+    with _exact_fp32():
+        yield
 
 
 @pytest.mark.nemotron_gpu
@@ -4370,7 +4378,8 @@ def _segment_pools() -> set[Any]:
 
 @pytest.mark.nemotron_gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.usefixtures("exact_fp32")
+@create_new_process_for_each_test(method="spawn")
+@_exact_fp32()
 @torch.inference_mode()
 def test_cuda_admission_and_serving_capture_share_cell_order(
     monkeypatch: pytest.MonkeyPatch,
@@ -4403,7 +4412,8 @@ def test_cuda_admission_and_serving_capture_share_cell_order(
 
 @pytest.mark.nemotron_gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.usefixtures("exact_fp32")
+@create_new_process_for_each_test(method="spawn")
+@_exact_fp32()
 @torch.inference_mode()
 def test_cuda_serving_pool_is_distinct_from_released_admission_pool(
     monkeypatch: pytest.MonkeyPatch,
@@ -4422,7 +4432,8 @@ def test_cuda_serving_pool_is_distinct_from_released_admission_pool(
 
 @pytest.mark.nemotron_gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.usefixtures("exact_fp32")
+@create_new_process_for_each_test(method="spawn")
+@_exact_fp32()
 @torch.inference_mode()
 def test_cuda_receipt_reports_admission_and_serving_bytes(
     monkeypatch: pytest.MonkeyPatch,
