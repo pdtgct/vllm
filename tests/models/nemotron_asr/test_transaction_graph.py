@@ -12,6 +12,7 @@ be frozen at capture.
 from __future__ import annotations
 
 import gc
+import os
 import sys
 import types
 import weakref
@@ -24,6 +25,7 @@ from typing import Any
 import pytest
 import torch
 
+from tests.models.nemotron_asr import test_encoder_execution as encoder_tests
 from tests.models.nemotron_asr.test_advance_model_rows_local import (
     _BOOK,
     CAP,
@@ -51,16 +53,33 @@ from tests.models.nemotron_asr.test_advance_model_rows_local import (
     advance,
     rnnt,
 )
-from tests.models.nemotron_asr.test_plan_local import _feature
+from tests.models.nemotron_asr.test_advance_session_local import _fresh_state
+from tests.models.nemotron_asr.test_decode_graph_binding import (
+    _decode_calls,
+)
+from tests.models.nemotron_asr.test_decode_graph_binding import (
+    _runtime as _decode_runtime,
+)
+from tests.models.nemotron_asr.test_plan_local import _bind, _feature, _row
 from vllm.config.compilation import CUDAGraphMode
 from vllm.models.nemotron_asr import profile_execution
 from vllm.models.nemotron_asr import transaction_graph as tg
+from vllm.models.nemotron_asr.batch_invariance import execution_mode
 from vllm.models.nemotron_asr.capture_scope import (
     nested_graph_mode,
     outer_transaction_capture,
 )
-from vllm.models.nemotron_asr.decode_graph import GraphRuntime
+from vllm.models.nemotron_asr.chunk_bucket_graph import (
+    ExactChunkGraphBinding,
+    capture_chunk_bucket,
+)
+from vllm.models.nemotron_asr.commit_sink import (
+    BoundedCommitSink,
+    resolve_status_reports,
+)
+from vllm.models.nemotron_asr.decode_graph import DenseGraphBinding, GraphRuntime
 from vllm.models.nemotron_asr.model_state_v2 import NemotronASRModelState
+from vllm.models.nemotron_asr.plan import SessionRegistry
 from vllm.models.nemotron_asr.state_profile import (
     allocate_state_scratch,
     build_nemotron_persistent_state_spec,
@@ -176,13 +195,116 @@ def _cuda_runtime() -> GraphRuntime:
     return _runtime(Wrapper, mode)
 
 
+def _logging_runtime(
+    log: list[tuple[int, str]], corrupt: Callable[[int], bool] | None = None
+) -> GraphRuntime:
+    """The re-executing runtime, logging ``(wrapper index, mode)`` per call.
+
+    When ``corrupt(index)`` holds, wrapper ``index``'s graph-mode calls after
+    its capture return projection rows that differ from the eager body's.
+    """
+    mode = {"value": "none"}
+    created = [0]
+
+    class Wrapper:
+        def __init__(self, runnable: Callable[[], Any], *_: Any, **__: Any):
+            self.runnable = runnable
+            self.index = created[0]
+            self.captured = False
+            created[0] += 1
+
+        def __call__(self) -> Any:
+            log.append((self.index, mode["value"]))
+            output = self.runnable()
+            if mode["value"] == "graph":
+                if self.captured and corrupt is not None and corrupt(self.index):
+                    output[0].add_(1)
+                self.captured = True
+            return output
+
+    return _runtime(Wrapper, mode)
+
+
+def _entry_runtime(captures: list[Any]) -> SimpleNamespace:
+    """A re-executing runtime whose wrappers hold graphs as the platform's do.
+
+    Each wrapper keeps ``concrete_cudagraph_entries`` keyed by batch
+    descriptor, each entry holding its ``cudagraph``. A graph-mode call
+    without an entry captures, recording the descriptor in ``captures``.
+    ``clear_all_graphs()`` empties every wrapper, as
+    ``CUDAGraphWrapper.clear_all_graphs()`` does.
+    """
+    mode: dict[str, Any] = {"value": "none", "descriptor": None}
+    wrappers: list[Any] = []
+
+    class Wrapper:
+        def __init__(self, runnable: Callable[[], Any], *_: Any, **__: Any):
+            self.runnable = runnable
+            self.concrete_cudagraph_entries: dict[Any, SimpleNamespace] = {}
+            wrappers.append(self)
+
+        def clear_graphs(self) -> None:
+            self.concrete_cudagraph_entries.clear()
+
+        def __call__(self) -> Any:
+            if mode["value"] == "graph":
+                descriptor = mode["descriptor"]
+                entry = self.concrete_cudagraph_entries.get(descriptor)
+                if entry is None or entry.cudagraph is None:
+                    captures.append(descriptor)
+                    self.concrete_cudagraph_entries[descriptor] = SimpleNamespace(
+                        cudagraph=object()
+                    )
+            return self.runnable()
+
+    def context(
+        _metadata: object,
+        _config: object,
+        *,
+        cudagraph_runtime_mode: str,
+        batch_descriptor: object,
+    ) -> Any:
+        @contextmanager
+        def scope() -> Iterator[None]:
+            previous = mode["value"], mode["descriptor"]
+            mode["value"], mode["descriptor"] = cudagraph_runtime_mode, batch_descriptor
+            try:
+                yield
+            finally:
+                mode["value"], mode["descriptor"] = previous
+
+        return scope()
+
+    def clear_all_graphs() -> None:
+        for wrapper in wrappers:
+            wrapper.clear_graphs()
+
+    runtime = replace(_runtime(Wrapper, mode), forward_context=context)
+    return SimpleNamespace(runtime=runtime, clear_all_graphs=clear_all_graphs)
+
+
+def _recording(runtime: GraphRuntime, modes: list[Any]) -> GraphRuntime:
+    """``runtime`` with every launch's graph mode appended to ``modes``."""
+    forward = runtime.forward_context
+
+    def context(*args: Any, cudagraph_runtime_mode: Any, **kwargs: Any) -> Any:
+        modes.append(cudagraph_runtime_mode)
+        return forward(*args, cudagraph_runtime_mode=cudagraph_runtime_mode, **kwargs)
+
+    return replace(runtime, forward_context=context)
+
+
 # ---- fixtures --------------------------------------------------------------
 
 
-def _endpoint_pools(num_blocks: int, device: torch.device = CPU) -> Pools:
+def _endpoint_pools(
+    num_blocks: int, device: torch.device = CPU, *, endpoint: bool = True
+) -> Pools:
+    """Resident pools; ``endpoint`` adds the endpoint history and book pools."""
     pools = _fresh_pools(num_blocks)
-    pools["endpoint_history_pool"] = torch.zeros(num_blocks, 8, dtype=torch.int32)
-    pools["endpoint_book_pool"] = torch.zeros(num_blocks, 6, dtype=torch.int32)
+    if endpoint:
+        pools["endpoint_history_pool"] = torch.zeros(num_blocks, 8, dtype=torch.int32)
+        pools["endpoint_book_pool"] = torch.zeros(num_blocks, 6, dtype=torch.int32)
     return {
         key: [tensor.to(device) for tensor in value]
         if isinstance(value, list)
@@ -203,8 +325,8 @@ def _transaction_pools(pools: Pools) -> advance.TransactionPools:
         frontend_raw=pools["frontend_raw_pool"],
         frontend_mel=pools["frontend_mel_pool"],
         frontend_counter=pools["frontend_counter_pool"],
-        endpoint_history=pools["endpoint_history_pool"],
-        endpoint_book=pools["endpoint_book_pool"],
+        endpoint_history=pools.get("endpoint_history_pool"),
+        endpoint_book=pools.get("endpoint_book_pool"),
     )
 
 
@@ -215,7 +337,8 @@ def _core(device: torch.device = CPU) -> Any:
     return core
 
 
-def _call_bindings(core: Any) -> tg.TransactionCallBindings:
+def _call_bindings(core: Any, *, endpoint: bool = True) -> tg.TransactionCallBindings:
+    """Call bindings; without ``endpoint`` the EOU control id is absent."""
     return tg.TransactionCallBindings(
         adapter=advance.make_mrv1_adapter(
             hidden_size=CARRIER_HIDDEN, park_id=PARK_ID, blank_id=core.blank_id
@@ -225,7 +348,7 @@ def _call_bindings(core: Any) -> tg.TransactionCallBindings:
         bucket_transition=None,
         placeholder_id=PLACEHOLDER_ID,
         park_id=PARK_ID,
-        eou_token_id=EOU,
+        eou_token_id=EOU if endpoint else None,
         graph_covers_decode=False,
     )
 
@@ -241,7 +364,7 @@ def _binding(
 ) -> tg.TransactionGraphBinding:
     binding = tg.TransactionGraphBinding(
         populations=list(populations),
-        geometries=(GEOM_REG, GEOM_FINAL),
+        geometries=(GEOM_REG,),
         maximum_population=4,
         vllm_config=object(),
         runtime=runtime,
@@ -380,6 +503,8 @@ def _model(
         for name, value in vars(_core(device)).items():
             setattr(core, name, value)
         core.policy = kwargs["policy"]
+        # The value an unbound owner reads; the dense decode binding needs it.
+        core.batch_invariant_mode = execution_mode(None)
         return core
 
     monkeypatch.setattr(nemotron_asr, "NemotronASRCore", make_core)
@@ -714,6 +839,45 @@ def _serve_session(
     raise AssertionError("the session did not park")
 
 
+def _chunk_forward(
+    model: Any, state: NemotronASRModelState, slots: StateSlotBindings
+) -> None:
+    """Session ``left``'s fresh g0 CHUNK step, up to its commit collection."""
+    layer = model._persistent_state_layer.prefix
+    audio = _chunk(17, seq=0, geometry=GEOM_REG, final=False, prompt=0)
+    step = _schedule(slots, layer, {"left": PLACEHOLDER_ID})
+    state.prepare_step(step, dummy_run=False, is_profile=False)
+    slots.begin_step(step, SimpleNamespace(wait_stream=lambda _: None))
+    slots.activate_requests()
+    state.add_request(
+        0,
+        NewRequestData(
+            "left",
+            [PLACEHOLDER_ID],
+            [_feature(payload=audio)],
+            None,
+            None,
+            ([1],),
+            0,
+            None,
+            prefill_token_ids=[PLACEHOLDER_ID],
+        ),
+    )
+    batch = SimpleNamespace(
+        req_ids=["left"],
+        num_scheduled_tokens=[1],
+        input_ids=torch.tensor([PLACEHOLDER_ID]),
+        num_computed_tokens_np=[0],
+    )
+    projection = state.prepare_inputs(
+        batch, SimpleNamespace(req_id_to_index={"left": 0})
+    )
+    with torch.inference_mode():
+        model.forward(
+            input_ids=batch.input_ids, inputs_embeds=audio.unsqueeze(0), **projection
+        )
+
+
 def _policy(plan: Any, mode: int, threshold: int, residue: int) -> Any:
     rows = plan.num_decodes + plan.num_prefills
     return replace(
@@ -734,26 +898,18 @@ def _step(
     graph: Any,
     *,
     capture: bool = False,
+    memory_profile: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    device = embeds.device
     sink = _CommitRecorder()
-    out = advance.advance_model_rows(
+    out = _advance(
         core,
-        torch.tensor(ids, dtype=torch.long, device=device),
-        embeds,
-        plan,
-        adapter=call.adapter,
-        decode_resolver=call.decode_resolver,
-        encoder_transition=call.encoder_transition,
-        bucket_transition=call.bucket_transition,
-        placeholder_id=PLACEHOLDER_ID,
-        park_id=PARK_ID,
-        eou_token_id=EOU,
-        commit_sink=sink,
+        pools,
+        call,
+        (ids, embeds, plan),
+        graph,
+        sink,
         capture=capture,
-        graph_covers_decode=call.graph_covers_decode,
-        transaction_graph=graph,
-        **pools,
+        memory_profile=memory_profile,
     )
     assert sink.log == ["reserve", "stage"]
     return (
@@ -763,11 +919,214 @@ def _step(
     )
 
 
-def _chunk(
-    seed: int, *, seq: int, geometry: int, final: bool, prompt: int
+Rows = tuple[list[int], torch.Tensor, Any]
+
+
+def _rows(
+    decodes: list[int],
+    prefills: list[int],
+    fresh: list[bool] | None = None,
+    *,
+    geometries: list[int] | None = None,
+    chunk: list[bool] | None = None,
+    num_pool_blocks: int = 4,
+    device: torch.device = CPU,
+) -> Rows:
+    """Ids, carriers and plan: echo rows on ``decodes``, then CHUNK rows."""
+    fresh = [True] * len(prefills) if fresh is None else fresh
+    rows = len(decodes) + len(prefills)
+    geometries = [GEOM_REG] * rows if geometries is None else geometries
+    chunk = [False] * len(decodes) + [True] * len(prefills) if chunk is None else chunk
+    carriers = [
+        _chunk(5 + row, seq=0, geometry=geometries[row], final=False, prompt=0)
+        if chunk[row]
+        else torch.zeros(CARRIER_HIDDEN)
+        for row in range(rows)
+    ]
+    plan = _plan(
+        decodes=decodes,
+        prefills=prefills,
+        num_pool_blocks=num_pool_blocks,
+        has_initial=[not value for value in fresh],
+        geometries=geometries,
+        chunk=chunk,
+    )
+    embeds = torch.stack(carriers) if carriers else torch.zeros(0, CARRIER_HIDDEN)
+    ids = [PLACEHOLDER_ID if chunk[row] else VOCAB - 1 for row in range(rows)]
+    return ids, embeds.to(device), plan
+
+
+def _advance(
+    core: Any,
+    pools: Pools,
+    call: tg.TransactionCallBindings,
+    rows: Rows,
+    graph: Any,
+    sink: Any = None,
+    **kwargs: Any,
 ) -> torch.Tensor:
+    """One ``advance_model_rows`` call over ``rows`` and ``pools``."""
+    ids, embeds, plan = rows
+    return advance.advance_model_rows(
+        core,
+        torch.tensor(ids, dtype=torch.long, device=embeds.device),
+        embeds,
+        plan,
+        adapter=call.adapter,
+        decode_resolver=call.decode_resolver,
+        encoder_transition=call.encoder_transition,
+        bucket_transition=call.bucket_transition,
+        placeholder_id=PLACEHOLDER_ID,
+        park_id=PARK_ID,
+        eou_token_id=call.eou_token_id,
+        commit_sink=sink,
+        graph_covers_decode=call.graph_covers_decode,
+        transaction_graph=graph,
+        **kwargs,
+        **pools,
+    )
+
+
+def _prepared(
+    core: Any, pools: Pools, call: tg.TransactionCallBindings, rows: Rows
+) -> Any:
+    """The host prologue's ``TransactionInputs`` for ``rows``."""
+    ids, embeds, plan = rows
+    return advance.prepare_transaction(
+        core,
+        torch.tensor(ids, dtype=torch.long, device=embeds.device),
+        embeds,
+        plan,
+        pools=_transaction_pools(pools),
+        eou_token_id=call.eou_token_id,
+        adapter=call.adapter,
+        decode_resolver=call.decode_resolver,
+        encoder_transition=call.encoder_transition,
+        bucket_transition=call.bucket_transition,
+        placeholder_id=PLACEHOLDER_ID,
+        park_id=PARK_ID,
+        has_commit_sink=True,
+        capture=False,
+        graph_covers_decode=call.graph_covers_decode,
+        memory_profile=False,
+        native_burst_handoff=None,
+    )
+
+
+class _PermissiveLease:
+    """A registry whose every lease is current, for sink-level collection."""
+
+    def validate_lease(self, _bindings: Any) -> None:
+        return None
+
+    def lease_is_current(self, _bindings: Any) -> bool:
+        return True
+
+    def resolve_status(self, **_kwargs: Any) -> bool:
+        return True
+
+
+class _TrackedTicket:
+    def __init__(self, ticket: Any, log: list[str]) -> None:
+        self._ticket = ticket
+        self._log = log
+
+    def stage(self, row_status: torch.Tensor) -> None:
+        self._log.append("stage")
+        self._ticket.stage(row_status)
+
+    def cancel(self) -> None:
+        self._log.append("cancel")
+        self._ticket.cancel()
+
+
+class _TrackedSink(BoundedCommitSink):
+    """The production sink, logging reserve, stage, cancel and collect.
+
+    ``fail_stage`` makes staging raise after the ticket has marked itself
+    done, as a ``CommitTicket.stage`` failure after ``_done`` would.
+    """
+
+    def __init__(
+        self,
+        registry: Any = None,
+        *,
+        rows: int = 4,
+        device: torch.device = CPU,
+        fail_stage: bool = False,
+    ) -> None:
+        super().__init__(registry or _PermissiveLease(), max_rows=rows, device=device)
+        self.log: list[str] = []
+        self._fail_stage = fail_stage
+
+    def reserve(self, plan: Any) -> Any:
+        ticket = super().reserve(plan)
+        self.log.append("reserve")
+        return _TrackedTicket(ticket, self.log)
+
+    def _stage(self, plan: Any, row_status: torch.Tensor) -> None:
+        if self._fail_stage:
+            raise RuntimeError("injected stage failure")
+        super()._stage(plan, row_status)
+
+    def collect(self) -> Any:
+        self.log.append("collect")
+        return super().collect()
+
+    def failed_request_ids(self) -> set[str]:
+        """Collect the staged step as ``postprocess_state`` does."""
+        reports, _records, lease_ok = self.collect()
+        return resolve_status_reports(self._registry, reports, lease_ok=lease_ok)[1]
+
+
+def _collected_step(
+    core: Any,
+    pools: Pools,
+    call: tg.TransactionCallBindings,
+    rows: Rows,
+    graph: Any,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], set[str]]:
+    """One step through the production sink and its collection.
+
+    Returns the projected rows and collected statuses, and the failed request
+    ids collection passes to ``state_slots.fail_requests``.
+    """
+    plan = rows[2]
+    sink = _TrackedSink(rows=len(plan.bindings), device=rows[1].device)
+    out = _advance(core, pools, call, rows, graph, sink).clone()
+    assert sink.log == ["reserve", "stage"]
+    failed = sink.failed_request_ids()
+    status = sink._status_host[: len(plan.bindings)].clone()
+    return (out.cpu(), status), failed
+
+
+def _leased(request_id: str, block: int) -> tuple[SessionRegistry, _TrackedSink, Rows]:
+    """A registry holding one fresh session's lease, its sink and CHUNK rows."""
+    registry = SessionRegistry()
+    [bound] = _bind(registry, [_row(request_id, block, chunk=True, prior=False)])
+    ids, embeds, _plan_rows = _rows([], [block])
+    plan = _plan(
+        prefills=[block],
+        num_pool_blocks=4,
+        generations=[bound.admission_generation],
+        request_ids=(request_id,),
+    )
+    return registry, _TrackedSink(registry), (ids, embeds, plan)
+
+
+def _chunk(
+    seed: int,
+    *,
+    seq: int,
+    geometry: int,
+    final: bool,
+    prompt: int,
+    samples: int | None = None,
+) -> torch.Tensor:
+    """One CHUNK envelope; ``samples`` defaults to the geometry's cadence."""
     torch.manual_seed(seed)
-    samples = FINAL_SAMPLES if geometry == GEOM_FINAL else REG_SAMPLES
+    if samples is None:
+        samples = FINAL_SAMPLES if geometry == GEOM_FINAL else REG_SAMPLES
     return _envelope(
         torch.randn(samples) * 0.01,
         final=final,
@@ -829,6 +1188,7 @@ def _drive(
                     geometry=sessions[name][1],
                     final=final,
                     prompt=sessions[name][2],
+                    samples=REG_SAMPLES // 2 if final else None,
                 )
                 for index, name in enumerate(names)
             ]
@@ -857,7 +1217,7 @@ def _drive(
     chunk(["a", "c"], 0, fresh=True, final=False)
     chunk(["c", "a"], 1, fresh=False, final=False)
     chunk(["a"], 2, fresh=False, final=False)
-    sessions["b"] = (1, GEOM_FINAL, 3)
+    sessions["b"] = (1, GEOM_REG, 3)
     policies["b"] = (1, 1, 0)
     chunk(["b"], 0, fresh=True, final=True)
     return records
@@ -898,7 +1258,7 @@ def _replay_parity(device: torch.device, runtime: GraphRuntime) -> None:
         "chunk-fresh:g0:b2",
         "chunk-continuing:g0:b2",
         "chunk-continuing:g0:b1",
-        "chunk-fresh:g2:b1",
+        "chunk-fresh:g0:b1",
         "replay:b1",
     ):
         assert counts[f"replays:{label}"] >= 1, label
@@ -995,20 +1355,26 @@ def _drive_population(
 
 
 def _population_parity(
-    device: torch.device, runtime: GraphRuntime, population: int, *, chunks: int
+    device: torch.device,
+    runtime: GraphRuntime,
+    population: int,
+    *,
+    chunks: int,
+    endpoint: bool = True,
 ) -> None:
     """Lockstep CHUNKs at ``population`` replay their cells bitwise exactly.
 
     Only ``population`` is declared, so every CHUNK must replay and only echo
     steps whose population shrank may fall back, as ``undeclared``.
+    ``endpoint`` selects the ``endpoint_enabled`` pool configuration.
     """
     core = _core(device)
-    call = _call_bindings(core)
-    eager_pools = _endpoint_pools(population + 1, device)
+    call = _call_bindings(core, endpoint=endpoint)
+    eager_pools = _endpoint_pools(population + 1, device, endpoint=endpoint)
     graph_pools = _clone_pools(eager_pools)
     binding = tg.TransactionGraphBinding(
         populations=[population],
-        geometries=(GEOM_REG, GEOM_FINAL),
+        geometries=(GEOM_REG,),
         maximum_population=population,
         vllm_config=object(),
         runtime=runtime,
@@ -1064,13 +1430,116 @@ _POPULATION_CHUNKS = [(1, 3), (31, 3), (63, 2)]
 # ---- CPU: arena, guard, classification and replay plumbing -----------------
 
 
+@contextmanager
+def _functional_encoder() -> Iterator[None]:
+    """Run the encoder-execution tests' functional transition in this scope."""
+    patch = pytest.MonkeyPatch()
+    patch.setattr(
+        encoder_tests.encoder_execution_module,
+        "execute_encoder_transition",
+        encoder_tests._functional_graph_transition,
+    )
+    try:
+        yield
+    finally:
+        patch.undo()
+
+
+def _nested_launchers(modes: list[Any]) -> dict[str, Callable[[], Any]]:
+    """Captured encoder, decode and CHUNK-bucket entry points, by binding.
+
+    Every launch through them appends its graph mode to ``modes``.
+    """
+    encoder = encoder_tests.build_encoder_execution(
+        encoder_tests._compiled_core(),
+        encoder_tests._dense_graphed_config("eager-graphed"),
+        maximum_population=1,
+        warmup_geometries=(0,),
+        vllm_config=object(),
+        graph_runtime=_recording(encoder_tests._graph_runtime(), modes),
+    )
+
+    def encode(population: int = 1) -> Any:
+        with _functional_encoder():
+            return encoder.transition(
+                *encoder_tests._graph_transition_args(population=population)
+            )
+
+    with _functional_encoder():
+        encoder.warmup_domain(
+            expected_cells=((0, 1),),
+            invoke=lambda _geometry, population: encode(population),
+        )
+    _, decode = _decode_calls()
+    dense = DenseGraphBinding(
+        decode_fn=decode,
+        predictor=object(),
+        joint=object(),
+        vllm_config=object(),
+        frame_widths=(2,),
+        tiers=(1,),
+        encoder_hidden=3,
+        predictor_layers=2,
+        predictor_hidden=5,
+        blank_id=7,
+        runtime=_recording(_decode_runtime(), modes),
+    )
+    dense.warmup(CPU, torch.float32)
+    decode_fn = dense.decode_fn(geometry=0, tier=1)
+    decode_state = rnnt.DecodeState(
+        h=torch.ones(2, 1, 5), c=torch.ones(2, 1, 5), last_label=torch.tensor([4])
+    )
+    core = _core()
+    env = _chunk(3, seq=0, geometry=1, final=False, prompt=0).unsqueeze(0)
+    session = _fresh_state(1)
+    bucket_args = dict(
+        geometry=1,
+        admitted_prompt=torch.zeros(1, dtype=torch.long),
+        incoming_status=torch.zeros(1, dtype=torch.int32),
+        queue_capacity=CAP,
+    )
+    bucket = capture_chunk_bucket(
+        core,
+        env,
+        session,
+        **bucket_args,
+        vllm_config=object(),
+        runtime=_recording(_rerun_runtime(), modes),
+        capture_decode_fn=rnnt.decode_dense_masked_frames,
+        decoder_tier=1,
+    )
+    return {
+        "encoder": encode,
+        "decode": lambda: decode_fn(
+            torch.ones(1, 2, 3), torch.tensor([2]), object(), object(), decode_state
+        ),
+        "chunk-bucket": lambda: bucket(
+            core,
+            env,
+            session,
+            **bucket_args,
+            decode_fn=rnnt.decode_dense_masked_frames,
+        ),
+    }
+
+
 @pytest.mark.cpu_test
+@torch.inference_mode()
 def test_nested_bindings_run_eagerly_only_inside_the_capture_scope() -> None:
     runtime = _rerun_runtime()
     assert nested_graph_mode(runtime) == "graph"
     with outer_transaction_capture():
         assert nested_graph_mode(runtime) == "none"
     assert nested_graph_mode(runtime) == "graph"
+
+    modes: list[Any] = []
+    for name, launch in _nested_launchers(modes).items():
+        modes.clear()
+        launch()
+        with outer_transaction_capture():
+            launch()
+        launch()
+        assert modes == ["graph", "none", "graph"], name
 
 
 @pytest.mark.cpu_test
@@ -1096,12 +1565,13 @@ def _fresh_chunk_inputs(
         3,
         2,
     )
+    device = pools["book_pool"].device
     embeds = torch.stack(
         [_chunk(3, seq=0, geometry=GEOM_REG, final=False, prompt=1)] * len(blocks)
-    )
+    ).to(device)
     return advance.prepare_transaction(
         core,
-        torch.full((len(blocks),), PLACEHOLDER_ID, dtype=torch.long),
+        torch.full((len(blocks),), PLACEHOLDER_ID, dtype=torch.long, device=device),
         embeds,
         plan,
         pools=_transaction_pools(pools),
@@ -1175,36 +1645,92 @@ def test_arena_rejects_vectors_outside_its_layout() -> None:
         tg.TransactionArena((("x", torch.float32, (1,)),), CPU)
 
 
+class _FenceEvent:
+    """A host event stub: logs its waits and records against ``log``.
+
+    A wait also logs the fenced host buffer's slot id as the rewrite sees it.
+    """
+
+    def __init__(self, index: int, arena: Any, log: list[Any]) -> None:
+        self._index = index
+        self._arena = arena
+        self._log = log
+
+    def synchronize(self) -> None:
+        held = int(self._arena._host_views[self._index]["composed_indices"][0])
+        self._log.append(("wait", self._index, held))
+
+    def record(self) -> None:
+        self._log.append(("record", self._index))
+
+
 @pytest.mark.cpu_test
 def test_arena_alternates_host_buffers_across_calls() -> None:
     core = _core()
     call = _call_bindings(core)
     pools = _endpoint_pools(4)
-    first = _fresh_chunk_inputs(core, pools, call, [1])
-    second = _fresh_chunk_inputs(core, pools, call, [3])
-    arena = tg.TransactionArena(tg._arena_layout(first), CPU)
-    arena.upload(first)
-    arena.upload(second)
-    assert int(arena._host_views[0]["composed_indices"][0]) == 1
+    calls = [_fresh_chunk_inputs(core, pools, call, [block]) for block in (1, 3, 2)]
+    arena = tg.TransactionArena(tg._arena_layout(calls[0]), CPU)
+    log: list[Any] = []
+    arena._events = [_FenceEvent(index, arena, log) for index in range(2)]
+    copy = arena._device.copy_
+
+    def upload(source: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        log.append(("copy", int(source.data_ptr() == arena._host[1].data_ptr())))
+        return copy(source, **kwargs)
+
+    arena._device.copy_ = upload
+    for inputs in calls:
+        arena.upload(inputs)
+        assert torch.equal(
+            arena.views["composed_indices"], inputs.vector("composed_indices")
+        )
+    assert log == [
+        ("wait", 0, 0),
+        ("copy", 0),
+        ("record", 0),
+        ("wait", 1, 0),
+        ("copy", 1),
+        ("record", 1),
+        ("wait", 0, 1),
+        ("copy", 0),
+        ("record", 0),
+    ]
+    assert int(arena._host_views[0]["composed_indices"][0]) == 2
     assert int(arena._host_views[1]["composed_indices"][0]) == 3
-    assert int(arena.views["composed_indices"][0]) == 3
+
+
+#: Classification cases over slots 2 and 4 of six; slots 1, 3 and 5 stay
+#: bound without a row in the step: ``(decodes, prefills, fresh, options)``.
+_CLASSIFIED = {
+    "chunk-fresh": ([], [2, 4], [True, True], {}),
+    "chunk-continuing": ([], [2, 4], [False, False], {}),
+    "replay": ([2, 4], [], [], {}),
+    "empty": ([], [], [], {}),
+    "fresh-non-chunk": ([], [2], [True], {"chunk": [False]}),
+    "multi-geometry": ([], [2, 4], [True, True], {"geometries": [0, GEOM_FINAL]}),
+    "mixed-roles": ([2], [4], [True], {}),
+    "mixed-fresh": ([], [2, 4], [True, False], {}),
+}
+
+_CELLS = {
+    "chunk-fresh": tg.TransactionCell(tg.CELL_FRESH_CHUNK, GEOM_REG, 2),
+    "chunk-continuing": tg.TransactionCell(tg.CELL_CONTINUING_CHUNK, GEOM_REG, 2),
+    "replay": tg.TransactionCell(tg.CELL_REPLAY, -1, 2),
+}
 
 
 @pytest.mark.cpu_test
-def test_classification_covers_declared_shapes_only() -> None:
+@pytest.mark.parametrize("case", list(_CLASSIFIED))
+def test_classification_covers_declared_shapes_only(case: str) -> None:
     core = _core()
     call = _call_bindings(core)
-    pools = _endpoint_pools(4)
-    cell, reason = tg.classify_transaction(
-        _fresh_chunk_inputs(core, pools, call, [1, 2])
-    )
-    assert cell == tg.TransactionCell(tg.CELL_FRESH_CHUNK, GEOM_REG, 2)
-    assert reason is None
-    mixed = replace(
-        _fresh_chunk_inputs(core, pools, call, [1, 2]),
-        fresh_positions=torch.tensor([0]),
-    )
-    assert tg.classify_transaction(mixed) == (None, "mixed-fresh")
+    pools = _endpoint_pools(6)
+    decodes, prefills, fresh, options = _CLASSIFIED[case]
+    rows = _rows(decodes, prefills, fresh, num_pool_blocks=6, **options)
+    assert rows[2].live_block_ids.tolist() == [1, 2, 3, 4, 5]
+    expected = (_CELLS[case], None) if case in _CELLS else (None, case)
+    assert tg.classify_transaction(_prepared(core, pools, call, rows)) == expected
 
 
 @pytest.mark.cpu_test
@@ -1223,7 +1749,11 @@ def test_population_lockstep_replays_every_chunk_on_cpu(
 def _corrupt_row_in_population(
     device: torch.device, runtime: GraphRuntime, population: int
 ) -> None:
-    """One out-of-sequence row in a continuing population is rejected alone."""
+    """One out-of-sequence row in a continuing population is rejected alone.
+
+    Collection reports the same failed request under replay as under eager,
+    and the rejection neither raises nor latches the binding.
+    """
     core = _core(device)
     call = _call_bindings(core)
     eager_pools = _endpoint_pools(population + 1, device)
@@ -1247,8 +1777,8 @@ def _corrupt_row_in_population(
     blocks = list(range(1, population + 1))
     bad = population // 2
 
-    def run(pools: Pools, graph: Any) -> list[Any]:
-        records = []
+    def run(pools: Pools, graph: Any) -> tuple[list[Any], list[set[str]]]:
+        records, failures = [], []
         for seq in range(2):
             rows = []
             for index in range(population):
@@ -1268,17 +1798,15 @@ def _corrupt_row_in_population(
                 has_initial=[seq > 0] * population,
             )
             before = _clone_pools(pools)
-            records.append(
-                _step(
-                    core,
-                    pools,
-                    call,
-                    [PLACEHOLDER_ID] * population,
-                    torch.stack(rows).to(device),
-                    plan,
-                    graph,
-                )
+            record, failed = _collected_step(
+                core,
+                pools,
+                call,
+                ([PLACEHOLDER_ID] * population, torch.stack(rows).to(device), plan),
+                graph,
             )
+            records.append(record)
+            failures.append(failed)
             if seq:
                 for key in pools:
                     values = (
@@ -1315,18 +1843,33 @@ def _corrupt_row_in_population(
                 )
                 for row, index in enumerate(active):
                     tokens[index] = int(out[0][row, 0])
-        return records
+        return records, failures
 
-    expected = run(eager_pools, None)
-    actual = run(graph_pools, binding)
+    expected, expected_failed = run(eager_pools, None)
+    actual, actual_failed = run(graph_pools, binding)
     _assert_records_equal(actual, expected)
     _assert_pools_equal(graph_pools, eager_pools)
+    assert actual_failed == expected_failed == [set(), {f"req-{bad}"}]
     status = expected[1][1]
     assert int(status[bad]) != 0
     assert not bool(status[torch.arange(population) != bad].any())
     counts = binding.counters()
     assert counts["fallbacks"] == 0
     assert counts[f"replays:chunk-continuing:g0:b{population}"] == 1
+    _collected_step(
+        core,
+        graph_pools,
+        call,
+        _rows(
+            [],
+            blocks,
+            [False] * population,
+            num_pool_blocks=population + 1,
+            device=device,
+        ),
+        binding,
+    )
+    assert binding.counters()["replays"] == counts["replays"] + 1, "latched"
 
 
 @pytest.mark.cpu_test
@@ -1345,17 +1888,72 @@ def test_capture_input_stores_no_page_and_publishes_every_cell() -> None:
     for tensor in (pools["book_pool"], pools["queue_pool"]):
         tensor.fill_(3)
     before = _clone_pools(pools)
-    binding = _binding(core, pools, call, _rerun_runtime(), populations=(1,))
+    launches: list[tuple[int, str]] = []
+    binding = _binding(
+        core, pools, call, _logging_runtime(launches), populations=(1, 2)
+    )
     _assert_pools_equal(pools, before)
     assert binding.ready
     assert [cell.label for cell in binding.cells] == [
         "chunk-continuing:g0:b1",
-        "chunk-continuing:g2:b1",
+        "chunk-continuing:g0:b2",
         "chunk-fresh:g0:b1",
-        "chunk-fresh:g2:b1",
+        "chunk-fresh:g0:b2",
         "replay:b1",
+        "replay:b2",
     ]
+    wrappers = sorted({index for index, _mode in launches})
+    assert len(wrappers) == len(binding.cells)
+    for wrapper in wrappers:
+        modes = [mode for index, mode in launches if index == wrapper]
+        assert modes == ["none"] * 3 + ["graph"] * 2, wrapper
     assert advance.consume_batch_stats() is None
+
+
+@pytest.mark.cpu_test
+def test_capture_self_check_mismatch_publishes_nothing() -> None:
+    core = _core()
+    call = _call_bindings(core)
+    pools = _endpoint_pools(4)
+    before = _clone_pools(pools)
+    runtime = _logging_runtime([], corrupt=lambda _index: True)
+    binding = tg.TransactionGraphBinding(
+        populations=[1, 2],
+        geometries=(GEOM_REG,),
+        maximum_population=4,
+        vllm_config=object(),
+        runtime=runtime,
+    )
+    with pytest.raises(RuntimeError) as raised:
+        _serve(binding, core, call, _transaction_pools(pools))
+    assert any(cell.label in str(raised.value) for cell in binding.cells)
+    assert not binding.ready
+    assert binding.counters()["captured_cells"] == 0
+    assert not any(entry["captured"] for entry in binding.receipt()["cells"])
+    _assert_pools_equal(pools, before)
+
+
+@pytest.mark.cpu_test
+def test_cells_share_no_arena_static_input_or_owned_output() -> None:
+    core = _core()
+    call = _call_bindings(core)
+    pools = _endpoint_pools(4)
+    binding = _binding(core, pools, call, _rerun_runtime())
+    storages: list[int] = []
+    for graph in binding._graphs.values():
+        for tensor in (
+            graph.arena._device,
+            *graph.arena._host,
+            graph.static_ids,
+            graph.static_embeds,
+            graph.rows_out,
+            graph.status_out,
+            graph.progress_out,
+        ):
+            assert tensor.numel() > 0
+            storages.append(tensor.untyped_storage().data_ptr())
+    assert len(binding._graphs) == len(binding.cells) > 1
+    assert len(set(storages)) == len(storages)
 
 
 @pytest.mark.cpu_test
@@ -1443,18 +2041,52 @@ def _first_step(
     )
 
 
+#: Uncovered calls on ``_binding``'s cells, every reachable reason:
+#: ``(decodes, prefills, fresh, options, key)``.
+_UNCOVERED = {
+    "mixed-fresh": (
+        [],
+        [1, 2],
+        [True, False],
+        {},
+        "fallbacks:uncovered:mixed-fresh",
+    ),
+    "mixed-roles": ([2], [1], [True], {}, "fallbacks:uncovered:mixed-roles"),
+    "multi-geometry": (
+        [],
+        [1, 2],
+        [True, True],
+        {"geometries": [GEOM_REG, GEOM_FINAL]},
+        "fallbacks:uncovered:multi-geometry",
+    ),
+    "fresh-non-chunk": (
+        [],
+        [1],
+        [True],
+        {"chunk": [False]},
+        "fallbacks:uncovered:fresh-non-chunk",
+    ),
+    "undeclared": (
+        [],
+        [1, 2, 3],
+        [True] * 3,
+        {},
+        "fallbacks:chunk-fresh:g0:b3:undeclared",
+    ),
+    "capture": ([], [1], [True], {}, "fallbacks:chunk-fresh:g0:b1:capture"),
+    "memory-profile": (
+        [],
+        [1],
+        [True],
+        {},
+        "fallbacks:chunk-fresh:g0:b1:memory-profile",
+    ),
+}
+
+
 @pytest.mark.cpu_test
-@pytest.mark.parametrize(
-    ("blocks", "fresh", "capture", "key"),
-    [
-        ([1, 2], [True, False], False, "fallbacks:uncovered:mixed-fresh"),
-        ([1, 2, 3], [True] * 3, False, "fallbacks:chunk-fresh:g0:b3:undeclared"),
-        ([1], [True], True, "fallbacks:chunk-fresh:g0:b1:capture"),
-    ],
-)
-def test_uncovered_calls_run_eager_and_are_counted(
-    blocks: list[int], fresh: list[bool], capture: bool, key: str
-) -> None:
+@pytest.mark.parametrize("case", list(_UNCOVERED))
+def test_uncovered_calls_run_eager_and_are_counted(case: str) -> None:
     core = _core()
     call = _call_bindings(core)
     graph_pools = _endpoint_pools(4)
@@ -1462,14 +2094,21 @@ def test_uncovered_calls_run_eager_and_are_counted(
     binding = _binding(core, graph_pools, call, _rerun_runtime())
     for pools in (graph_pools, eager_pools):
         pools["book_pool"][1:, _BOOK["last_label"]] = core.blank_id
-    kwargs = dict(core=core, call=call, blocks=blocks, fresh=fresh, capture=capture)
-    expected = _first_step(None, eager_pools, **kwargs)
-    actual = _first_step(binding, graph_pools, **kwargs)
+    decodes, prefills, fresh, options, key = _UNCOVERED[case]
+    ids, embeds, plan = _rows(decodes, prefills, fresh, **options)
+    flags = {"capture": case == "capture", "memory_profile": case == "memory-profile"}
+    before = binding.counters()
+    expected = _step(core, eager_pools, call, ids, embeds, plan, None, **flags)
+    actual = _step(core, graph_pools, call, ids, embeds, plan, binding, **flags)
     _assert_records_equal([actual], [expected])
     _assert_pools_equal(graph_pools, eager_pools)
     counts = binding.counters()
-    assert counts[key] == 1
-    assert counts["fallbacks"] == 1 and counts["replays"] == 0
+    assert counts[key] == before.get(key, 0) + 1
+    assert counts["fallbacks"] == before["fallbacks"] + 1
+    assert {k: v for k, v in counts.items() if k.startswith("replays")} == {
+        k: v for k, v in before.items() if k.startswith("replays")
+    }
+    assert not any(name.endswith((":uncaptured", ":native-burst")) for name in counts)
 
 
 @pytest.mark.cpu_test
@@ -1490,6 +2129,324 @@ def test_relocated_pools_fall_back_instead_of_replaying() -> None:
     assert binding.counters()["captured_cells"] == captured
 
 
+def _extend_arena_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give every later call one more staged vector than its cell's arena."""
+    staged = advance.TransactionInputs.staged_vectors
+
+    def extended(self: Any) -> tuple[tuple[str, torch.Tensor], ...]:
+        return (*staged(self), ("layout-probe", torch.zeros(1, dtype=torch.int64)))
+
+    monkeypatch.setattr(advance.TransactionInputs, "staged_vectors", extended)
+
+
+def _signature(base: SimpleNamespace, **changes: Any) -> tuple[Any, ...]:
+    """The signature of ``base``'s call with ``changes`` to its fields."""
+    call = {**vars(base), **changes}
+    return tg.transaction_signature(
+        call["core"],
+        call["inputs"],
+        call["ids"],
+        call["embeds"],
+        graph_covers_decode=False,
+    )
+
+
+def _with_bucket(inputs: Any, **changes: Any) -> Any:
+    return replace(inputs, buckets=tuple(replace(b, **changes) for b in inputs.buckets))
+
+
+def _with_book(inputs: Any, book: torch.Tensor) -> Any:
+    return replace(inputs, pools=replace(inputs.pools, book=book))
+
+
+def _prepared_call(core: Any, pools: Pools, call: Any, rows: Rows) -> dict[str, Any]:
+    ids, embeds, _plan_rows = rows
+    return {
+        "inputs": _prepared(core, pools, call, rows),
+        "ids": torch.tensor(ids, dtype=torch.long),
+        "embeds": embeds,
+    }
+
+
+def _resize_lazy_buffer(core: Any) -> dict[str, Any]:
+    pe = core.encoder.pos_enc.pe
+    core.encoder.pos_enc.pe = torch.zeros(
+        pe.shape[0], pe.shape[1] + 8, pe.shape[2], dtype=pe.dtype
+    )
+    return {}
+
+
+#: One structural input changed per case, as ``base -> field changes``.
+_STRUCTURAL: dict[str, Callable[[SimpleNamespace], dict[str, Any]]] = {
+    "population": lambda b: _prepared_call(b.core, b.pools, b.call, _rows([], [1])),
+    "placeholder-id": lambda b: {
+        "inputs": replace(b.inputs, placeholder_id=PLACEHOLDER_ID + 7)
+    },
+    "park-id": lambda b: {"inputs": replace(b.inputs, park_id=PARK_ID + 7)},
+    "eou-token-id": lambda b: {"inputs": replace(b.inputs, eou_token_id=EOU + 1)},
+    "endpoint-enabled": lambda b: {"inputs": replace(b.inputs, endpoint_enabled=False)},
+    "n-fresh": lambda b: _prepared_call(
+        b.core, b.pools, b.call, _rows([], [1, 2], [True, False])
+    ),
+    "decode-callable": lambda b: {
+        "inputs": _with_bucket(
+            b.inputs,
+            resolved=replace(
+                b.inputs.buckets[0].resolved, decode_fn=rnnt.decode_dense_masked
+            ),
+        )
+    },
+    "transition-callable": lambda b: {
+        "inputs": _with_bucket(b.inputs, transition=lambda *_a, **_k: None)
+    },
+    "pool-address": lambda b: {
+        "inputs": replace(b.inputs, pools=_transaction_pools(_clone_pools(b.pools)))
+    },
+    "pool-shape": lambda b: {"inputs": _with_book(b.inputs, b.pools["book_pool"][:-1])},
+    "pool-stride": lambda b: {
+        "inputs": _with_book(
+            b.inputs,
+            b.pools["book_pool"].as_strided(
+                b.pools["book_pool"].shape, (1, b.pools["book_pool"].shape[0])
+            ),
+        )
+    },
+    "encoder-buffer": lambda b: _resize_lazy_buffer(b.core),
+    "input-shape": lambda b: {"embeds": torch.zeros(2, CARRIER_HIDDEN + 1)},
+}
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("change", [*_STRUCTURAL, "arena-layout", "arena-data"])
+def test_signature_covers_every_structural_input(
+    monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    core = _core()
+    call = _call_bindings(core)
+    pools = _endpoint_pools(4)
+    base = SimpleNamespace(
+        core=core,
+        pools=pools,
+        call=call,
+        **_prepared_call(core, pools, call, _rows([], [1, 2])),
+    )
+    expected = _signature(base)
+    if change == "arena-data":
+        ids = [PLACEHOLDER_ID] * 2
+        plan = _plan(prefills=[3, 1], num_pool_blocks=4, prompts=[2, 1])
+        embeds = torch.stack(
+            [
+                _chunk(seed, seq=0, geometry=GEOM_REG, final=False, prompt=prompt)
+                for seed, prompt in ((41, 2), (43, 1))
+            ]
+        )
+        moved = _prepared_call(core, pools, call, (ids, embeds, plan))
+        assert _signature(base, **moved) == expected
+        return
+    if change == "arena-layout":
+        _extend_arena_layout(monkeypatch)
+        assert _signature(base) != expected
+        return
+    assert _signature(base, **_STRUCTURAL[change](base)) != expected
+
+
+@pytest.mark.cpu_test
+def test_arena_layout_mismatch_is_a_signature_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    core = _core()
+    call = _call_bindings(core)
+    graph_pools = _endpoint_pools(4)
+    binding = _binding(core, graph_pools, call, _rerun_runtime())
+    eager_pools = _clone_pools(graph_pools)
+    for pools in (graph_pools, eager_pools):
+        pools["book_pool"][1:, _BOOK["last_label"]] = core.blank_id
+    arenas = [
+        (buffer, buffer.clone())
+        for graph in binding._graphs.values()
+        for buffer in (graph.arena._device, *graph.arena._host)
+    ]
+    captured = binding.counters()["captured_cells"]
+    _extend_arena_layout(monkeypatch)
+    kwargs = dict(core=core, call=call, blocks=[1], fresh=[True])
+    expected = _first_step(None, eager_pools, **kwargs)
+    actual = _first_step(binding, graph_pools, **kwargs)
+    _assert_records_equal([actual], [expected])
+    _assert_pools_equal(graph_pools, eager_pools)
+    assert all(torch.equal(buffer, saved) for buffer, saved in arenas)
+    counts = binding.counters()
+    assert counts["fallbacks:chunk-fresh:g0:b1:signature"] == 1
+    assert counts["fallbacks"] == 1 and counts["replays"] == 0
+    assert counts["captured_cells"] == captured
+
+
+@pytest.mark.cpu_test
+def test_signature_callable_identities_are_stable_across_calls() -> None:
+    _, decode = _decode_calls()
+    dense = DenseGraphBinding(
+        decode_fn=decode,
+        predictor=object(),
+        joint=object(),
+        vllm_config=object(),
+        frame_widths=(2, 2),
+        tiers=(1, 2),
+        encoder_hidden=3,
+        predictor_layers=2,
+        predictor_hidden=5,
+        blank_id=7,
+        runtime=_decode_runtime(),
+    )
+    dense.warmup(CPU, torch.float32)
+    decode_fn = dense.decode_fn(geometry=1, tier=1)
+    assert all(dense.decode_fn(geometry=1, tier=1) is decode_fn for _ in range(3))
+
+    core = _core()
+
+    def sealed(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("signature checks never run the sealed cell")
+
+    encoder = SimpleNamespace(
+        ready=True,
+        transition=lambda *_args, **_kwargs: None,
+        _chunk_graph_entries={},
+        reserve_chunk_graph_cells=lambda _cells: None,
+    )
+    chunk = ExactChunkGraphBinding(core, object(), encoder, dense, [1])
+    encoder._chunk_graph_entries[execution_mode(core).graph_key("chunk", (1, 1))] = (
+        sealed
+    )
+
+    def resolve(fn: Any) -> Any:
+        return chunk.resolve(
+            geometry=1,
+            population=1,
+            decode_fn=fn,
+            encoder_transition=encoder.transition,
+            capture=False,
+        )
+
+    assert all(resolve(dense.decode_fn(geometry=1, tier=1)) is sealed for _ in range(3))
+    with pytest.raises(ValueError, match="sealed"):
+        resolve(lambda *_args: None)
+
+    def resolver(request: Any) -> Any:
+        tier = dense.execution_tier(request.execution_batch_size)
+        return advance.ResolvedDecode(
+            arm="dense-graphed",
+            decode_fn=dense.decode_fn(geometry=request.geometry, tier=tier),
+        )
+
+    call = replace(
+        _call_bindings(core),
+        decode_resolver=resolver,
+        encoder_transition=encoder.transition,
+        bucket_transition=chunk,
+        graph_covers_decode=True,
+    )
+    pools = _endpoint_pools(4)
+    signatures = []
+    for block in (1, 2):
+        ids, embeds, plan = _rows([], [block], geometries=[1])
+        inputs = _prepared(
+            core, pools, call, (ids, embeds, replace(plan, execution_tier=1))
+        )
+        assert inputs.buckets[0].transition is sealed
+        signatures.append(
+            tg.transaction_signature(
+                core,
+                inputs,
+                torch.tensor(ids, dtype=torch.long),
+                embeds,
+                graph_covers_decode=True,
+            )
+        )
+    assert signatures[0] == signatures[1]
+
+
+@contextmanager
+def _changed_process_constant(
+    name: str, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[None]:
+    """Change the process constant ``name`` for the scope."""
+    if name == "batch-invariant":
+        from vllm.model_executor.determinism import batch_invariant
+
+        mode = batch_invariant._batch_invariant_MODE
+        monkeypatch.setattr(batch_invariant, "_batch_invariant_MODE", not mode)
+        yield
+    elif name == "tf32":
+        # cuDNN's flag: the matmul flag is float32_matmul_precision's alias.
+        enabled = torch.backends.cudnn.allow_tf32
+        torch.backends.cudnn.allow_tf32 = not enabled
+        try:
+            yield
+        finally:
+            torch.backends.cudnn.allow_tf32 = enabled
+    elif name == "float32_matmul_precision":
+        precision = torch.get_float32_matmul_precision()
+        torch.set_float32_matmul_precision(
+            "medium" if precision != "medium" else "highest"
+        )
+        try:
+            yield
+        finally:
+            torch.set_float32_matmul_precision(precision)
+    else:
+        workspace = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+        monkeypatch.setenv(
+            "CUBLAS_WORKSPACE_CONFIG", ":16:8" if workspace != ":16:8" else ":4096:8"
+        )
+        yield
+
+
+#: Error-message pattern naming each process constant.
+_PROCESS_CONSTANTS = {
+    "batch-invariant": r"(?i)batch.invariant",
+    "tf32": r"(?i)tf32",
+    "float32_matmul_precision": r"float32_matmul_precision",
+    "CUBLAS_WORKSPACE_CONFIG": r"CUBLAS_WORKSPACE_CONFIG",
+}
+
+#: Calls on ``_binding``'s cells: the covered call and every fallback path,
+#: ``(decodes, prefills, fresh)``; ``signature`` runs over relocated pools.
+_PATHS = {
+    "replay": ([], [1], [True]),
+    "uncovered": ([], [1, 2], [True, False]),
+    "mixed-row": ([2], [1], [True]),
+    "undeclared": ([], [1, 2, 3], [True] * 3),
+    "signature": ([], [1], [True]),
+}
+
+
+def _path_pools(path: str, pools: Pools) -> Pools:
+    """The live pools a ``_PATHS`` call runs over."""
+    return _clone_pools(pools) if path == "signature" else pools
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("path", list(_PATHS))
+@pytest.mark.parametrize("constant", list(_PROCESS_CONSTANTS))
+def test_process_constant_change_is_fatal_on_every_path(
+    monkeypatch: pytest.MonkeyPatch, constant: str, path: str
+) -> None:
+    core = _core()
+    call = _call_bindings(core)
+    pools = _endpoint_pools(4)
+    binding = _binding(core, pools, call, _rerun_runtime())
+    live = _path_pools(path, pools)
+    before = _clone_pools(live)
+    counts = binding.counters()
+    sink = _CommitRecorder()
+    with (
+        _changed_process_constant(constant, monkeypatch),
+        pytest.raises(RuntimeError, match=_PROCESS_CONSTANTS[constant]),
+    ):
+        _advance(core, live, call, _rows(*_PATHS[path]), binding, sink)
+    assert sink.log == []
+    _assert_pools_equal(live, before)
+    assert binding.counters() == counts
+
+
 @pytest.mark.cpu_test
 def test_replay_reserves_before_any_page_write_and_stages_after() -> None:
     core = _core()
@@ -1506,85 +2463,338 @@ def test_replay_reserves_before_any_page_write_and_stages_after() -> None:
             return super().reserve(plan)
 
     sink = Sink()
-    advance.advance_model_rows(
-        core,
-        torch.tensor([PLACEHOLDER_ID]),
-        _chunk(5, seq=0, geometry=GEOM_REG, final=False, prompt=0).unsqueeze(0),
-        _plan(prefills=[1], num_pool_blocks=4),
-        adapter=call.adapter,
-        decode_resolver=call.decode_resolver,
-        placeholder_id=PLACEHOLDER_ID,
-        park_id=PARK_ID,
-        eou_token_id=EOU,
-        commit_sink=sink,
-        transaction_graph=binding,
-        **pools,
-    )
+    _advance(core, pools, call, _rows([], [1]), binding, sink)
     assert seen == ["reserve"] and sink.log == ["reserve", "stage"]
     assert int(sink.staged[0][0]) == 0
     assert int(pools["frontend_counter_pool"][1].abs().sum()) > 0
     assert binding.counters()["replays:chunk-fresh:g0:b1"] == 1
 
+    registry, leased, rows = _leased("right", 2)
+    _advance(core, pools, call, rows, binding, leased)
+    assert binding.counters()["replays:chunk-fresh:g0:b1"] == 2
+    registry.prune(())  # the request is aborted after its replay
+    reports, _records, _lease_ok = leased.collect()
+    assert [report.request_id for report in reports] == ["right"]
+    assert leased.log == ["reserve", "stage", "collect"]
+
+
+def _fail(message: str) -> Callable[..., Any]:
+    def fail(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError(message)
+
+    return fail
+
+
+def _assert_latched(
+    binding: tg.TransactionGraphBinding,
+    core: Any,
+    call: tg.TransactionCallBindings,
+    pools: Pools,
+    monkeypatch: pytest.MonkeyPatch,
+    paths: tuple[str, ...] = ("replay", "uncovered"),
+) -> None:
+    """Later covered and fallback calls fail at the latch, counting nothing."""
+    classified: list[Any] = []
+    classify = tg.classify_transaction
+
+    def tracked(inputs: Any) -> Any:
+        classified.append(inputs)
+        return classify(inputs)
+
+    monkeypatch.setattr(tg, "classify_transaction", tracked)
+    counts = binding.counters()
+    before = _clone_pools(pools)
+    for path in paths:
+        sink = _CommitRecorder()
+        with pytest.raises(RuntimeError, match="a fresh worker is required"):
+            _advance(core, pools, call, _rows(*_PATHS[path]), binding, sink)
+        assert sink.log == [], path
+    assert not classified
+    assert binding.counters() == counts
+    _assert_pools_equal(pools, before)
+
 
 @pytest.mark.cpu_test
-def test_replay_failure_cancels_the_reservation_once() -> None:
+def test_replay_failure_cancels_the_reservation_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     core = _core()
     call = _call_bindings(core)
     pools = _endpoint_pools(4)
     binding = _binding(core, pools, call, _rerun_runtime())
     graph = binding._graphs[tg.TransactionCell(tg.CELL_FRESH_CHUNK, GEOM_REG, 1)]
-
-    def fail() -> None:
-        raise RuntimeError("replay failed")
-
-    graph.replay = fail
+    graph.replay = _fail("replay failed")
     sink = _CommitRecorder()
     with pytest.raises(RuntimeError, match="replay failed"):
-        advance.advance_model_rows(
-            core,
-            torch.tensor([PLACEHOLDER_ID]),
-            _chunk(5, seq=0, geometry=GEOM_REG, final=False, prompt=0).unsqueeze(0),
-            _plan(prefills=[1], num_pool_blocks=4),
-            adapter=call.adapter,
-            decode_resolver=call.decode_resolver,
-            placeholder_id=PLACEHOLDER_ID,
-            park_id=PARK_ID,
-            eou_token_id=EOU,
-            commit_sink=sink,
-            transaction_graph=binding,
-            **pools,
-        )
+        _advance(core, pools, call, _rows([], [1]), binding, sink)
     assert sink.log == ["reserve", "cancel"]
     assert binding.counters()["replays"] == 0
+    _assert_latched(binding, core, call, pools, monkeypatch)
+
+
+@pytest.mark.cpu_test
+def test_stage_failure_after_done_latches_the_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    core = _core()
+    call = _call_bindings(core)
+    pools = _endpoint_pools(4)
+    binding = _binding(core, pools, call, _rerun_runtime())
+    sink = _TrackedSink(fail_stage=True)
+    with pytest.raises(RuntimeError, match="injected stage failure"):
+        _advance(core, pools, call, _rows([], [1]), binding, sink)
+    assert sink.log == ["reserve", "stage", "cancel"]
+    _assert_latched(binding, core, call, pools, monkeypatch)
+
+
+#: Worker-fatal sources; each latches the binding (Failure Containment).
+_FATAL_SOURCES = (
+    "replay",
+    "stage",
+    "process-constant",
+    "wrapper-entry",
+    "post-warmup",
+    "changed-reinitialization",
+)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("later", ["covered", "fallback"])
+@pytest.mark.parametrize("source", _FATAL_SOURCES)
+def test_every_fatal_source_latches_before_classification(
+    monkeypatch: pytest.MonkeyPatch, source: str, later: str
+) -> None:
+    platform = _entry_runtime([])
+    model, config = _model(monkeypatch, runtime=lambda: platform.runtime)
+    model.prepare_execution_memory()
+    state, slots = _model_state(model, config, num_blocks=4)
+    state.initialize_state_slots(slots)
+    binding = model._transaction_graph
+    assert binding.ready
+    pools = _pool_arguments(_resident(model, slots))
+    call = _model_call(model)
+    rows = _rows(*_PATHS["replay"])
+    if source == "replay":
+        cell = tg.TransactionCell(tg.CELL_FRESH_CHUNK, GEOM_REG, 1)
+        binding._graphs[cell].replay = _fail("injected replay failure")
+        with pytest.raises(RuntimeError, match="injected replay failure"):
+            _advance(model.core, pools, call, rows, binding, _CommitRecorder())
+    elif source == "stage":
+        with pytest.raises(RuntimeError, match="injected stage failure"):
+            _advance(
+                model.core, pools, call, rows, binding, _TrackedSink(fail_stage=True)
+            )
+    elif source == "process-constant":
+        with (
+            _changed_process_constant("CUBLAS_WORKSPACE_CONFIG", monkeypatch),
+            pytest.raises(RuntimeError, match="CUBLAS_WORKSPACE_CONFIG"),
+        ):
+            _advance(model.core, pools, call, rows, binding, _CommitRecorder())
+    elif source == "wrapper-entry":
+        platform.clear_all_graphs()
+        with pytest.raises(RuntimeError):
+            _advance(model.core, pools, call, rows, binding, _CommitRecorder())
+    elif source == "post-warmup":
+        verify = _seam(model, "verify_transaction_graphs")
+        _resize_positional_buffer(model)
+        with pytest.raises(RuntimeError, match="transaction_graph_populations"):
+            verify()
+    else:
+        _other, moved = _model_state(model, config, num_blocks=4)
+        with pytest.raises(RuntimeError):
+            state.initialize_state_slots(moved)
+    path = "replay" if later == "covered" else "uncovered"
+    _assert_latched(binding, model.core, call, pools, monkeypatch, (path,))
+    with pytest.raises(RuntimeError, match="a fresh worker is required"):
+        state.prepare_step(
+            SchedulerOutput.make_empty(), dummy_run=False, is_profile=False
+        )
+
+
+class _StagelessSink(_CommitRecorder):
+    """A sink whose reservation lacks ``stage()``; reserving must cancel it."""
+
+    def reserve(self, plan: Any) -> Any:
+        return SimpleNamespace(cancel=super().reserve(plan).cancel)
+
+
+#: Failure points before ``graph.replay()``, in Execute order.
+_PRE_BOUNDARY = (
+    "classification",
+    "signature",
+    "arena-upload",
+    "static-input-copy",
+    "escaped-output-allocation",
+    "commit-reservation",
+)
+
+
+def _inject_pre_boundary_fault(
+    fault: str, binding: tg.TransactionGraphBinding, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Make step ``fault`` of every later ``execute`` raise."""
+    message = f"injected {fault} failure"
+    if fault == "classification":
+        monkeypatch.setattr(tg, "classify_transaction", _fail(message))
+    elif fault == "signature":
+        monkeypatch.setattr(tg, "transaction_signature", _fail(message))
+    elif fault == "escaped-output-allocation":
+        _seam(tg, "allocate_escaped_rows")
+        monkeypatch.setattr(tg, "allocate_escaped_rows", _fail(message))
+    for graph in binding._graphs.values():
+        if fault == "arena-upload":
+            monkeypatch.setattr(graph.arena, "upload", _fail(message))
+        elif fault == "static-input-copy":
+            monkeypatch.setattr(graph.static_ids, "copy_", _fail(message))
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("fault", _PRE_BOUNDARY)
+def test_pre_boundary_failure_keeps_baseline_and_cancels_ticket_once(
+    monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    core = _core()
+    call = _call_bindings(core)
+    pools = _endpoint_pools(4)
+    binding = _binding(core, pools, call, _rerun_runtime())
+    rows = _rows(*_PATHS["replay"])
+    if fault == "commit-reservation":
+        sink: _CommitRecorder = _StagelessSink()
+        with pytest.raises(ValueError) as eager:
+            _advance(core, _clone_pools(pools), call, rows, None, _StagelessSink())
+        expected = (ValueError, str(eager.value))
+    else:
+        sink = _CommitRecorder()
+        expected = (RuntimeError, f"injected {fault} failure")
+    _inject_pre_boundary_fault(fault, binding, monkeypatch)
+    baseline = _clone_pools(pools)
+    counts = binding.counters()
+    with pytest.raises(expected[0]) as raised:
+        _advance(core, pools, call, rows, binding, sink)
+    assert str(raised.value) == expected[1]
+    _assert_pools_equal(pools, baseline)
+    assert sink.cancels == int(fault == "commit-reservation")
+    after = binding.counters()
+    for name in counts:
+        if name.startswith(("replays", "fallbacks")):
+            assert after[name] == counts[name], name
 
 
 @pytest.mark.cpu_test
 def test_stale_lease_fails_before_replay_writes_a_page() -> None:
-    from vllm.models.nemotron_asr.commit_sink import BoundedCommitSink
-    from vllm.models.nemotron_asr.plan import SessionRegistry
-
     core = _core()
     call = _call_bindings(core)
     pools = _endpoint_pools(4)
     binding = _binding(core, pools, call, _rerun_runtime())
     before = _clone_pools(pools)
     with pytest.raises(ValueError, match="not registered"):
-        advance.advance_model_rows(
+        _advance(
             core,
-            torch.tensor([PLACEHOLDER_ID]),
-            _chunk(5, seq=0, geometry=GEOM_REG, final=False, prompt=0).unsqueeze(0),
-            _plan(prefills=[1], num_pool_blocks=4),
-            adapter=call.adapter,
-            decode_resolver=call.decode_resolver,
-            placeholder_id=PLACEHOLDER_ID,
-            park_id=PARK_ID,
-            eou_token_id=EOU,
-            commit_sink=BoundedCommitSink(SessionRegistry(), max_rows=4),
-            transaction_graph=binding,
-            **pools,
+            pools,
+            call,
+            _rows([], [1]),
+            binding,
+            BoundedCommitSink(SessionRegistry(), max_rows=4),
         )
     _assert_pools_equal(pools, before)
     assert binding.counters()["replays"] == 0
+
+
+@pytest.mark.cpu_test
+def test_cleared_wrapper_entry_is_fatal_and_never_captures() -> None:
+    core = _core()
+    call = _call_bindings(core)
+    pools = _endpoint_pools(4)
+    captures: list[Any] = []
+    platform = _entry_runtime(captures)
+    binding = _binding(core, pools, call, platform.runtime)
+    started = len(captures)
+    assert started == len(binding.cells)
+    captured = binding.counters()["captured_cells"]
+    platform.clear_all_graphs()
+
+    moved, reference = _clone_pools(pools), _clone_pools(pools)
+    kwargs = dict(core=core, call=call, blocks=[1], fresh=[True])
+    actual = _first_step(binding, moved, **kwargs)
+    expected = _first_step(None, reference, **kwargs)
+    _assert_records_equal([actual], [expected])
+    assert binding.counters()["fallbacks:chunk-fresh:g0:b1:signature"] == 1
+
+    arenas = [
+        (buffer, buffer.clone())
+        for graph in binding._graphs.values()
+        for buffer in (graph.arena._device, *graph.arena._host)
+    ]
+    before = _clone_pools(pools)
+    sink = _CommitRecorder()
+    with pytest.raises(RuntimeError):
+        _advance(core, pools, call, _rows(*_PATHS["replay"]), binding, sink)
+    assert len(captures) == started
+    assert binding.counters()["captured_cells"] == captured
+    assert sink.log == []
+    _assert_pools_equal(pools, before)
+    assert all(torch.equal(buffer, saved) for buffer, saved in arenas)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("cause", ["abort", "replay-raised"])
+def test_abort_after_replay_does_not_roll_back_pages(cause: str) -> None:
+    core = _core()
+    call = _call_bindings(core)
+    pools = _endpoint_pools(4)
+    binding = _binding(core, pools, call, _rerun_runtime())
+    registry, sink, rows = _leased("left", 1)
+    written: list[Pools] = []
+    if cause == "replay-raised":
+        graph = binding._graphs[tg.TransactionCell(tg.CELL_FRESH_CHUNK, GEOM_REG, 1)]
+        replay = graph.replay
+
+        def fail() -> None:
+            replay()
+            written.append(_clone_pools(pools))
+            raise RuntimeError("injected failure after the replay")
+
+        graph.replay = fail
+        with pytest.raises(RuntimeError, match="after the replay"):
+            _advance(core, pools, call, rows, binding, sink)
+        assert sink.log == ["reserve", "cancel"]
+    else:
+        _advance(core, pools, call, rows, binding, sink)
+        written.append(_clone_pools(pools))
+        registry.prune(())  # the request is aborted after its replay
+        sink.collect()
+        assert sink.log == ["reserve", "stage", "collect"]
+    assert int(written[0]["frontend_counter_pool"][1].abs().sum()) > 0
+    _assert_pools_equal(pools, written[0])
+
+
+@pytest.mark.cpu_test
+def test_collection_failure_after_replay_publishes_no_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model, state, slots = _verified_model(monkeypatch, num_blocks=4)
+    binding = model._transaction_graph
+    replays = binding.counters()["replays"]
+    _chunk_forward(model, state, slots)
+    assert binding.counters()["replays"] == replays + 1
+    progress = model._registry._sessions["left"].progress_key
+    monkeypatch.setattr(
+        model._commit_sink, "collect", _fail("injected collection failure")
+    )
+    with pytest.raises(RuntimeError, match="injected collection failure"):
+        state.postprocess_state(torch.tensor([0]), torch.tensor([1]))
+    assert model.consume_committed_progress() == {}
+    assert model._registry._sessions["left"].progress_key == progress
+    # Collection runs outside ``execute``, so the binding is not latched.
+    _first_step(
+        binding,
+        _pool_arguments(_resident(model, slots)),
+        core=model.core,
+        call=_model_call(model),
+        blocks=[2],
+        fresh=[True],
+    )
+    assert binding.counters()["replays"] == replays + 2
 
 
 @pytest.mark.cpu_test
@@ -2571,11 +3781,18 @@ def test_cuda_graph_replay_matches_eager_across_varied_plans() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.usefixtures("exact_fp32")
 @torch.inference_mode()
+@pytest.mark.parametrize("endpoint", [True, False], ids=["endpoint", "no-endpoint"])
 @pytest.mark.parametrize(("population", "chunks"), _POPULATION_CHUNKS)
 def test_cuda_population_lockstep_replays_every_chunk(
-    population: int, chunks: int
+    population: int, chunks: int, endpoint: bool
 ) -> None:
-    _population_parity(torch.device("cuda"), _cuda_runtime(), population, chunks=chunks)
+    _population_parity(
+        torch.device("cuda"),
+        _cuda_runtime(),
+        population,
+        chunks=chunks,
+        endpoint=endpoint,
+    )
 
 
 @pytest.mark.nemotron_gpu
@@ -2595,21 +3812,30 @@ def test_cuda_one_corrupt_row_in_a_population_is_rejected_alone(
 @torch.inference_mode()
 @pytest.mark.parametrize("corruption", ["sequence", "echo", "book"])
 def test_cuda_graph_replay_rejects_corrupt_rows_like_eager(corruption: str) -> None:
-    device = torch.device("cuda")
+    _corrupt_rows_parity(torch.device("cuda"), _cuda_runtime(), corruption)
+
+
+def _corrupt_rows_parity(
+    device: torch.device, runtime: GraphRuntime, corruption: str
+) -> None:
+    """A corrupt row is rejected under replay exactly as under eager.
+
+    Collection reports the same failed request in both arms, and the step
+    neither raises nor latches the binding.
+    """
     core = _core(device)
     call = _call_bindings(core)
     eager_pools = _endpoint_pools(4, device)
     graph_pools = _clone_pools(eager_pools)
-    binding = _binding(core, graph_pools, call, _cuda_runtime(), device=device)
+    binding = _binding(core, graph_pools, call, runtime, device=device)
 
-    def run(pools: Pools, graph: Any) -> list[Any]:
+    def run(pools: Pools, graph: Any) -> tuple[list[Any], set[str]]:
         records = [
             _first_step(graph, pools, core=core, call=call, blocks=[2], fresh=[True])
         ]
         token = int(records[0][0][0, 0])
         if corruption == "sequence":
             embeds = _chunk(9, seq=5, geometry=GEOM_REG, final=False, prompt=0)
-            embeds = embeds.to(device)
             plan = _plan(prefills=[2], num_pool_blocks=4, has_initial=[True])
             ids, rows = [PLACEHOLDER_ID], embeds.unsqueeze(0).to(device)
         else:
@@ -2620,16 +3846,21 @@ def test_cuda_graph_replay_rejects_corrupt_rows_like_eager(corruption: str) -> N
             ids = [wrong if corruption == "echo" else token]
             rows = torch.zeros(1, CARRIER_HIDDEN, device=device)
         before = _clone_pools(pools)
-        records.append(_step(core, pools, call, ids, rows, plan, graph))
+        record, failed = _collected_step(core, pools, call, (ids, rows, plan), graph)
+        records.append(record)
         _assert_pools_equal(pools, before)
-        return records
+        return records, failed
 
-    expected = run(eager_pools, None)
-    actual = run(graph_pools, binding)
+    expected, expected_failed = run(eager_pools, None)
+    actual, actual_failed = run(graph_pools, binding)
     _assert_records_equal(actual, expected)
     assert int(expected[1][1][0]) != 0
+    assert actual_failed == expected_failed == {"req-0"}
     _assert_pools_equal(graph_pools, eager_pools)
-    assert binding.counters()["fallbacks"] == 0
+    counts = binding.counters()
+    assert counts["fallbacks"] == 0
+    _first_step(binding, graph_pools, core=core, call=call, blocks=[3], fresh=[True])
+    assert binding.counters()["replays"] == counts["replays"] + 1, "latched"
 
 
 @pytest.mark.nemotron_gpu
@@ -2856,3 +4087,420 @@ def test_cuda_replay_freezes_nested_counters_and_counts_once(
     assert after["fallbacks"] == before["fallbacks"]
     _first_step(None, pools, core=model.core, call=call, blocks=[2], fresh=[True])
     assert execution._invocations == invocations + 1
+
+
+@pytest.mark.nemotron_gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.inference_mode()
+def test_cuda_arena_reuses_pinned_buffers_after_async_upload() -> None:
+    device = torch.device("cuda")
+    core = _core(device)
+    call = _call_bindings(core)
+    pools = _endpoint_pools(4, device)
+    calls = [_fresh_chunk_inputs(core, pools, call, [block]) for block in (1, 3, 2, 1)]
+    arena = tg.TransactionArena(tg._arena_layout(calls[0]), device)
+    assert all(buffer.is_pinned() for buffer in arena._host)
+    uploaded = []
+    for inputs in calls:
+        arena.upload(inputs)
+        uploaded.append({name: view.clone() for name, view in arena.views.items()})
+    torch.cuda.synchronize()
+    for inputs, views in zip(calls, uploaded, strict=True):
+        for name, vector in inputs.staged_vectors():
+            assert torch.equal(views[name].cpu(), vector.cpu()), name
+
+
+def _control_trajectory(
+    core: Any, pools: Pools, call: tg.TransactionCallBindings, graph: Any
+) -> tuple[list[Any], dict[str, int]]:
+    """One session through every accepted control row kind on slot 1.
+
+    A fresh CHUNK drains to its park, then a park-echo and a forced-endpoint
+    row; a final CHUNK drains to its park, then a FLUSH. Returns the records
+    and each control row's record index. A rejected control row must leave
+    every page unchanged.
+    """
+    device = pools["book_pool"].device
+    records: list[Any] = []
+    controls: dict[str, int] = {}
+
+    def step(ids: list[int], embeds: torch.Tensor, plan: Any) -> int:
+        records.append(_step(core, pools, call, ids, embeds, plan, graph))
+        return int(records[-1][0][0, 0])
+
+    def echo(token: int) -> None:
+        for _ in range(CAP + 2):
+            if token == PARK_ID:
+                return
+            token = step(
+                [token],
+                torch.zeros(1, CARRIER_HIDDEN, device=device),
+                _plan(decodes=[1], num_pool_blocks=4),
+            )
+        raise AssertionError("replay queue did not drain")
+
+    def chunk(seq: int, *, final: bool) -> None:
+        embeds = _chunk(
+            23 + seq,
+            seq=seq,
+            geometry=GEOM_REG,
+            final=final,
+            prompt=0,
+            samples=REG_SAMPLES // 2 if final else None,
+        )
+        plan = _plan(prefills=[1], num_pool_blocks=4, has_initial=[seq > 0])
+        echo(step([PLACEHOLDER_ID], embeds.unsqueeze(0).to(device), plan))
+
+    def control(name: str, token: int) -> int:
+        controls[name] = len(records)
+        before = _clone_pools(pools)
+        emitted = step(
+            [token],
+            torch.zeros(1, CARRIER_HIDDEN, device=device),
+            _plan(decodes=[1], num_pool_blocks=4),
+        )
+        if int(records[-1][1][0]):
+            _assert_pools_equal(pools, before)
+        return emitted
+
+    chunk(0, final=False)
+    echo(control("park-echo", PARK_ID))
+    echo(control("forced-endpoint", EOU))
+    chunk(1, final=True)
+    control("flush", PARK_ID)
+    return records, controls
+
+
+def _control_parity(
+    device: torch.device, runtime: GraphRuntime, endpoint: bool
+) -> None:
+    """Accepted control rows replay the ``replay`` cell bitwise exactly."""
+    core = _core(device)
+    call = _call_bindings(core, endpoint=endpoint)
+    eager_pools = _endpoint_pools(4, device, endpoint=endpoint)
+    graph_pools = _clone_pools(eager_pools)
+    binding = _binding(
+        core, graph_pools, call, runtime, populations=(1,), device=device
+    )
+    expected, controls = _control_trajectory(core, eager_pools, call, None)
+    actual, _ = _control_trajectory(core, graph_pools, call, binding)
+    _assert_records_equal(actual, expected)
+    _assert_pools_equal(graph_pools, eager_pools)
+    statuses = {name: int(expected[index][1][0]) for name, index in controls.items()}
+    assert statuses["park-echo"] == 0 and statuses["flush"] == 0
+    assert (statuses["forced-endpoint"] == 0) is endpoint
+    counts = binding.counters()
+    assert counts["fallbacks"] == 0
+    assert counts["replays"] == len(expected)
+    assert counts["replays:replay:b1"] >= len(controls)
+
+
+@pytest.mark.nemotron_gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("exact_fp32")
+@torch.inference_mode()
+@pytest.mark.parametrize("endpoint", [True, False], ids=["endpoint", "no-endpoint"])
+def test_cuda_replay_cell_accepted_control_rows_match_eager(endpoint: bool) -> None:
+    _control_parity(torch.device("cuda"), _cuda_runtime(), endpoint)
+
+
+def _traced(stream_log: list[tuple[str, int]], name: str, fn: Any) -> Any:
+    def traced(*args: Any, **kwargs: Any) -> Any:
+        stream_log.append((name, torch.cuda.current_stream().cuda_stream))
+        return fn(*args, **kwargs)
+
+    return traced
+
+
+@pytest.mark.nemotron_gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("exact_fp32")
+@torch.inference_mode()
+def test_cuda_replay_runs_on_the_current_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = torch.device("cuda")
+    core = _core(device)
+    call = _call_bindings(core)
+    eager_pools = _endpoint_pools(4, device)
+    graph_pools = _clone_pools(eager_pools)
+    binding = _binding(core, graph_pools, call, _cuda_runtime(), device=device)
+    kwargs = dict(core=core, call=call, blocks=[1], fresh=[True])
+    expected = _first_step(None, eager_pools, **kwargs)
+    torch.cuda.synchronize()
+    streams: list[tuple[str, int]] = []
+    replay = torch.cuda.CUDAGraph.replay
+    monkeypatch.setattr(
+        torch.cuda.CUDAGraph, "replay", _traced(streams, "replay", replay)
+    )
+    for graph in binding._graphs.values():
+        monkeypatch.setattr(
+            graph.arena, "upload", _traced(streams, "upload", graph.arena.upload)
+        )
+        for name in ("static_ids", "static_embeds"):
+            tensor = getattr(graph, name)
+            monkeypatch.setattr(tensor, "copy_", _traced(streams, name, tensor.copy_))
+    side = torch.cuda.Stream(device)
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        actual = _first_step(binding, graph_pools, **kwargs)
+    side.synchronize()
+    _assert_records_equal([actual], [expected])
+    _assert_pools_equal(graph_pools, eager_pools)
+    assert {name for name, _stream in streams} == {
+        "replay",
+        "upload",
+        "static_ids",
+        "static_embeds",
+    }
+    assert all(stream == side.cuda_stream for _name, stream in streams), streams
+    assert binding.counters()["replays:chunk-fresh:g0:b1"] == 1
+
+
+def _segment_pool(tensor: torch.Tensor) -> tuple[int, int]:
+    """The allocator pool id of the segment holding ``tensor``."""
+    address = tensor.untyped_storage().data_ptr()
+    for segment in torch.cuda.memory._snapshot()["segments"]:
+        if segment["address"] <= address < segment["address"] + segment["total_size"]:
+            return tuple(segment["segment_pool_id"])
+    raise AssertionError("tensor storage lies in no allocator segment")
+
+
+@pytest.mark.nemotron_gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("exact_fp32")
+@torch.inference_mode()
+def test_cuda_owned_outputs_are_allocated_outside_the_graph_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = torch.device("cuda")
+    core = _core(device)
+    call = _call_bindings(core)
+    pools = _endpoint_pools(4, device)
+    captures = _track_graph_captures(monkeypatch, {"value": "serving"})
+    binding = _binding(core, pools, call, _cuda_runtime(), device=device)
+    graph_pools = {pool for _phase, _stream, pool in captures}
+    assert graph_pools and None not in graph_pools
+    escaped = _advance(
+        core, pools, call, _rows([], [1], device=device), binding, _CommitRecorder()
+    )
+    for graph in binding._graphs.values():
+        for name in ("rows_out", "status_out", "progress_out"):
+            assert _segment_pool(getattr(graph, name)) not in graph_pools, name
+    assert _segment_pool(escaped) not in graph_pools
+
+
+def _drive_interleaved(
+    core: Any,
+    pools: Pools,
+    call: tg.TransactionCallBindings,
+    graph: Any,
+    tier: Callable[[int], int],
+) -> list[Any]:
+    """CHUNK steps that alternate replayed cells with eager fallbacks.
+
+    Populations ``1`` and ``2`` are declared; a mixed-fresh step and a
+    three-row step fall back. Every CHUNK step drains its echoes before the
+    next, through the same arm.
+    """
+    device = pools["book_pool"].device
+    sequence: dict[int, int] = {}
+    records: list[Any] = []
+    steps = ([1, 2], [3, 1], [2, 3], [1, 2, 3], [4])
+    for index, blocks in enumerate(steps):
+        seqs = [sequence.get(block, -1) + 1 for block in blocks]
+        sequence.update(zip(blocks, seqs, strict=True))
+        embeds = torch.stack(
+            [
+                _chunk(
+                    31 * index + block,
+                    seq=seq,
+                    geometry=GEOM_REG,
+                    final=False,
+                    prompt=block % 4,
+                )
+                for block, seq in zip(blocks, seqs, strict=True)
+            ]
+        ).to(device)
+        plan = _plan(
+            prefills=blocks,
+            num_pool_blocks=5,
+            has_initial=[seq > 0 for seq in seqs],
+            prompts=[block % 4 for block in blocks],
+            execution_tier=tier(len(blocks)),
+        )
+        records.append(
+            _step(
+                core, pools, call, [PLACEHOLDER_ID] * len(blocks), embeds, plan, graph
+            )
+        )
+        tokens = dict(zip(blocks, records[-1][0][:, 0].long().tolist(), strict=True))
+        for _ in range(CAP + 2):
+            active = [block for block in blocks if tokens[block] != PARK_ID]
+            if not active:
+                break
+            plan = _plan(
+                decodes=active,
+                num_pool_blocks=5,
+                prompts=[block % 4 for block in active],
+                execution_tier=tier(len(active)),
+            )
+            records.append(
+                _step(
+                    core,
+                    pools,
+                    call,
+                    [tokens[block] for block in active],
+                    torch.zeros(len(active), CARRIER_HIDDEN, device=device),
+                    plan,
+                    graph,
+                )
+            )
+            for row, block in enumerate(active):
+                tokens[block] = int(records[-1][0][row, 0])
+        else:
+            raise AssertionError("replay queue did not drain")
+    return records
+
+
+def _interleaved_parity(model: Any, slots: StateSlotBindings) -> None:
+    """Fallbacks through the nested bindings interleave with exact replays."""
+    binding = model._transaction_graph
+    assert binding.ready
+    call = _model_call(model)
+    graph_pools = _pool_arguments(_resident(model, slots))
+    eager_pools = _clone_pools(graph_pools)
+    decoder = model._decode_graph_binding
+
+    def tier(rows: int) -> int:
+        return 0 if decoder is None else decoder.execution_tier(rows)
+
+    expected = _drive_interleaved(model.core, eager_pools, call, None, tier)
+    actual = _drive_interleaved(model.core, graph_pools, call, binding, tier)
+    _assert_records_equal(actual, expected)
+    _assert_pools_equal(graph_pools, eager_pools)
+    assert all(not bool(status.any()) for _rows, status, _progress in expected)
+    counts = binding.counters()
+    assert counts["fallbacks:uncovered:mixed-fresh"] == 1
+    assert counts["fallbacks:chunk-continuing:g0:b3:undeclared"] == 1
+    assert counts["replays:chunk-fresh:g0:b2"] == 1
+    assert counts["replays:chunk-continuing:g0:b2"] == 1
+    assert counts["replays:chunk-fresh:g0:b1"] == 1
+    assert counts["replays"] + counts["fallbacks"] == len(expected)
+
+
+@pytest.mark.nemotron_gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("exact_fp32")
+@torch.inference_mode()
+def test_cuda_interleaved_fallbacks_and_replays_match_eager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.models.nemotron_asr import decode_graph, encoder_execution
+
+    device = torch.device("cuda")
+    monkeypatch.setattr(encoder_execution, "platform_graph_runtime", _cuda_runtime)
+    monkeypatch.setattr(decode_graph, "platform_graph_runtime", _cuda_runtime)
+    model, config = _model(
+        monkeypatch,
+        runtime=_cuda_runtime,
+        device=device,
+        engine={"max_num_seqs": 4},
+        encoder_execution_arm="eager-graphed",
+        decode_dispatch_arm="dense-graphed",
+    )
+    model.prepare_execution_memory()
+    state, slots = _model_state(model, config, num_blocks=5)
+    state.initialize_state_slots(slots)
+    _interleaved_parity(model, slots)
+
+
+@pytest.mark.nemotron_gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("exact_fp32")
+@torch.inference_mode()
+def test_cuda_replay_allocates_nothing_after_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = torch.device("cuda")
+    core = _core(device)
+    call = _call_bindings(core)
+    pools = _endpoint_pools(4, device)
+    binding = _binding(core, pools, call, _cuda_runtime(), device=device)
+    allocated: list[int] = []
+    replay = torch.cuda.CUDAGraph.replay
+
+    def counted(self: Any) -> Any:
+        allocated.append(torch.cuda.memory_stats(device)["allocation.all.allocated"])
+        return replay(self)
+
+    monkeypatch.setattr(torch.cuda.CUDAGraph, "replay", counted)
+    torch.cuda.synchronize()
+    escaped = _advance(
+        core,
+        pools,
+        call,
+        _rows([], [1], device=device),
+        binding,
+        _TrackedSink(rows=1, device=device),
+    )
+    returned = torch.cuda.memory_stats(device)["allocation.all.allocated"]
+    assert len(allocated) == 1 and returned == allocated[0]
+    assert escaped.shape == (1, CARRIER_HIDDEN) and escaped.dtype == torch.float32
+    owned = {
+        tensor.untyped_storage().data_ptr()
+        for graph in binding._graphs.values()
+        for tensor in (
+            graph.arena._device,
+            graph.static_ids,
+            graph.static_embeds,
+            graph.rows_out,
+            graph.status_out,
+            graph.progress_out,
+        )
+    }
+    assert escaped.untyped_storage().data_ptr() not in owned
+    kept = escaped.clone()
+    _advance(
+        core,
+        pools,
+        call,
+        _rows([], [2], device=device),
+        binding,
+        _TrackedSink(rows=1, device=device),
+    )
+    torch.cuda.synchronize()
+    assert len(allocated) == 2
+    assert torch.equal(escaped, kept)
+
+
+@pytest.mark.nemotron_gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("exact_fp32")
+@torch.inference_mode()
+def test_cuda_status_and_progress_survive_another_cells_replay() -> None:
+    device = torch.device("cuda")
+    core = _core(device)
+    call = _call_bindings(core)
+    eager_pools = _endpoint_pools(4, device)
+    graph_pools = _clone_pools(eager_pools)
+    binding = _binding(core, graph_pools, call, _cuda_runtime(), device=device)
+    for pools in (eager_pools, graph_pools):
+        pools["book_pool"][1:, _BOOK["last_label"]] = core.blank_id
+    first, second = (
+        dict(blocks=[1], fresh=[True]),
+        dict(blocks=[2, 3], fresh=[True] * 2),
+    )
+    expected = _first_step(None, eager_pools, core=core, call=call, **first)
+    _first_step(None, eager_pools, core=core, call=call, **second)
+    _first_step(binding, graph_pools, core=core, call=call, **first)
+    _first_step(binding, graph_pools, core=core, call=call, **second)
+    torch.cuda.synchronize()
+    cell = binding._graphs[tg.TransactionCell(tg.CELL_FRESH_CHUNK, GEOM_REG, 1)]
+    torch.testing.assert_close(cell.status_out.cpu(), expected[1].cpu(), atol=0, rtol=0)
+    torch.testing.assert_close(
+        cell.progress_out.cpu(), expected[2].cpu(), atol=0, rtol=0
+    )
+    counts = binding.counters()
+    assert counts["replays:chunk-fresh:g0:b1"] == 1
+    assert counts["replays:chunk-fresh:g0:b2"] == 1
