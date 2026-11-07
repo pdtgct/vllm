@@ -590,9 +590,6 @@ class NemotronASRForRNNT(nn.Module):
                 chunk_populations,
             )
         self._transaction_graph = None
-        # The resident storage serving capture ran over; post-warmup
-        # verification re-projects the live pools from it.
-        self._transaction_storage: Any = None
         if transaction_populations:
             from vllm.models.nemotron_asr.transaction_graph import (
                 TransactionGraphBinding,
@@ -1027,7 +1024,6 @@ class NemotronASRForRNNT(nn.Module):
         except Exception:
             binding.discard()
             raise
-        self._transaction_storage = storage
 
     def _project_transaction_pools(self, storage: Any) -> TransactionPools:
         from vllm.models.nemotron_asr.state_profile import (
@@ -1046,20 +1042,22 @@ class NemotronASRForRNNT(nn.Module):
             if binding is not None
         )
 
-    def verify_transaction_graphs(self) -> None:
+    def verify_transaction_graphs(self, storage: Any) -> None:
         """Verify every published transaction cell after the worker warmups.
 
-        Every cell is checked against the live resident pools, call bindings
-        and nested bindings. Until a core post-warmup hook exists, the model
-        state runs this once on the first non-dummy step. A mismatch is
-        worker-fatal.
+        ``storage`` is the live aggregate state group (``spec`` and component
+        ``views``) the model state reads from its current slots, or ``None``
+        when none are bound. Every cell is checked against the resident pools
+        projected from it, the live call bindings and the nested bindings;
+        nothing built from ``storage`` is kept. Until a core post-warmup hook
+        exists, the model state runs this once on the first non-dummy step. A
+        mismatch is worker-fatal.
         """
         binding = getattr(self, "_transaction_graph", None)
         if binding is None:
             return
         from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
-        storage = self._transaction_storage
         binding.verify_after_warmup(
             self.core,
             resident_pools=(

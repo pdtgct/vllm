@@ -92,6 +92,15 @@ class StateBatch:
         return _ResidentCommitSink(sink, self.access)
 
 
+def _resident_storage(bindings: StateSlotBindings, layer: str) -> SimpleNamespace:
+    """The aggregate state group's ``spec`` and current component ``views``.
+
+    Read from the live bindings each time it is needed; no caller keeps it.
+    """
+    views = bindings.views[layer]
+    return SimpleNamespace(spec=views.spec, views=views._views)
+
+
 class NemotronASRModelState(ModelState):
     """Model-local projection with no slot allocation or retirement authority."""
 
@@ -118,8 +127,7 @@ class NemotronASRModelState(ModelState):
             capture is not None
             and getattr(self.model, "_transaction_graph", None) is not None
         ):
-            (views,) = bindings.views.values()
-            capture(SimpleNamespace(spec=views.spec, views=views._views))
+            capture(_resident_storage(bindings, layer))
         # All resident writes run on the runner stream. Inner graphs also replay
         # there; no auxiliary state-writing stream is created by this consumer.
 
@@ -138,13 +146,18 @@ class NemotronASRModelState(ModelState):
         if dummy_run:
             return
         # The first real step stands in for a post-warmup hook: it verifies the
-        # transaction graphs once, and every real step honours their latch,
-        # before any registry, slot or request state changes.
+        # transaction graphs once over the live resident layout, and every real
+        # step honours their latch, before any registry, slot or request state
+        # changes.
         transaction_graph = getattr(self.model, "_transaction_graph", None)
         if transaction_graph is not None:
             transaction_graph.check_latch()
             if not self._transaction_graphs_verified:
-                self.model.verify_transaction_graphs()
+                slots = self.state_slots
+                layer = self.model._persistent_state_layer.prefix
+                self.model.verify_transaction_graphs(
+                    None if slots is None else _resident_storage(slots, layer)
+                )
                 self._transaction_graphs_verified = True
         cached = scheduler_output.scheduled_cached_reqs
         if len(cached.req_ids) != len(cached.new_token_ids):

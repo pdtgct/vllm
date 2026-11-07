@@ -336,7 +336,7 @@ reload after execution materialization (`nemotron_asr.py:552-556`).
 ### Invariants
 
 - Arena upload, static-input copies, replay and every resident write run on
-  the runner stream (`model_state_v2.py:122`). Replays are serialized.
+  the runner stream (`model_state_v2.py:131-132`). Replays are serialized.
 - No slot is freed or reassigned between the commit reservation and the
   commit-sink collection in `postprocess_state`. Collection precedes the next
   replay because persistent state requires synchronous scheduling
@@ -381,7 +381,7 @@ reload after execution materialization (`nemotron_asr.py:552-556`).
 - Resident pools exist only inside `initialize_kv_cache`. The KV allocation
   precedes `initialize_state_slots`, and the capture hook runs from
   `initialize_state_slots` after the pools are allocated (on this branch
-  `model_runner.py:830`, `:854`; `model_state_v2.py:110-121`).
+  `model_runner.py:830`, `:854`; `model_state_v2.py:120-130`).
 
 Graphs bake in resident pool addresses, and those addresses do not exist until
 capacity is fixed. The inventory that serves therefore cannot be the inventory
@@ -430,7 +430,9 @@ makes the binding ready.
    expected outputs, capture and verify callbacks, capture inputs) while the
    admission holder retains the stand-in storage explicitly; read `Na`, then
    the allocator's allocated bytes on the device; release the stand-in
-   storage; read `N1`, then the allocated bytes again. Release is verified
+   storage; read `N1`, then the allocated bytes again. `Na` is the settled
+   point at which the allocated-bytes reading for the release check is taken;
+   no admitted figure uses `Na`'s free memory. Release is verified
    when the allocated bytes drop by at least the stand-in bytes between the
    two allocated-bytes readings and no owning reference to the stand-in
    storage remains (checked separately through a weak reference), else
@@ -529,7 +531,7 @@ core `ModelState` post-warmup hook called at the end of
 `_compile_or_warm_up_model`, where a mismatch is a startup failure (Core
 Obligations). Until it exists, the model runs the same
 verification once on the first non-dummy `prepare_step`, before its registry
-pruning (`model_state_v2.py:155-158`) and therefore before
+pruning (`model_state_v2.py:181`) and therefore before
 `state_slots.begin_step` (`model_runner.py:1837`, `:1845`), request activation
 or any transaction; a mismatch there is worker-fatal. This interim is a safety
 gate, not startup qualification: the engine may report ready before the first
@@ -676,9 +678,11 @@ independent of the out-of-tree model.
    before `initialize_state_slots` reports the same attribution. TXG-MEM-012.
 6. **Startup pool access.** An authorized way for a model to reach the
    unowned resident pools for serving capture and the rejected-row reference,
-   valid only during `initialize_state_slots` and committing no page. Today
-   capture reads the private `views._views` (`model_state_v2.py:121`;
-   divergence 13). TXG-LIFE-008.
+   valid only during `initialize_state_slots` and committing no page, plus
+   read-only resident pool layout (address, shape and stride per pool) at
+   post-warmup verification. Today both capture and verification read the
+   private `views._views` through one helper (`model_state_v2.py:95-101`;
+   divergence 3). TXG-LIFE-008.
 
 ## Default-On Gate (future intent)
 
@@ -699,65 +703,27 @@ extension.
 
 ## Current Implementation Divergences
 
-Each item gives the current behavior on this branch, then the target.
+Each item gives the current behavior on this branch, then the target. Every
+remaining item waits on a core obligation.
 
-1. **Geometry at configuration.** `nemotron_asr.py:503-526` accepts any served
-   geometry set, and `transaction_graph.py:365-370` builds cells for every
-   served geometry. Target: g0 only.
-2. **Geometry at admission.** `_stage_plan` passes `len(CADENCES)`
-   (`nemotron_asr.py:709`), and `plan.py:425` checks only that range. Target:
-   the configured set.
-3. **Outer graph mode.** Only FULL is rejected (`plan.py:230-249`); PIECEWISE
-   is accepted. Under PIECEWISE the runner's estimator bootstraps minimal
-   state slots, which calls `initialize_state_slots`, and so the capture hook
-   runs over throwaway pools (`cudagraph_utils.py:1057-1077`), whose graphs
-   `clear_all_graphs` later empties. Target: `cudagraph_mode == NONE`, plus the
-   wrapper-entry check.
-4. **No admission.** `prepare_execution_memory` performs no transaction-graph
-   admission. Capture runs only after capacity is fixed
-   (`model_state_v2.py:115-121`). Target: the full ordering above, with
-   normalized `A`/`S` and the `S <= A` check.
-5. **Capture references retained.** `_TransactionGraph` keeps its
-   `capture_graph` and `verify` closures (`transaction_graph.py:267-268`,
-   `:664-665`). Those closures retain the capture `inputs` (pools), page
-   snapshots and expected outputs. The wrapper keeps `body`, which closes over
-   `inputs` (`transaction_graph.py:566`, `cuda_graph.py:185`). Target: the
-   capture-lifetime rule.
-6. **Replay boundary.** `execute` cancels only on replay failure and has no
-   failed latch. It stages outside that handler and clones `rows_out` after
-   replay (`transaction_graph.py:729-738`). Target: preallocated escaped
-   output, latch, stage failure latched.
-7. **Arena mismatch.** `TransactionArena.upload` raises on a layout mismatch
-   (`transaction_graph.py:216-232`), and the layout is not in the signature.
-   Target: a `signature` fallback.
-8. **Recapture.** `capture` discards and recaptures on any change of pool
-   layout (`transaction_graph.py:420-423`, `nemotron_asr.py:861-866`). Target:
-   a single serving capture; a change is fatal.
-9. **Missing checks.** No latch, process-constant, wrapper-entry or
-   post-warmup checks exist: `execute` classifies first and counts a fallback
-   (`transaction_graph.py:686-709`) with nothing fatal before it. Population
-   validation (`transaction_graph.py:350-362`) omits `max_num_batched_tokens`
-   and the override slot bound. Target: the Execute order.
-10. **Reader and shutdown.** `_resolve_model` returns `None` for an unreachable
-    model, so the reader reports off (`transaction_graph.py:793-823`);
-    `GPUModelRunner.shutdown` (`model_runner.py:2483-2511`) does not discard
-    the binding, and no `ModelState` shutdown hook exists; `discard()`
-    (`transaction_graph.py:396-399`) clears graphs only, not arenas or owned
-    buffers. Target: `discard()` drops all three, and the core shutdown hook
-    calls it.
-11. **Inaccurate comments.** `advance.py:3535-3536` says structural rejection
-    runs on every invocation including graph replay; under outer replay it is
-    frozen at capture. `transaction_graph.py:451-455` and the receipt
-    docstring (`:759-761`) claim largest-first segment reuse, which
-    measurement contradicts.
-
-12. **Processor geometry check.** `NemotronASRMultiModalProcessor`
-    (`processor.py:106-122`) passes envelopes through without checking their
-    geometry, so today an off-set geometry is caught only in the worker.
-13. **Private pool access at capture.** `initialize_state_slots` hands capture
-    the private `views._views` mapping (`model_state_v2.py:121`), outside any
-    authorized core access. Target: the core startup pool access (Core
-    Obligations, item 6).
+1. **Post-warmup hook.** No `ModelState` post-warmup hook exists, so the model
+   verifies on the first non-dummy `prepare_step` (Post-Warmup Verification).
+   Target: the core hook (Core Obligations, item 2).
+2. **Shutdown.** `GPUModelRunner.shutdown` (`model_runner.py:2483`) does not
+   call the binding's `discard()`, which drops graphs, arenas and owned
+   buffers; they are released with the model object. Target: the core shutdown
+   hook calls `discard()` (Core Obligations, item 3).
+3. **Private pool access.** `initialize_state_slots` hands capture the private
+   `views._views` mapping (`model_state_v2.py:95-101`, `:130`), outside any
+   authorized core access. Post-warmup verification reads the same mapping
+   from the model state's current `state_slots` on the first non-dummy
+   `prepare_step` (`model_state_v2.py:156-160`), so it checks the live layout,
+   and nothing keeps it. Target: the core startup pool access (Core
+   Obligations, item 6), the eventual source for both.
+4. **Option attribution in core errors.** The planner's persistent-state
+   capacity rejection and a KV allocation failure before
+   `initialize_state_slots` do not name the option. Target: Core Obligations,
+   items 4 and 5.
 
 ## Decisions & Alternatives
 
@@ -787,8 +753,8 @@ Each item gives the current behavior on this branch, then the target.
    freed block only on the stream that allocated it, and `graph_capture`
    documents that reusing one stream shares free graph-pool blocks
    (`parallel_state.py:1711`). Secondary suspects: tensors kept alive until the
-   deferred `consume_batch_stats()` (`transaction_graph.py:473`), the retained
-   capture closures (divergence 5), and lazily created module buffers.
+   deferred `consume_batch_stats()` (`transaction_graph.py:1100`), and lazily
+   created module buffers.
    **Probe:** capture the nine g0 cells on one persistent stream into a
    dedicated pool, taking `memory_reserved` and `torch.cuda.memory._snapshot()`
    after each capture; repeat with capture contexts cleared and
@@ -878,7 +844,7 @@ the body on the live call's inputs and cannot observe it.
 - **TXG-MEM-002**: When `transaction_graph_populations` is non-empty, `prepare_execution_memory` shall, after the nested inventory is ready and before the eager profile transactions, capture every declared cell (never a subset or an extrapolation) over stand-in storage of `max(populations) + 1` slots with the real persistent-state layout into a dedicated graph pool, using the same capture path, cell order, capture stream and replay self-check as serving capture.
   - Design: Ordering
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_admission_captures_full_inventory_before_eager_profiles` (new; call order and captured-cell inventory) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_cuda_admission_and_serving_capture_share_cell_order` (new; capture stream identical across both inventories and the admission graph pool handle distinct from the platform and nested pools) [CUDA]
-- **TXG-MEM-003**: When `transaction_graph_populations` is non-empty, every admission reading `N()` (`N0`, `Na`, `N1`, `Ns0`, `Ns1`) shall be a `mem_get_info` free-memory value taken after a device synchronize, `gc.collect()` and an allocator `empty_cache()`; `Na` shall be read after every capture-only temporary (page snapshots, expected outputs, capture and verify callbacks, capture inputs) is cleared and while the admission holder still retains the stand-in storage, and `N1` after that storage is released; the model shall read the allocator's allocated bytes on the device (`torch.cuda.memory_allocated`) immediately after the `Na` and the `N1` readings; and the model shall compute `A = N0 - N1` and `S = Ns0 - Ns1` from free memory alone.
+- **TXG-MEM-003**: When `transaction_graph_populations` is non-empty, every admission reading `N()` (`N0`, `Na`, `N1`, `Ns0`, `Ns1`) shall be a `mem_get_info` free-memory value taken after a device synchronize, `gc.collect()` and an allocator `empty_cache()`; `Na` shall be read after every capture-only temporary (page snapshots, expected outputs, capture and verify callbacks, capture inputs) is cleared and while the admission holder still retains the stand-in storage, and `N1` after that storage is released; the model shall read the allocator's allocated bytes on the device (`torch.cuda.memory_allocated`) immediately after the `Na` and the `N1` readings, `Na` being the settled point at which the allocated-bytes reading for the release check is taken, and no admitted figure shall use `Na`'s free memory; and the model shall compute `A = N0 - N1` and `S = Ns0 - Ns1` from free memory alone.
   - Design: Normalized measurement; Ordering
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_normalized_readings_synchronize_collect_and_empty_first` (new; also the order: temporaries cleared, `Na` and its allocated-bytes reading, stand-in release, `N1` and its allocated-bytes reading; release verified with no free-memory rise at release) [CPU, patched device calls]
 - **TXG-MEM-004**: When `transaction_graph_populations` is non-empty, if the allocator's allocated bytes drop by less than the stand-in storage bytes between the readings taken with `Na` and `N1`, or any owning reference to the stand-in storage survives its release, then startup shall fail with an error naming `transaction_graph_populations` and reporting both figures (the allocated-bytes drop and the stand-in bytes).
@@ -901,7 +867,7 @@ the body on the live call's inputs and cannot observe it.
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_admission_oom_latches_and_reports_progress` (new) [CPU, injected OOM]
 - **TXG-MEM-010**: When `transaction_graph_populations` is non-empty, if serving capture raises, or the usable slot count after capacity is fixed is less than `max(populations)`, then the binding shall discard every graph and `initialize_kv_cache` shall raise an error naming `transaction_graph_populations`, and no step shall be served eager in its place.
   - Design: Lifetime: one serving capture per worker; Failure modes and diagnostics
-  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_failed_capture_publishes_nothing_and_every_call_runs_eager` (existing; rewrite to assert startup failure) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_serving_capture_rejects_too_few_usable_slots` (new) [CPU]
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_failed_capture_publishes_nothing_and_every_call_runs_eager` (existing; rewrite to assert startup failure) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_serving_capture_rejects_too_few_usable_slots` (new) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_serving_capture_requires_admission_on_cuda` (new; binding level: without admission, the CUDA serving-capture guard raises naming `transaction_graph_populations` and latches the binding) [CPU]
 - **TXG-MEM-011**: When `transaction_graph_populations` is non-empty, if core budget validation rejects the persistent-state budget after admission, because fewer than two pages fit or a set `num_gpu_blocks_override` exceeds the remaining budget, then startup shall fail with an error naming the model-supplied contributor label (for this model, `transaction_graph_populations`), and no step shall be served eager in its place. How the model supplies that label is the core persistent-state design's choice.
   - Design: Failure modes and diagnostics; Core Obligations, item 4 (deferred until core lands it)
   - Test: `tests/v1/core/test_kv_cache_planning.py::test_state_planner_rejection_names_the_contributor_label` (new; requires the core change; generic label; too-small budget and oversized override, parametrized) [CPU]
@@ -932,7 +898,7 @@ the body on the live call's inputs and cannot observe it.
 - **TXG-LIFE-007**: When `transaction_graph_populations` is non-empty and `GPUModelRunner.shutdown` runs, the core `ModelState` shutdown hook shall call the binding's `discard()` before the model state is released.
   - Design: Lifetime: one serving capture per worker; Core Obligations, item 3 (deferred until core lands it)
   - Test: `tests/v1/worker/test_gpu_model_runner_v2.py::test_shutdown_calls_model_state_shutdown_hook` (new; requires the core hook) [CPU]
-- **TXG-LIFE-008**: When `transaction_graph_populations` is non-empty, the model shall reach the unowned resident pools for serving capture and the rejected-row reference only through the core-authorized startup pool access, use it only during `initialize_state_slots`, and commit no page through it.
+- **TXG-LIFE-008**: When `transaction_graph_populations` is non-empty, the model shall reach the unowned resident pools for serving capture and the rejected-row reference only through the core-authorized startup pool access, use it only during `initialize_state_slots`, and commit no page through it; post-warmup verification shall read only resident pool layout (address, shape and stride), through the same core-provided access.
   - Design: Lifetime: one serving capture per worker; Core Obligations, item 6 (deferred until core lands it)
   - Test: `tests/v1/worker/test_gpu_model_runner_v2.py::test_startup_pool_access_expires_after_initialize_state_slots` (new; requires the core change; generic model state) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_capture_reaches_pools_only_through_the_startup_accessor` (new; requires the core change; never reads `views._views`) [CPU]
 
@@ -994,7 +960,7 @@ the body on the live call's inputs and cannot observe it.
 
 - **TXG-VER-001**: When `transaction_graph_populations` is non-empty and the model's post-warmup verification function runs, it shall verify every published cell's signature and the address and size of every binding-external buffer its graph reads, and if any differs from its capture-time value, then it shall raise an error naming `transaction_graph_populations`, the cell and the buffer.
   - Design: Post-Warmup Verification
-  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_post_warmup_verification_rejects_resized_external_buffer` (new; calls the verification function directly with a resized stub buffer) [CPU]
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_post_warmup_verification_rejects_resized_external_buffer` (new; calls the verification function directly with a resized stub buffer) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_verification_keeps_no_resident_view` (new; no resident view outlives verification and `discard()`) [CPU]
 - **TXG-VER-002**: When `transaction_graph_populations` is non-empty and no core post-warmup hook exists, the model shall run the same verification exactly once, on the first non-dummy `prepare_step`, before registry pruning, `state_slots.begin_step`, request activation and any transaction, and dummy steps shall not consume it; every non-dummy `prepare_step`, the first included, shall also check the binding's failed latch at that point and raise the TXG-FAIL-004 error if it is set.
   - Design: Post-Warmup Verification
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_first_real_step_verifies_once_before_pruning` (new; also a latched binding failing a later `prepare_step` before pruning, with verification not rerun) [CPU]

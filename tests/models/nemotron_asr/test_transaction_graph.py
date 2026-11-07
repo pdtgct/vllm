@@ -898,10 +898,15 @@ def _model_call(model: Any) -> tg.TransactionCallBindings:
     )
 
 
+def _live_storage(model: Any, slots: StateSlotBindings) -> SimpleNamespace:
+    """The aggregate group's ``spec`` and current component ``views``."""
+    views = slots.views[model._persistent_state_layer.prefix]
+    return SimpleNamespace(spec=views.spec, views=views._views)
+
+
 def _resident(model: Any, slots: StateSlotBindings) -> advance.TransactionPools:
     """The resident pools behind ``slots``, as serving capture reads them."""
-    views = slots.views[model._persistent_state_layer.prefix]
-    return _transaction_view(SimpleNamespace(spec=views.spec, views=views._views))
+    return _transaction_view(_live_storage(model, slots))
 
 
 def _live(references: list[weakref.ref[Any]]) -> list[Any]:
@@ -2795,7 +2800,7 @@ def test_every_fatal_source_latches_before_classification(
         verify = _seam(model, "verify_transaction_graphs")
         _resize_positional_buffer(model)
         with pytest.raises(RuntimeError, match="transaction_graph_populations"):
-            verify()
+            verify(_live_storage(model, slots))
     else:
         _other, moved = _model_state(model, config, num_blocks=4)
         with pytest.raises(RuntimeError, match=r"(?i)pool layout|call binding"):
@@ -3593,6 +3598,24 @@ def test_serving_capture_rejects_too_few_usable_slots() -> None:
     assert binding.counters()["captured_cells"] == 0
 
 
+@pytest.mark.cpu_test
+def test_serving_capture_requires_admission_on_cuda() -> None:
+    """Serving capture on CUDA requires admission; without it the binding latches.
+
+    ``capture_transaction_graphs`` calls ``require_admission()`` before serving
+    capture over CUDA pools; the CPU check runs that guard directly.
+    """
+    binding = _admission_binding()
+    with pytest.raises(RuntimeError, match="transaction_graph_populations") as raised:
+        binding.require_admission()
+    assert "admission" in str(raised.value)
+    assert "a fresh worker is required" in str(raised.value)
+    with pytest.raises(RuntimeError, match="a fresh worker is required"):
+        binding.check_latch()
+    assert not binding.ready
+    assert binding.counters()["captured_cells"] == 0
+
+
 # ---- CPU: capture lifetime -------------------------------------------------
 
 
@@ -3904,6 +3927,7 @@ _VERIFY_MISMATCHES = (
     "relocated-buffer",
     "rebound-encoder-transition",
     "relocated-pool-view",
+    "replaced-mapping",
     "lazy-projection",
     "relocated-encoder-entry",
     "relocated-decoder-entry",
@@ -3920,9 +3944,10 @@ def _verification_mismatch(
     ``relocated-buffer`` moves the positional buffer to a same-size copy, so
     only its address changes. ``rebound-encoder-transition`` rebinds the
     encoder transition every call binds; ``relocated-pool-view`` moves one
-    resident pool view; ``lazy-projection`` binds the encoder's lazily prepared
-    positional projections. The nested cases move one encoder graph entry's
-    mel storage or one decode graph entry's frame input.
+    resident pool view; ``replaced-mapping`` swaps the live views mapping for a
+    new one whose channel view is relocated; ``lazy-projection`` binds the
+    encoder's lazily prepared positional projections. The nested cases move one
+    encoder graph entry's mel storage or one decode graph entry's frame input.
     """
 
     def names(*parts: str) -> Callable[[str], None]:
@@ -3952,6 +3977,11 @@ def _verification_mismatch(
         views = slots.views[model._persistent_state_layer.prefix]._views
         name = "encoder.layers.0.window.channel"
         views[name] = views[name].clone()
+        return names("resident pool channel.0")
+    if kind == "replaced-mapping":
+        owner = slots.views[model._persistent_state_layer.prefix]
+        name = "encoder.layers.0.window.channel"
+        owner._views = {**owner._views, name: owner._views[name].clone()}
         return names("resident pool channel.0")
     if kind == "lazy-projection":
         assert encoder._stream_relative_position_lengths == ()
@@ -3985,11 +4015,27 @@ def test_post_warmup_verification_rejects_resized_external_buffer(
         monkeypatch, graphed=mismatch in _NESTED_MISMATCHES
     )
     verify = _seam(model, "verify_transaction_graphs")
-    verify()
+    verify(_live_storage(model, slots))
     check = _verification_mismatch(model, slots, mismatch)
     with pytest.raises(RuntimeError, match="transaction_graph_populations") as raised:
-        verify()
+        verify(_live_storage(model, slots))
     check(str(raised.value))
+
+
+@pytest.mark.cpu_test
+def test_verification_keeps_no_resident_view(
+    monkeypatch: pytest.MonkeyPatch, cpu_readings: SimpleNamespace
+) -> None:
+    """No resident view outlives ``discard()`` and the model state's slots."""
+    cpu_readings.expected = 5
+    model, state, slots = _verified_model(monkeypatch)
+    views = slots.views[model._persistent_state_layer.prefix]._views
+    resident = [weakref.ref(view) for view in views.values()]
+    state.prepare_step(SchedulerOutput.make_empty(), dummy_run=False, is_profile=False)
+    model._transaction_graph.discard()
+    state.state_slots = None
+    del views, slots
+    assert not _live(resident)
 
 
 @pytest.mark.cpu_test
@@ -4003,9 +4049,11 @@ def test_first_real_step_verifies_once_before_pruning(
     verify = _seam(model, "verify_transaction_graphs")
     prune = model._registry.prune
 
-    def verified() -> None:
+    def verified(storage: Any) -> None:
         events.append("verify")
-        verify()
+        live = slots.views[model._persistent_state_layer.prefix]
+        assert storage.spec is live.spec and storage.views is live._views
+        verify(storage)
 
     def pruned(live: Any) -> Any:
         events.append("prune")
