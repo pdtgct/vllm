@@ -157,6 +157,24 @@ SESSION_LIMITS: dict[str, int] = {
 }
 
 
+def served_geometry_ids(hf_config: Any) -> tuple[int, ...]:
+    """The :data:`CADENCES` indices the served configuration admits.
+
+    Every published cadence is served unless ``supported_num_lookahead_tokens``
+    narrows the set by encoder lookahead.
+    """
+    declared = getattr(hf_config, "supported_num_lookahead_tokens", None)
+    supported = None if declared is None else {int(value) for value in declared}
+    geometries = tuple(
+        index
+        for index, (_left, right) in enumerate(CADENCES.values())
+        if supported is None or right in supported
+    )
+    if not geometries:
+        raise ValueError("served configuration declares no supported encoder geometry")
+    return geometries
+
+
 def canonical_json(obj: Any) -> str:
     """The canonical JSON serialization every manifest hash is over.
 

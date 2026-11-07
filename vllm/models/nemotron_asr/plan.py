@@ -249,6 +249,18 @@ def reject_unsupported_outer_graph_mode(compilation_config: object) -> None:
         )
 
 
+def _served_geometry_set(
+    num_geometries: int | None, served_geometries: Collection[int] | None
+) -> frozenset[int]:
+    """The admitted geometry ids; ``num_geometries`` admits ``0..n-1``."""
+    if (num_geometries is None) == (served_geometries is None):
+        raise TypeError("pass exactly one of served_geometries or num_geometries")
+    if served_geometries is None:
+        assert num_geometries is not None
+        return frozenset(range(num_geometries))
+    return frozenset(int(geometry) for geometry in served_geometries)
+
+
 def _header_int(header: tuple[float, ...], slot: int, name: str) -> int:
     value = header[slot]
     if not math.isfinite(value) or value != math.trunc(value):
@@ -392,7 +404,7 @@ class SessionRegistry:
         row: ObservedRow,
         *,
         num_prompts: int,
-        num_geometries: int,
+        served_geometries: frozenset[int],
     ) -> tuple[int, int, int]:
         header = row.envelope_header
         if header is None:
@@ -423,7 +435,7 @@ class SessionRegistry:
             )
         _header_int(header, ENV_CHUNK_SEQUENCE, "chunk_sequence")
         geometry = _header_int(header, ENV_GEOMETRY_ID, "geometry_id")
-        if not 0 <= geometry < num_geometries:
+        if geometry not in served_geometries:
             raise ValueError(
                 f"envelope header for {row.request_id!r} carries geometry {geometry} "
                 "outside the admitted set"
@@ -452,9 +464,10 @@ class SessionRegistry:
         *,
         placeholder_id: int,
         num_prompts: int,
-        num_geometries: int,
         now_ns: int,
         resident_request_ids: Sequence[str] | None = None,
+        served_geometries: Collection[int] | None = None,
+        num_geometries: int | None = None,
     ) -> tuple[PreparedRowBinding, ...]:
         """Mint one binding per observed row, atomically per step.
 
@@ -472,7 +485,12 @@ class SessionRegistry:
         so it must be directly comparable to the frontend process's
         wall clock (the same cross-process basis vLLM's own scheduler
         uses for ``Request.arrival_time``).
+
+        ``served_geometries`` is the configured served geometry set; a CHUNK
+        header naming any other geometry fails here, before the delta commit.
+        ``num_geometries`` admits every geometry id below it instead.
         """
+        served = _served_geometry_set(num_geometries, served_geometries)
         if now_ns <= 0:
             raise ValueError("now_ns must be a positive wall-clock nanosecond stamp")
         # Two-phase delta commit: validate the complete row set against
@@ -536,7 +554,7 @@ class SessionRegistry:
                 geometry, prompt, admission_ms_mod = self._parse_chunk_header(
                     row,
                     num_prompts=num_prompts,
-                    num_geometries=num_geometries,
+                    served_geometries=served,
                 )
                 staged_generation += 1
                 session = _Session(
@@ -585,7 +603,7 @@ class SessionRegistry:
                 _, prompt, admission_ms_mod = self._parse_chunk_header(
                     row,
                     num_prompts=num_prompts,
-                    num_geometries=num_geometries,
+                    served_geometries=served,
                 )
                 prior = session.prompt_index
                 # Provisional only: resolve_status publishes it after a
@@ -645,18 +663,20 @@ def prepare_plan_context(
     resident_request_ids: Sequence[str],
     placeholder_id: int,
     num_prompts: int,
-    num_geometries: int,
     now_ns: int,
     step: int,
+    served_geometries: Collection[int] | None = None,
+    num_geometries: int | None = None,
 ) -> PlanContext:
     """One hook invocation: prune, mint bindings, build the columns."""
     bindings = registry.bind_rows(
         rows,
         placeholder_id=placeholder_id,
         num_prompts=num_prompts,
-        num_geometries=num_geometries,
         now_ns=now_ns,
         resident_request_ids=resident_request_ids,
+        served_geometries=served_geometries,
+        num_geometries=num_geometries,
     )
     return PlanContext(
         step=step,

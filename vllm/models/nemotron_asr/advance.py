@@ -2826,7 +2826,8 @@ def advance_model_rows(
 
     ``transaction_graph`` is an optional startup-captured replay of the device
     body and commit scatters. It returns ``None`` for any call outside its
-    captured keys, and such calls run the eager path below unchanged.
+    captured cells, and such calls run the eager path below unchanged; a
+    worker-fatal check or a latched binding raises instead.
 
     Host staging (PORT-PERF-001): ``staging`` is optional reusable
     pinned H2D buffering (:class:`HostStaging`) for the once-per-call
@@ -3532,8 +3533,9 @@ def run_transaction_body(
         if not isinstance(bucket, ChunkBucketResult):
             raise TypeError("bucket transition must return ChunkBucketResult")
         batch, result = bucket.batch, bucket.result
-        # Keep structural rejection on every invocation, including graph
-        # replay; capture-time metadata validation alone is insufficient.
+        # Structural rejection runs on every eager invocation and every nested
+        # graph replay. Under an outer transaction graph it runs only while
+        # the cell is captured, whose signature then fixes this structure.
         _validate_result_structure(
             result,
             rows=int(rows_dev.shape[0]),

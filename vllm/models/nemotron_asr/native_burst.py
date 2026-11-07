@@ -357,14 +357,17 @@ def native_burst_invariant_rows(
 
 
 def native_burst_token_budget(config: Any) -> int:
-    from vllm.models.nemotron_asr.manifests import CADENCES, author_emission_manifest
-    from vllm.models.nemotron_asr.nemotron_asr import _served_geometry_ids
+    from vllm.models.nemotron_asr.manifests import (
+        CADENCES,
+        author_emission_manifest,
+        served_geometry_ids,
+    )
 
     manifest = author_emission_manifest(config)["per_geometry"]
     labels = tuple(CADENCES)
     return max(
         int(manifest[labels[index]]["max_emission_tokens"])
-        for index in _served_geometry_ids(config)
+        for index in served_geometry_ids(config)
     )
 
 

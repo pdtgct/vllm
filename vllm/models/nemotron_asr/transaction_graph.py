@@ -9,13 +9,22 @@ host vector the body reads comes from a persistent arena uploaded with one
 host-to-device copy before replay. The reservation happens before replay and the
 status stage after it. Calls outside the captured cells return ``None`` and the
 caller runs the eager path; such calls are counted per cell and reason.
+
+The declared inventory is captured twice per worker through one capture path:
+over stand-in storage inside the memory-profiling window, which admits its
+retained memory before resident capacity is fixed, then once over the resident
+pools for serving. A failure from the replay onward, and every worker-fatal
+check, latches the binding.
 """
 
 from __future__ import annotations
 
+import gc
 import os
 import time
-from collections.abc import Callable, Mapping, Sequence
+import weakref
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -42,6 +51,11 @@ from vllm.models.nemotron_asr.decode_graph import GraphRuntime, platform_graph_r
 CELL_FRESH_CHUNK = "chunk-fresh"
 CELL_CONTINUING_CHUNK = "chunk-continuing"
 CELL_REPLAY = "replay"
+
+#: The option every configuration and startup error names.
+OPTION = "transaction_graph_populations"
+#: The one served geometry: the 80 ms cadence, ``CADENCES`` index 0 (g0).
+SERVED_GEOMETRY = 0
 
 
 @dataclass(frozen=True, order=True)
@@ -112,6 +126,15 @@ def _lazy_buffer_signature(core: Any) -> tuple[Any, ...]:
     )
 
 
+def _arena_layout(
+    inputs: TransactionInputs,
+) -> tuple[tuple[str, torch.dtype, tuple[int, ...]], ...]:
+    return tuple(
+        (name, tensor.dtype, tuple(tensor.shape))
+        for name, tensor in inputs.staged_vectors()
+    )
+
+
 def transaction_signature(
     core: Any,
     inputs: TransactionInputs,
@@ -120,7 +143,7 @@ def transaction_signature(
     *,
     graph_covers_decode: bool,
 ) -> tuple[Any, ...]:
-    """Every structural input a captured body freezes."""
+    """Every structural input a captured body freezes, arena layout included."""
     return (
         inputs.n_real,
         inputs.hidden,
@@ -148,15 +171,7 @@ def transaction_signature(
         _lazy_buffer_signature(core),
         (tuple(input_ids.shape), input_ids.dtype, input_ids.device),
         (tuple(inputs_embeds.shape), inputs_embeds.dtype, inputs_embeds.device),
-    )
-
-
-def _arena_layout(
-    inputs: TransactionInputs,
-) -> tuple[tuple[str, torch.dtype, tuple[int, ...]], ...]:
-    return tuple(
-        (name, tensor.dtype, tuple(tensor.shape))
-        for name, tensor in inputs.staged_vectors()
+        _arena_layout(inputs),
     )
 
 
@@ -249,6 +264,152 @@ class ArenaTransactionStager:
         return self._views[bucket_vector_name(index, field)]
 
 
+# ---------------------------------------------------------------- device seams
+def normalized_free_memory(device: torch.device) -> int | None:
+    """Free device memory after a synchronize, ``gc.collect()`` and cache release.
+
+    Every admission figure is a difference of two such readings, so it covers
+    memory the allocator does not track. Returns ``None`` off CUDA.
+    """
+    if device.type != "cuda":
+        return None
+    torch.cuda.synchronize(device)
+    gc.collect()
+    torch.cuda.empty_cache()
+    free, _total = torch.cuda.mem_get_info(device)
+    return int(free)
+
+
+def device_memory_info(device: torch.device) -> tuple[int | None, int | None]:
+    """The device's free and total memory; ``(None, None)`` off CUDA."""
+    if device.type != "cuda":
+        return None, None
+    free, total = torch.cuda.mem_get_info(device)
+    return int(free), int(total)
+
+
+def allocate_escaped_rows(rows: torch.Tensor) -> torch.Tensor:
+    """Caller-owned storage for one replay's projection rows."""
+    return torch.empty_like(rows)
+
+
+def _process_constants() -> dict[str, Any]:
+    """Host-only reads of the settings every captured graph was built under.
+
+    Only the per-operation ``fp32_precision`` settings are read: they also
+    reflect the legacy matmul-precision setter, whose getters raise once a
+    per-operation value is set.
+    """
+    from vllm.model_executor.determinism import batch_invariant
+
+    return {
+        "batch-invariant mode": batch_invariant._batch_invariant_MODE,
+        "torch.backends.cuda.matmul.fp32_precision": (
+            torch.backends.cuda.matmul.fp32_precision
+        ),
+        "torch.backends.cudnn.conv.fp32_precision": (
+            torch.backends.cudnn.conv.fp32_precision
+        ),
+        "torch.backends.cudnn.rnn.fp32_precision": (
+            torch.backends.cudnn.rnn.fp32_precision
+        ),
+        "CUBLAS_WORKSPACE_CONFIG": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+    }
+
+
+def _external_buffers(core: Any) -> dict[str, Any]:
+    """Layouts of the core-owned tensors the captured graphs read."""
+    if isinstance(core, torch.nn.Module):
+        modules = [("", core)]
+    else:
+        modules = [
+            (name, value)
+            for name, value in getattr(core, "__dict__", {}).items()
+            if isinstance(value, torch.nn.Module)
+        ]
+    layouts: dict[str, Any] = {}
+    for prefix, module in modules:
+        for name, tensor in (
+            *module.named_parameters(prefix),
+            *module.named_buffers(prefix),
+        ):
+            layouts[name] = _tensor_layout(tensor)
+    encoder = getattr(core, "encoder", None)
+    layouts["encoder._stream_relative_position_lengths"] = tuple(
+        getattr(encoder, "_stream_relative_position_lengths", ())
+    )
+    return layouts
+
+
+def _failure_figures(
+    device: torch.device, baseline: int | None
+) -> tuple[int | None, int | None, int | None]:
+    """Bytes admitted since ``baseline`` and the device's free and total memory."""
+    try:
+        current = normalized_free_memory(device)
+        free, total = device_memory_info(device)
+    except Exception:
+        return None, None, None
+    admitted = None if baseline is None or current is None else baseline - current
+    return admitted, free, total
+
+
+@contextmanager
+def _automatic_gc_paused() -> Iterator[None]:
+    """Pause automatic garbage collection for one capture.
+
+    A finalizer running inside a capture, such as a pinned host buffer's,
+    could issue a CUDA call that is illegal while a stream captures and
+    invalidate the capture.
+    """
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if enabled:
+            gc.enable()
+
+
+@contextmanager
+def _on_stream(stream: Any) -> Iterator[None]:
+    """Run the scope on ``stream``, ordered after and before the current one."""
+    if stream is None:
+        yield
+        return
+    current = torch.cuda.current_stream()
+    stream.wait_stream(current)
+    with torch.cuda.stream(stream):
+        yield
+    current.wait_stream(stream)
+
+
+# ------------------------------------------------------------------ cell state
+@dataclass
+class _CaptureContext:
+    """Everything one cell's capture and self-check read; cleared when verified.
+
+    ``inputs`` is also bound for the duration of each replay, for runtimes
+    that re-execute the body instead of launching a graph.
+    """
+
+    inputs: TransactionInputs | None
+    blocks: torch.Tensor | None = None
+    pages: tuple[torch.Tensor, ...] | None = None
+    expected: tuple[torch.Tensor, ...] | None = None
+
+    def require_inputs(self) -> TransactionInputs:
+        if self.inputs is None:
+            raise RuntimeError("transaction graph body has no bound inputs")
+        return self.inputs
+
+    def clear(self) -> None:
+        self.inputs = None
+        self.blocks = None
+        self.pages = None
+        self.expected = None
+
+
 @dataclass
 class _TransactionGraph:
     cell: TransactionCell
@@ -259,6 +420,9 @@ class _TransactionGraph:
     rows_out: torch.Tensor
     status_out: torch.Tensor
     progress_out: torch.Tensor
+    wrapper: Any
+    descriptor: Any
+    context: _CaptureContext
     replay: Callable[[], None]
     retained_bytes: int | None = None
     warmup_seconds: float | None = None
@@ -266,6 +430,17 @@ class _TransactionGraph:
     capture_index: int | None = None
     capture_graph: Callable[[], None] | None = None
     verify: Callable[[], None] | None = None
+
+    def holds_graph(self) -> bool:
+        """Whether the wrapper entry still holds this cell's graph."""
+        entry = self.wrapper.concrete_cudagraph_entries.get(self.descriptor)
+        return entry is not None and entry.cudagraph is not None
+
+    def clear_capture(self) -> None:
+        """Drop the capture and self-check callbacks and the capture context."""
+        self.capture_graph = None
+        self.verify = None
+        self.context.clear()
 
 
 def _capture_plan(
@@ -335,6 +510,80 @@ class TransactionCallBindings:
     execution_tier: Callable[[int], int] = field(default=lambda population: 0)
 
 
+def _startup_key(
+    pools: TransactionPools,
+    call: TransactionCallBindings,
+    *,
+    hidden_size: int,
+    device: torch.device,
+    null_block_id: int,
+) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+    """The pool layout and the call bindings one serving capture is valid for."""
+    return (
+        tuple(_tensor_layout(pool) for pool in pools.sequence()),
+        (
+            *(
+                _callable_identity(fn)
+                for fn in (
+                    call.adapter,
+                    call.decode_resolver,
+                    call.encoder_transition,
+                    call.bucket_transition,
+                    call.execution_tier,
+                )
+            ),
+            call.placeholder_id,
+            call.park_id,
+            call.eou_token_id,
+            call.graph_covers_decode,
+            hidden_size,
+            device,
+            null_block_id,
+        ),
+    )
+
+
+@dataclass
+class _CaptureProgress:
+    """The cell being prepared or captured, and the cells captured so far."""
+
+    cell: TransactionCell | None = None
+    captured: list[TransactionCell] = field(default_factory=list)
+
+
+@dataclass
+class _Inventory:
+    """Every declared cell, verified, with its capture cost."""
+
+    graphs: dict[TransactionCell, _TransactionGraph]
+    retained_bytes: int | None
+    seconds: float
+
+    @property
+    def order(self) -> tuple[str, ...]:
+        ranked = sorted(
+            self.graphs.values(), key=lambda graph: graph.capture_index or 0
+        )
+        return tuple(graph.cell.label for graph in ranked)
+
+
+@dataclass
+class _AdmissionHolder:
+    """The unpublished admission inventory and the stand-in storage it reached."""
+
+    storage: torch.Tensor | None = None
+    inventory: _Inventory | None = None
+
+
+@dataclass(frozen=True)
+class _Startup:
+    """What the published serving inventory was captured for and against."""
+
+    key: tuple[tuple[Any, ...], tuple[Any, ...]]
+    signatures: Mapping[TransactionCell, tuple[Any, ...]]
+    external: Mapping[str, Any]
+
+
 class TransactionGraphBinding:
     """Declared whole-transaction cells, their graphs and replay accounting."""
 
@@ -357,15 +606,16 @@ class TransactionGraphBinding:
             or len(set(populations)) != len(populations)
         ):
             raise ValueError(
-                "transaction_graph_populations must be distinct integers in "
-                f"1..{maximum_population}"
+                f"{OPTION} must be distinct integers in 1..{maximum_population}"
             )
-        if not geometries:
-            raise ValueError("transaction graphs require a served geometry")
+        if tuple(geometries) != (SERVED_GEOMETRY,):
+            raise ValueError(
+                f"{OPTION} serves only geometry g{SERVED_GEOMETRY}, "
+                f"not {tuple(geometries)}"
+            )
         cells = [
-            TransactionCell(kind, int(geometry), int(population))
+            TransactionCell(kind, SERVED_GEOMETRY, int(population))
             for population in populations
-            for geometry in geometries
             for kind in (CELL_FRESH_CHUNK, CELL_CONTINUING_CHUNK)
         ]
         cells += [
@@ -373,12 +623,23 @@ class TransactionGraphBinding:
             for population in populations
         ]
         self._cells = tuple(sorted(cells))
-        self._replay_geometry = int(min(geometries))
+        self._replay_geometry = SERVED_GEOMETRY
         self._vllm_config = vllm_config
         self._runtime = runtime
+        self._capture_stream: Any = None
         self._graphs: dict[TransactionCell, _TransactionGraph] = {}
         self._pool_signature: tuple[Any, ...] | None = None
+        self._startup: _Startup | None = None
+        self._admission: _AdmissionHolder | None = None
+        self._constants: dict[str, Any] | None = None
+        self._failed: str | None = None
         self._retained_bytes_total: int | None = None
+        self._admission_bytes: int | None = None
+        self._serving_bytes: int | None = None
+        self._admission_release_verified: bool | None = None
+        self._admission_seconds: float | None = None
+        self._serving_seconds: float | None = None
+        self._admission_order: tuple[str, ...] = ()
         self._replays: dict[TransactionCell, int] = {}
         self._fallbacks: dict[tuple[str, str], int] = {}
         self._prologue_ns_last = 0
@@ -391,14 +652,126 @@ class TransactionGraphBinding:
 
     @property
     def ready(self) -> bool:
-        return set(self._graphs) == set(self._cells)
+        return self._failed is None and set(self._graphs) == set(self._cells)
+
+    @property
+    def serving_captured(self) -> bool:
+        return self._startup is not None
 
     def discard(self) -> None:
+        """Drop every graph, arena and owned buffer, published or admitted."""
         self._graphs = {}
+        self._admission = None
         self._pool_signature = None
         self._retained_bytes_total = None
 
+    # ------------------------------------------------------------ the latch
+    def check_latch(self) -> None:
+        """Raise if a worker-fatal failure has latched the binding."""
+        if self._failed is not None:
+            raise RuntimeError(
+                f"{OPTION}: the transaction graph binding failed earlier "
+                f"({self._failed}); a fresh worker is required"
+            )
+
+    def _latch(self, reason: str) -> None:
+        if self._failed is None:
+            self._failed = reason
+
+    def _fatal(self, message: str) -> RuntimeError:
+        self._latch(message)
+        return RuntimeError(f"{message}; a fresh worker is required")
+
+    def _verify_process_constants(self) -> None:
+        if self._constants is None:
+            return
+        for name, value in _process_constants().items():
+            captured = self._constants[name]
+            if value != captured:
+                raise self._fatal(
+                    f"{OPTION}: process constant {name} changed from "
+                    f"{captured!r} to {value!r} since capture"
+                )
+
     # ------------------------------------------------------------- capture
+    @torch.inference_mode()
+    def admit(
+        self,
+        core: Any,
+        *,
+        allocate: Callable[[int], tuple[torch.Tensor, TransactionPools]],
+        call: TransactionCallBindings,
+        hidden_size: int,
+        device: torch.device,
+        null_block_id: int = 0,
+    ) -> None:
+        """Capture the declared inventory over stand-in storage to admit its memory.
+
+        Runs inside the memory-profiling window, before the eager profile
+        transactions. ``allocate(slots)`` returns raw stand-in storage of
+        ``slots`` pages with the real layout and its pools. The unpublished
+        inventory stays alive until serving capture releases it. The stand-in
+        storage is released after ``Na``; release is verified when ``N1 - Na``
+        covers its bytes and no owning reference survives. ``A = N0 - N1``.
+        """
+        self.check_latch()
+        if self._startup is not None or self._admission is not None:
+            raise RuntimeError(f"{OPTION} admits its inventory once, before serving")
+        slots = max(cell.population for cell in self._cells) + 1
+        progress = _CaptureProgress()
+        holder = _AdmissionHolder()
+        baseline: int | None = None
+        try:
+            baseline = normalized_free_memory(device)
+            storage, pools = allocate(slots)
+            holder.storage = storage
+            stand_in = weakref.ref(storage)
+            stand_in_bytes = int(storage.untyped_storage().nbytes())
+            del storage
+            holder.inventory = self._capture_inventory(
+                core,
+                pools=pools,
+                call=call,
+                hidden_size=hidden_size,
+                device=device,
+                null_block_id=null_block_id,
+                progress=progress,
+            )
+            del pools
+            retained = normalized_free_memory(device)
+            holder.storage = None
+            released = normalized_free_memory(device)
+        except Exception as error:
+            failure = self._inventory_error(
+                "admission", error, progress, device, baseline
+            )
+            holder.storage = None
+            holder.inventory = None
+            self._latch(str(failure))
+            raise failure from error
+        inventory = holder.inventory
+        assert inventory is not None
+        release = None if retained is None or released is None else released - retained
+        owned = stand_in() is not None
+        verified = not owned and (release is None or release >= stand_in_bytes)
+        self._admission_release_verified = verified
+        if not verified:
+            holder.inventory = None
+            message = (
+                f"{OPTION}: admission release is not verified: N1 - Na is "
+                f"{release} bytes for {stand_in_bytes} stand-in bytes"
+            )
+            if owned:
+                message += ", and an owning reference to the stand-in storage survived"
+            self._latch(message)
+            raise RuntimeError(message)
+        self._admission = holder
+        self._admission_bytes = (
+            None if baseline is None or released is None else baseline - released
+        )
+        self._admission_seconds = inventory.seconds
+        self._admission_order = inventory.order
+
     @torch.inference_mode()
     def capture(
         self,
@@ -412,27 +785,147 @@ class TransactionGraphBinding:
     ) -> None:
         """Capture every declared cell over the allocated resident pools.
 
+        Runs once per worker. The admission inventory is released before
+        ``Ns0``; the serving inventory is published only when every cell
+        verifies and ``S = Ns0 - Ns1`` does not exceed the admitted ``A``. A
+        repeated call with identical pool layout and call bindings is a no-op;
+        any difference, and any capture failure, discards every graph and
+        latches the binding.
+
         Capture inputs use real free block ids and rows the transaction rejects
         (a non-envelope CHUNK payload, or a placeholder id on a non-CHUNK row),
         so warm-up and self-check runs store no page. Each graph must reproduce
         the eager transaction bitwise on that input before it is published.
         """
-        signature = tuple(_tensor_layout(pool) for pool in pools.sequence())
-        if self._graphs and signature == self._pool_signature:
-            return
-        self.discard()
+        self.check_latch()
+        key = _startup_key(
+            pools,
+            call,
+            hidden_size=hidden_size,
+            device=device,
+            null_block_id=null_block_id,
+        )
+        if self._startup is not None:
+            if key == self._startup.key:
+                return
+            changed = (
+                "pool layout" if key[0] != self._startup.key[0] else "call bindings"
+            )
+            self.discard()
+            raise self._fatal(
+                f"{OPTION}: initialize_state_slots repeated with a different "
+                f"{changed}; nothing is recaptured after startup"
+            )
+        self._admission = None
+        progress = _CaptureProgress()
+        baseline: int | None = None
+        try:
+            baseline = normalized_free_memory(device)
+            inventory = self._capture_inventory(
+                core,
+                pools=pools,
+                call=call,
+                hidden_size=hidden_size,
+                device=device,
+                null_block_id=null_block_id,
+                progress=progress,
+            )
+            retained = normalized_free_memory(device)
+        except Exception as error:
+            failure = self._inventory_error(
+                "serving", error, progress, device, baseline
+            )
+            self.discard()
+            self._latch(str(failure))
+            raise failure from error
+        serving = None if baseline is None or retained is None else baseline - retained
+        admitted = self._admission_bytes
+        if serving is not None and admitted is not None and serving > admitted:
+            del inventory
+            self.discard()
+            raise self._fatal(
+                f"{OPTION}: serving capture retained {serving} bytes, more than the "
+                f"{admitted} admitted bytes"
+            )
+        self._graphs = inventory.graphs
+        self._pool_signature = key[0]
+        self._startup = _Startup(
+            key=key,
+            signatures={cell: graph.signature for cell, graph in self._graphs.items()},
+            external=_external_buffers(core),
+        )
+        self._retained_bytes_total = inventory.retained_bytes
+        self._serving_bytes = serving
+        self._serving_seconds = inventory.seconds
+
+    def _inventory_error(
+        self,
+        phase: str,
+        error: Exception,
+        progress: _CaptureProgress,
+        device: torch.device,
+        baseline: int | None = None,
+    ) -> RuntimeError:
+        failing = "none" if progress.cell is None else progress.cell.label
+        captured = [cell.label for cell in progress.captured]
+        message = (
+            f"{OPTION}: {phase} capture failed at cell {failing} with "
+            f"{len(captured)} cells captured ({', '.join(captured) or 'none'})"
+        )
+        if isinstance(error, torch.OutOfMemoryError):
+            admitted, free, total = _failure_figures(device, baseline)
+            message += (
+                f"; out of memory with {admitted} normalized bytes admitted so far "
+                f"and {free} of {total} device bytes free"
+            )
+        return RuntimeError(f"{message}: {error}")
+
+    def _capture_inventory(
+        self,
+        core: Any,
+        *,
+        pools: TransactionPools,
+        call: TransactionCallBindings,
+        hidden_size: int,
+        device: torch.device,
+        null_block_id: int,
+        progress: _CaptureProgress,
+    ) -> _Inventory:
+        """Prepare, capture and verify every declared cell into one fresh pool.
+
+        Every cell's eager reference and warm-ups precede the first capture, so
+        lazily extended module buffers are not rebound under a graph that has
+        already recorded their addresses. Cells are captured largest population
+        first on the binding's one capture stream. Each cell's capture context
+        is cleared before this returns, whether or not every cell verified.
+        """
+        started = time.perf_counter()
         runtime = self._runtime or platform_graph_runtime()
+        self._runtime = runtime
+        if self._constants is None:
+            self._constants = _process_constants()
+        else:
+            self._verify_process_constants()
         num_pool_blocks = int(pools.queue.shape[0])
         free = [block for block in range(num_pool_blocks) if block != null_block_id]
-        pending: dict[TransactionCell, _TransactionGraph] = {}
+        largest = max(cell.population for cell in self._cells)
+        if len(free) < largest:
+            raise ValueError(
+                f"{OPTION} declares population {largest}, but the state pools hold "
+                f"{len(free)} usable slots"
+            )
+        graph_pool = None
+        if device.type == "cuda":
+            from vllm.platforms import current_platform
+
+            graph_pool = current_platform.graph_pool_handle()
+            if self._capture_stream is None:
+                self._capture_stream = torch.cuda.Stream(device=device)
+        graphs: dict[TransactionCell, _TransactionGraph] = {}
         try:
             for cell in self._cells:
-                if len(free) < cell.population:
-                    raise ValueError(
-                        f"transaction cell {cell.label} needs {cell.population} free "
-                        f"state slots; {len(free)} exist"
-                    )
-                pending[cell] = self._capture_cell(
+                progress.cell = cell
+                graphs[cell] = self._capture_cell(
                     core,
                     cell,
                     pools=pools,
@@ -443,38 +936,33 @@ class TransactionGraphBinding:
                     null_block_id=null_block_id,
                     hidden_size=hidden_size,
                     device=device,
+                    graph_pool=graph_pool,
+                    capture_stream=self._capture_stream,
                 )
-            # Eager warm-up of every cell precedes the first capture: lazily
-            # extended module buffers must not be rebound under a graph that
-            # already recorded their addresses. Every graph is then verified
-            # after the last capture.
-            # Graphs share the platform's global pool and replay serially, and
-            # no pool tensor outlives its capture (outputs are copied into
-            # owned buffers). Capturing the largest population first lets the
-            # smaller cells reuse its freed segments, so the retained pool is
-            # about the largest cell's transient peak rather than the sum.
             reserved = (
                 torch.cuda.memory_reserved(device) if device.type == "cuda" else None
             )
-            order = sorted(pending.values(), key=lambda g: -g.cell.population)
+            order = sorted(graphs.values(), key=lambda graph: -graph.cell.population)
             for index, graph in enumerate(order):
-                assert graph.capture_graph is not None
+                progress.cell = graph.cell
                 graph.capture_index = index
+                assert graph.capture_graph is not None
                 graph.capture_graph()
-            retained_total = (
+                progress.captured.append(graph.cell)
+            retained = (
                 None
                 if reserved is None
                 else torch.cuda.memory_reserved(device) - reserved
             )
-            for graph in pending.values():
+            for graph in graphs.values():
+                progress.cell = graph.cell
                 assert graph.verify is not None
                 graph.verify()
         finally:
+            for graph in graphs.values():
+                graph.clear_capture()
             consume_batch_stats()
-        self._graphs = pending
-        self._pool_signature = signature
-        self._retained_bytes_total = retained_total
-        self._runtime = runtime
+        return _Inventory(graphs, retained, time.perf_counter() - started)
 
     def _capture_cell(
         self,
@@ -489,7 +977,14 @@ class TransactionGraphBinding:
         null_block_id: int,
         hidden_size: int,
         device: torch.device,
+        graph_pool: Any = None,
+        capture_stream: Any = None,
     ) -> _TransactionGraph:
+        """Prepare one cell: its eager reference, warm-ups and capture callbacks.
+
+        Every capture-only value lives in the returned cell's capture context,
+        which the wrapper's body and the callbacks read through.
+        """
         started = time.perf_counter()
         geometry = self._replay_geometry if cell.kind == CELL_REPLAY else cell.geometry
         plan = _capture_plan(
@@ -560,13 +1055,16 @@ class TransactionGraphBinding:
             rows_out = torch.empty_like(expected[0])
             status_out = torch.empty_like(expected[1])
             progress_out = torch.empty_like(expected[2])
+        context = _CaptureContext(inputs, blocks, pages, expected)
         stager = ArenaTransactionStager(arena)
         owned = (rows_out, status_out, progress_out)
+        covers = call.graph_covers_decode
+        vllm_config = self._vllm_config
 
         def body() -> tuple[torch.Tensor, ...]:
             with outer_transaction_capture():
                 result = run_transaction_body(
-                    core, static_ids, static_embeds, inputs, stager
+                    core, static_ids, static_embeds, context.require_inputs(), stager
                 )
                 if result.native_stage is not None or result.records:
                     raise RuntimeError("transaction graph body staged host work")
@@ -580,43 +1078,47 @@ class TransactionGraphBinding:
             return owned
 
         wrapper = runtime.wrapper_factory(
-            body, self._vllm_config, runtime_mode=runtime.graph_mode
+            body, vllm_config, runtime_mode=runtime.graph_mode
         )
+        if graph_pool is not None:
+            wrapper.graph_pool = graph_pool
         descriptor = runtime.descriptor_factory(cell.population)
 
         def launch(mode: Any) -> None:
             with runtime.forward_context(
                 None,
-                self._vllm_config,
+                vllm_config,
                 cudagraph_runtime_mode=mode,
                 batch_descriptor=descriptor,
             ):
                 wrapper()
 
         def matches() -> bool:
+            blocks, pages, expected = context.blocks, context.pages, context.expected
+            assert blocks is not None and pages is not None and expected is not None
             if any(
                 not torch.equal(actual, wanted)
                 for actual, wanted in zip(owned, expected, strict=True)
             ):
                 return False
+            resident = context.require_inputs().pools.sequence()
             return all(
                 torch.equal(pool.index_select(0, blocks), page)
-                for pool, page in zip(pools.sequence(), pages, strict=True)
+                for pool, page in zip(resident, pages, strict=True)
             )
 
-        for _ in range(3):
-            arena.upload(inputs)
-            launch(runtime.eager_mode)
+        # Warm up on the capture stream, so state created lazily per stream
+        # exists before the capture instead of being recorded into it.
+        with _on_stream(capture_stream):
+            for _ in range(3):
+                arena.upload(inputs)
+                launch(runtime.eager_mode)
         if not matches():
             raise RuntimeError(f"transaction eager twin differs for {cell.label}")
         graph = _TransactionGraph(
             cell=cell,
             signature=transaction_signature(
-                core,
-                inputs,
-                static_ids,
-                static_embeds,
-                graph_covers_decode=call.graph_covers_decode,
+                core, inputs, static_ids, static_embeds, graph_covers_decode=covers
             ),
             arena=arena,
             static_ids=static_ids,
@@ -624,6 +1126,9 @@ class TransactionGraphBinding:
             rows_out=rows_out,
             status_out=status_out,
             progress_out=progress_out,
+            wrapper=wrapper,
+            descriptor=descriptor,
+            context=context,
             replay=lambda: launch(runtime.graph_mode),
             warmup_seconds=time.perf_counter() - started,
         )
@@ -633,21 +1138,19 @@ class TransactionGraphBinding:
             reserved = (
                 torch.cuda.memory_reserved(device) if device.type == "cuda" else None
             )
+            captured = context.require_inputs()
             graph.signature = transaction_signature(
-                core,
-                inputs,
-                static_ids,
-                static_embeds,
-                graph_covers_decode=call.graph_covers_decode,
+                core, captured, static_ids, static_embeds, graph_covers_decode=covers
             )
-            arena.upload(inputs)
+            arena.upload(captured)
             runtime.synchronize(device)
-            runtime.set_capture_enabled(True)
-            try:
-                with runtime.capture_context(device):
-                    launch(runtime.graph_mode)
-            finally:
-                runtime.set_capture_enabled(False)
+            with _automatic_gc_paused():
+                runtime.set_capture_enabled(True)
+                try:
+                    with runtime.capture_context(device), _on_stream(capture_stream):
+                        launch(runtime.graph_mode)
+                finally:
+                    runtime.set_capture_enabled(False)
             if reserved is not None:
                 graph.retained_bytes = torch.cuda.memory_reserved(device) - reserved
             graph.capture_seconds = time.perf_counter() - started
@@ -655,7 +1158,7 @@ class TransactionGraphBinding:
         def verify() -> None:
             for value in owned:
                 value.fill_(-1)
-            arena.upload(inputs)
+            arena.upload(context.require_inputs())
             launch(runtime.graph_mode)
             runtime.synchronize(device)
             if not matches():
@@ -664,6 +1167,34 @@ class TransactionGraphBinding:
         graph.capture_graph = capture_graph
         graph.verify = verify
         return graph
+
+    # ------------------------------------------------- post-warmup verification
+    def verify_after_warmup(self, core: Any) -> None:
+        """Check every published cell against what it was captured against.
+
+        Each cell's signature must equal its capture-time signature, and every
+        core-owned buffer the graphs read must keep its capture-time address
+        and size. A mismatch is worker-fatal and latches the binding.
+        """
+        self.check_latch()
+        startup = self._startup
+        if startup is None or not self.ready:
+            raise self._fatal(f"{OPTION}: no serving inventory was published")
+        live = _external_buffers(core)
+        for name, layout in startup.external.items():
+            if live.get(name) != layout:
+                labels = ", ".join(cell.label for cell in self._cells)
+                raise self._fatal(
+                    f"{OPTION}: post-warmup verification failed for cells {labels}: "
+                    f"buffer {name} changed from {layout} to {live.get(name)}"
+                )
+        for cell in self._cells:
+            if self._graphs[cell].signature != startup.signatures[cell]:
+                raise self._fatal(
+                    f"{OPTION}: post-warmup verification failed for cell "
+                    f"{cell.label}: its signature differs from its capture-time "
+                    "signature"
+                )
 
     # ----------------------------------------------------------- execution
     def _fallback(self, cell: TransactionCell | None, reason: str) -> None:
@@ -682,7 +1213,16 @@ class TransactionGraphBinding:
         memory_profile: bool,
         started_ns: int,
     ) -> torch.Tensor | None:
-        """Replay the call's captured cell, or return ``None`` to run eagerly."""
+        """Replay the call's captured cell, or return ``None`` to run eagerly.
+
+        Checks run in a fixed order: the failed latch, the process constants,
+        classification with its mode reasons, the signature and the wrapper
+        entry. Arena upload, static-input copies, the escaped-row allocation and
+        the commit reservation precede ``graph.replay()``. Any failure from the
+        replay onward latches the binding.
+        """
+        self.check_latch()
+        self._verify_process_constants()
         cell, reason = classify_transaction(inputs)
         if inputs.capture:
             reason = "capture"
@@ -708,9 +1248,15 @@ class TransactionGraphBinding:
             self._fallback(cell, reason)
             return None
         assert graph is not None
+        if not graph.holds_graph():
+            raise self._fatal(
+                f"{OPTION}: the wrapper entry of cell {graph.cell.label} no longer "
+                "holds its graph"
+            )
         graph.arena.upload(inputs)
         graph.static_ids.copy_(input_ids)
         graph.static_embeds.copy_(inputs_embeds)
+        rows = allocate_escaped_rows(graph.rows_out)
         cancel: Callable[[], None] | None = None
         stage: Callable[[torch.Tensor], None] | None = None
         if commit_sink is not None:
@@ -726,16 +1272,27 @@ class TransactionGraphBinding:
         prologue_ns = time.perf_counter_ns() - started_ns
         self._prologue_ns_last = prologue_ns
         self._prologue_ns_total += prologue_ns
+        # A runtime that re-executes the body at replay reads these inputs; they
+        # match the captured signature, so the host control flow is the same.
+        graph.context.inputs = inputs
         try:
             graph.replay()
-        except BaseException:
+            rows.copy_(graph.rows_out)
+            if stage is not None:
+                stage(graph.status_out)
+        except BaseException as error:
+            self._latch(
+                f"{graph.cell.label} failed from its replay on: "
+                f"{type(error).__name__}: {error}"
+            )
             if cancel is not None:
-                cancel()
+                with suppress(Exception):
+                    cancel()
             raise
-        if stage is not None:
-            stage(graph.status_out)
+        finally:
+            graph.context.inputs = None
         self._replays[graph.cell] = self._replays.get(graph.cell, 0) + 1
-        return graph.rows_out.clone()
+        return rows
 
     # ------------------------------------------------------------ reporting
     def counters(self) -> dict[str, int]:
@@ -754,13 +1311,14 @@ class TransactionGraphBinding:
         return counts
 
     def receipt(self) -> dict[str, Any]:
-        """Startup coverage and per-cell capture cost.
+        """Startup coverage, admission and per-cell capture cost.
 
-        ``retained_bytes`` is each capture's reserved-memory growth; the cells
-        share one graph pool, so a later, smaller cell often adds nothing and
-        ``retained_bytes_total`` is the pool's growth over all captures.
-        ``warmup_seconds`` covers the cell's eager reference and warm-ups,
-        ``capture_seconds`` its capture and instantiation.
+        ``retained_bytes`` is each serving capture's reserved-memory growth and
+        ``retained_bytes_total`` the serving inventory's; no reuse across cells
+        is assumed. ``warmup_seconds`` covers a cell's eager reference and
+        warm-ups, ``capture_seconds`` its capture and instantiation.
+        ``admission_bytes`` (``A``) and ``serving_bytes`` (``S``) are
+        normalized free-memory differences, ``None`` off CUDA.
         """
         fields = (
             "retained_bytes",
@@ -785,6 +1343,12 @@ class TransactionGraphBinding:
             "worker_pid": os.getpid(),
             "instance_id": self._instance_id,
             "retained_bytes_total": self._retained_bytes_total,
+            "admission_bytes": self._admission_bytes,
+            "serving_bytes": self._serving_bytes,
+            "admission_release_verified": self._admission_release_verified,
+            "admission_capture_seconds": self._admission_seconds,
+            "serving_capture_seconds": self._serving_seconds,
+            "admission_capture_order": list(self._admission_order),
             "cells": [cell_entry(cell) for cell in self._cells],
             "counters": self.counters(),
         }
@@ -815,8 +1379,18 @@ def transaction_graph_counters(target: Any) -> dict[str, int]:
     ``target`` is the Nemotron model or any in-process owner of it (model
     runner, worker, executor or EngineCore). Returns an empty mapping when the
     transaction graph option is off.
+
+    Raises:
+        RuntimeError: the model is not reachable in this process, for example
+            under a multiprocess executor.
+
     """
     model = _resolve_model(target)
+    if model is None:
+        raise RuntimeError(
+            "transaction graph counters cannot reach the Nemotron model in this "
+            "process; read them where the model runs"
+        )
     binding = getattr(model, "_transaction_graph", None)
     if binding is None:
         return {}

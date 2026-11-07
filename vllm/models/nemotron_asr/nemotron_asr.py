@@ -23,6 +23,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.model_executor.layers.state import PersistentStateLayerBase
 from vllm.models.nemotron_asr.advance import (
@@ -32,7 +33,9 @@ from vllm.models.nemotron_asr.advance import (
     EmissionAdapter,
     HostStaging,
     ResolvedDecode,
+    TransactionPools,
     make_mrv1_adapter,
+    warmup_advance_model_rows_scatter,
 )
 from vllm.models.nemotron_asr.batch_invariance import (
     BatchInvariantExecution,
@@ -66,6 +69,7 @@ from vllm.models.nemotron_asr.lid import (
 from vllm.models.nemotron_asr.manifests import (
     CADENCES,
     author_emission_manifest,
+    served_geometry_ids,
 )
 from vllm.models.nemotron_asr.plan import (
     ObservedRow,
@@ -107,21 +111,97 @@ _STFT_FREQ_BINS = 512 // 2 + 1
 _WIN_LENGTH = 400
 
 
-def _served_geometry_ids(hf_config: Any) -> tuple[int, ...]:
-    declared = getattr(
-        hf_config,
-        "supported_num_lookahead_tokens",
-        None,
+def _transaction_graph_populations(vllm_config: Any, hf_config: Any) -> tuple[int, ...]:
+    """Validate the transaction graph envelope; ``()`` means the option is off.
+
+    Raises:
+        ValueError: a configuration error naming the option.
+
+    """
+    declared = getattr(hf_config, "transaction_graph_populations", ())
+    option = "transaction_graph_populations"
+    if not isinstance(declared, (tuple, list)):
+        raise ValueError(f"{option} must be a sequence")
+    if not declared:
+        return ()
+    if getattr(hf_config, "experimental_native_burst", False) is not False:
+        raise ValueError(f"{option} requires experimental_native_burst disabled")
+    arm = getattr(hf_config, "decode_dispatch_arm", None)
+    if arm not in ("dense-graphed", "dense-eager"):
+        raise ValueError(
+            f"{option} requires the dense-graphed or dense-eager decode arm, "
+            f"not {arm!r}"
+        )
+    compilation = getattr(vllm_config, "compilation_config", None)
+    mode = getattr(compilation, "cudagraph_mode", None)
+    if mode != CUDAGraphMode.NONE:
+        raise ValueError(f"{option} requires cudagraph_mode NONE, not {mode}")
+    if getattr(compilation, "cudagraph_mm_encoder", False):
+        raise ValueError(f"{option} requires cudagraph_mm_encoder disabled")
+    lookaheads = getattr(hf_config, "supported_num_lookahead_tokens", None)
+    if lookaheads is None or [int(value) for value in lookaheads] != [0]:
+        raise ValueError(
+            f"{option} serves only g0: supported_num_lookahead_tokens must be "
+            f"[0], not {lookaheads}"
+        )
+    scheduler = vllm_config.scheduler_config
+    bound = min(int(scheduler.max_num_seqs), int(scheduler.max_num_batched_tokens))
+    invalid = ValueError(
+        f"{option} must be distinct integers in 1..{bound}, the smaller of "
+        "max_num_seqs and max_num_batched_tokens"
     )
-    supported = None if declared is None else {int(value) for value in declared}
-    geometries = tuple(
-        index
-        for index, (_label, (_left, right)) in enumerate(CADENCES.items())
-        if supported is None or right in supported
+    if any(type(n) is not int or not 0 < n <= bound for n in declared):
+        raise invalid
+    if len(set(declared)) != len(declared):
+        raise invalid
+    override = getattr(
+        getattr(vllm_config, "cache_config", None), "num_gpu_blocks_override", None
     )
-    if not geometries:
-        raise ValueError("served configuration declares no supported encoder geometry")
-    return geometries
+    if override is not None and max(declared) > int(override) - 1:
+        raise ValueError(
+            f"{option} declares population {max(declared)}, but "
+            f"num_gpu_blocks_override={override} leaves {int(override) - 1} "
+            "non-null state slots"
+        )
+    return tuple(declared)
+
+
+def _transaction_pools(pools: Any) -> TransactionPools:
+    """The transaction's view of projected aggregate state pools."""
+    return TransactionPools(
+        channel=list(pools.channel),
+        time=list(pools.convolution),
+        valid_length=list(pools.valid_length),
+        h=pools.predictor_h,
+        c=pools.predictor_c,
+        queue=pools.replay_queue,
+        book=pools.replay_book,
+        frontend_raw=pools.frontend_raw,
+        frontend_mel=pools.frontend_mel,
+        frontend_counter=pools.frontend_counters,
+        endpoint_history=pools.endpoint_history,
+        endpoint_book=pools.endpoint_book,
+    )
+
+
+def _warm_scatter(pools: TransactionPools) -> None:
+    """Warm every fixed-shape commit specialization of ``pools`` on CUDA."""
+    if pools.queue.device.type != "cuda":
+        return
+    warmup_advance_model_rows_scatter(
+        channel_pools=pools.channel,
+        time_pools=pools.time,
+        len_pools=pools.valid_length,
+        h_pool=pools.h,
+        c_pool=pools.c,
+        queue_pool=pools.queue,
+        book_pool=pools.book,
+        frontend_raw_pool=pools.frontend_raw,
+        frontend_mel_pool=pools.frontend_mel,
+        frontend_counter_pool=pools.frontend_counter,
+        endpoint_history_pool=pools.endpoint_history,
+        endpoint_book_pool=pools.endpoint_book,
+    )
 
 
 class NemotronASRCore(nn.Module):
@@ -384,6 +464,9 @@ class NemotronASRForRNNT(nn.Module):
                 "given, vLLM's auto policy downcasts float32 checkpoints "
                 "on SM80+ GPUs. Pass --dtype float32."
             )
+        # The option's envelope is checked before every other mode rejection,
+        # so each rejection of an option-on configuration names the option.
+        transaction_populations = _transaction_graph_populations(vllm_config, hf_config)
         # Pool sizing is resolved after vLLM's real memory profile in the
         # common worker. The model constructor deliberately does not invent
         # physical capacity or mutate ``num_gpu_blocks_override``.
@@ -439,12 +522,12 @@ class NemotronASRForRNNT(nn.Module):
                 max_tokens=native_burst_token_budget(hf_config)
             )
         self._max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
-        served_geometry_ids = _served_geometry_ids(hf_config)
+        served_geometries = served_geometry_ids(hf_config)
         self._encoder_execution = build_encoder_execution(
             self.core,
             hf_config,
             maximum_population=self._max_num_seqs,
-            warmup_geometries=served_geometry_ids,
+            warmup_geometries=served_geometries,
             vllm_config=vllm_config,
         )
         self._decode_graph_binding = None
@@ -454,7 +537,7 @@ class NemotronASRForRNNT(nn.Module):
                 execution_tiers,
             )
 
-            served_geometry_set = set(served_geometry_ids)
+            served_geometry_set = set(served_geometries)
             self._decode_graph_binding = DenseGraphBinding(
                 batch_invariant_mode=self.core.batch_invariant_mode,
                 decode_fn=decode_dense_masked_frames,
@@ -501,27 +584,18 @@ class NemotronASRForRNNT(nn.Module):
                 chunk_populations,
             )
         self._transaction_graph = None
-        transaction_populations = getattr(
-            hf_config, "transaction_graph_populations", ()
-        )
-        if not isinstance(transaction_populations, (tuple, list)):
-            raise ValueError("transaction_graph_populations must be a sequence")
         if transaction_populations:
             from vllm.models.nemotron_asr.transaction_graph import (
                 TransactionGraphBinding,
             )
 
-            if native_burst_enabled:
-                raise ValueError("transaction graphs require native burst disabled")
-            if getattr(hf_config, "decode_dispatch_arm", None) not in (
-                "dense-graphed",
-                "dense-eager",
-            ):
-                raise ValueError("transaction graphs require a dense decode arm")
+            scheduler = vllm_config.scheduler_config
             self._transaction_graph = TransactionGraphBinding(
                 populations=list(transaction_populations),
-                geometries=served_geometry_ids,
-                maximum_population=self._max_num_seqs,
+                geometries=served_geometries,
+                maximum_population=min(
+                    self._max_num_seqs, int(scheduler.max_num_batched_tokens)
+                ),
                 vllm_config=vllm_config,
             )
         self._commit_sink: BoundedCommitSink | None = None
@@ -706,7 +780,7 @@ class NemotronASRForRNNT(nn.Module):
             resident_request_ids=resident_request_ids,
             placeholder_id=int(self.config.audio_chunk_token_id),
             num_prompts=int(self.core.lid.num_prompts),
-            num_geometries=len(CADENCES),
+            served_geometries=served_geometry_ids(self.config),
             now_ns=time.time_ns(),
             step=self._plan_step,
         )
@@ -791,7 +865,7 @@ class NemotronASRForRNNT(nn.Module):
 
         expected = {
             (geometry, tier)
-            for geometry in _served_geometry_ids(self.config)
+            for geometry in served_geometry_ids(self.config)
             for tier in execution_tiers(self._max_num_seqs)
         }
         expected = {
@@ -829,6 +903,20 @@ class NemotronASRForRNNT(nn.Module):
             if chunk_binding is not None:
                 chunk_binding.warmup(device)
             self._require_execution_inventory_ready()
+            # The admission inventory stays retained through the eager profiles
+            # and the window close, so both are charged before capacity is fixed.
+            transaction_graph = getattr(self, "_transaction_graph", None)
+            if transaction_graph is not None:
+                from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
+                transaction_graph.admit(
+                    self.core,
+                    allocate=lambda slots: self._admission_storage(slots, device),
+                    call=self._transaction_call_bindings(),
+                    hidden_size=int(self.config.hidden_size),
+                    device=device,
+                    null_block_id=int(NULL_BLOCK_ID),
+                )
             # All retained graph buffers must coexist with this temporary
             # transaction so the profiler sees their combined high-water mark.
             if chunk_binding is not None:
@@ -846,7 +934,7 @@ class NemotronASRForRNNT(nn.Module):
                 self,
                 num_rows=self._max_num_seqs,
                 device=device,
-                geometry_id=max(_served_geometry_ids(self.config)),
+                geometry_id=max(served_geometry_ids(self.config)),
                 ready_domain=True,
             )
             self._require_execution_inventory_ready()
@@ -857,90 +945,90 @@ class NemotronASRForRNNT(nn.Module):
             raise
         self._execution_memory_prepared = True
 
+    def _admission_storage(self, slots: int, device: torch.device) -> Any:
+        """Stand-in storage of ``slots`` real-layout pages and its pools."""
+        from vllm.models.nemotron_asr import state_profile
+
+        scratch = state_profile.allocate_state_scratch(
+            build_nemotron_persistent_state_spec(self.config), slots, device
+        )
+        pools = _transaction_pools(
+            state_profile.project_nemotron_state_pools(
+                scratch, n_layers=int(self.config.n_layers)
+            )
+        )
+        _warm_scatter(pools)
+        return scratch.raw, pools
+
+    def _transaction_call_bindings(self) -> Any:
+        """The call bindings both transaction graph inventories capture."""
+        from vllm.models.nemotron_asr.transaction_graph import (
+            TransactionCallBindings,
+        )
+
+        graph_binding = self._decode_graph_binding
+        tier = (
+            {}
+            if graph_binding is None
+            else {"execution_tier": graph_binding.execution_tier}
+        )
+        return TransactionCallBindings(
+            adapter=self._emission_adapter,
+            decode_resolver=self._decode_resolver,
+            encoder_transition=self._encoder_execution.transition,
+            bucket_transition=getattr(self, "_chunk_bucket_binding", None),
+            placeholder_id=int(self.config.audio_chunk_token_id),
+            park_id=int(self.config.eos_token_id),
+            eou_token_id=int(self.config.eou_token_id),
+            graph_covers_decode=graph_binding is not None,
+            **tier,
+        )
+
     @torch.inference_mode()
     def capture_transaction_graphs(self, storage: Any) -> None:
         """Capture the declared transaction cells over allocated resident pools.
 
         ``storage`` exposes the aggregate state group's ``spec`` and named
-        component ``views``. Runs once the execution inventory is ready; a later
-        call with relocated pools recaptures.
+        component ``views``. Runs once the execution inventory is ready. A
+        repeated call over identical pools and call bindings is a verified
+        no-op; any change, or a failed capture, is worker-fatal.
         """
         binding = self._transaction_graph
         if binding is None:
             return
-        from vllm.models.nemotron_asr.advance import (
-            TransactionPools,
-            warmup_advance_model_rows_scatter,
-        )
         from vllm.models.nemotron_asr.state_profile import (
             project_nemotron_state_pools,
-        )
-        from vllm.models.nemotron_asr.transaction_graph import (
-            TransactionCallBindings,
         )
         from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
         self._require_execution_inventory_ready()
-        pools = project_nemotron_state_pools(
-            storage, n_layers=int(self.config.n_layers)
+        resident = _transaction_pools(
+            project_nemotron_state_pools(storage, n_layers=int(self.config.n_layers))
         )
-        resident = TransactionPools(
-            channel=list(pools.channel),
-            time=list(pools.convolution),
-            valid_length=list(pools.valid_length),
-            h=pools.predictor_h,
-            c=pools.predictor_c,
-            queue=pools.replay_queue,
-            book=pools.replay_book,
-            frontend_raw=pools.frontend_raw,
-            frontend_mel=pools.frontend_mel,
-            frontend_counter=pools.frontend_counters,
-            endpoint_history=pools.endpoint_history,
-            endpoint_book=pools.endpoint_book,
-        )
-        device = pools.replay_queue.device
-        if device.type == "cuda":
-            warmup_advance_model_rows_scatter(
-                channel_pools=resident.channel,
-                time_pools=resident.time,
-                len_pools=resident.valid_length,
-                h_pool=resident.h,
-                c_pool=resident.c,
-                queue_pool=resident.queue,
-                book_pool=resident.book,
-                frontend_raw_pool=resident.frontend_raw,
-                frontend_mel_pool=resident.frontend_mel,
-                frontend_counter_pool=resident.frontend_counter,
-                endpoint_history_pool=resident.endpoint_history,
-                endpoint_book_pool=resident.endpoint_book,
-            )
-        graph_binding = self._decode_graph_binding
         try:
+            if not binding.serving_captured:
+                _warm_scatter(resident)
             binding.capture(
                 self.core,
                 pools=resident,
-                call=TransactionCallBindings(
-                    adapter=self._emission_adapter,
-                    decode_resolver=self._decode_resolver,
-                    encoder_transition=self._encoder_execution.transition,
-                    bucket_transition=getattr(self, "_chunk_bucket_binding", None),
-                    placeholder_id=int(self.config.audio_chunk_token_id),
-                    park_id=int(self.config.eos_token_id),
-                    eou_token_id=int(self.config.eou_token_id),
-                    graph_covers_decode=graph_binding is not None,
-                    execution_tier=(
-                        graph_binding.execution_tier
-                        if graph_binding is not None
-                        else (lambda population: 0)
-                    ),
-                ),
+                call=self._transaction_call_bindings(),
                 hidden_size=int(self.config.hidden_size),
-                device=device,
+                device=resident.queue.device,
                 null_block_id=int(NULL_BLOCK_ID),
             )
         except Exception:
             binding.discard()
             raise
+
+    def verify_transaction_graphs(self) -> None:
+        """Verify every published transaction cell after the worker warmups.
+
+        Until a core post-warmup hook exists, the model state runs this once on
+        the first non-dummy step. A mismatch is worker-fatal.
+        """
+        binding = getattr(self, "_transaction_graph", None)
+        if binding is not None:
+            binding.verify_after_warmup(self.core)
 
     def execution_profile_receipt(self) -> dict[str, Any]:
         """Report the resolved execution arms and startup coverage."""

@@ -106,6 +106,7 @@ class NemotronASRModelState(ModelState):
         self._scheduled_encoder_inputs: dict[str, list[int]] = {}
         self._features: torch.Tensor | None = None
         self._scheduled_tokens: dict[str, tuple[int, ...]] = {}
+        self._transaction_graphs_verified = False
 
     def initialize_state_slots(self, bindings: StateSlotBindings) -> None:
         super().initialize_state_slots(bindings)
@@ -136,6 +137,15 @@ class NemotronASRModelState(ModelState):
             raise ValueError("profile execution requires a dummy run")
         if dummy_run:
             return
+        # The first real step stands in for a post-warmup hook: it verifies the
+        # transaction graphs once, and every real step honours their latch,
+        # before any registry, slot or request state changes.
+        transaction_graph = getattr(self.model, "_transaction_graph", None)
+        if transaction_graph is not None:
+            transaction_graph.check_latch()
+            if not getattr(self, "_transaction_graphs_verified", False):
+                self.model.verify_transaction_graphs()
+                self._transaction_graphs_verified = True
         cached = scheduler_output.scheduled_cached_reqs
         if len(cached.req_ids) != len(cached.new_token_ids):
             raise ValueError("state step omitted cached host token slices")
