@@ -649,7 +649,9 @@ def test_nemotron_engine_transaction_graph_admission_is_charged(monkeypatch):
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     # Zero cudagraph estimate: peak_activation_memory is then the peak headroom.
     monkeypatch.setenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "0")
-    max_num_seqs = 8
+    # Room above the target page count so memory, not max_num_seqs + 1, binds
+    # even though later engines in one process consume tens of MiB less.
+    max_num_seqs = 64
     option = {**_G0_BASE_OVERRIDES, "transaction_graph_populations": [1]}
     first, off = [
         _startup_memory(
@@ -675,8 +677,8 @@ def test_nemotron_engine_transaction_graph_admission_is_charged(monkeypatch):
         assert arm["peak_resets"] == [], figures
         assert arm["available"] == arm["requested"] - arm["non_kv"], figures
 
-    # Aim the budget at 5.5 pages so memory, not max_num_seqs + 1, binds.
-    utilization = (on["non_kv"] + 5.5 * on["page"]) / on["total"]
+    # Aim the budget at 32.5 pages, well inside 2..max_num_seqs + 1.
+    utilization = (on["non_kv"] + 32.5 * on["page"]) / on["total"]
     bound = _startup_memory(option, utilization, max_num_seqs)
     assert bound["peak_resets"] == [], bound
     assert 2 <= bound["count"] < max_num_seqs + 1, bound

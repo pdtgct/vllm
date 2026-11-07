@@ -4376,8 +4376,21 @@ def _segment_pools() -> set[Any]:
     }
 
 
+@pytest.fixture
+def spawnable_module(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Let a spawned child import this module by its top-level name.
+
+    This directory is not a package, so pytest imports the module as
+    ``test_transaction_graph``; the child resolves that name on ``PYTHONPATH``.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    paths = [here, *filter(None, [os.environ.get("PYTHONPATH")])]
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(paths))
+
+
 @pytest.mark.nemotron_gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("spawnable_module")
 @create_new_process_for_each_test(method="spawn")
 @_exact_fp32()
 @torch.inference_mode()
@@ -4412,6 +4425,7 @@ def test_cuda_admission_and_serving_capture_share_cell_order(
 
 @pytest.mark.nemotron_gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("spawnable_module")
 @create_new_process_for_each_test(method="spawn")
 @_exact_fp32()
 @torch.inference_mode()
@@ -4432,6 +4446,7 @@ def test_cuda_serving_pool_is_distinct_from_released_admission_pool(
 
 @pytest.mark.nemotron_gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("spawnable_module")
 @create_new_process_for_each_test(method="spawn")
 @_exact_fp32()
 @torch.inference_mode()
