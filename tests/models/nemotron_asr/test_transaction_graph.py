@@ -720,7 +720,9 @@ def _tracking_clones(clones: list[weakref.ref[torch.Tensor]]) -> Iterator[None]:
     """Append a weak reference to every tensor copied in the scope.
 
     Covers ``Tensor.clone``, ``torch.clone`` and ``torch.empty_like``, the
-    allocation an ``empty_like(...).copy_(...)`` copy starts from.
+    allocation an ``empty_like(...).copy_(...)`` copy starts from. A copy built
+    from a bare ``torch.empty`` is not tracked; capture code copies through
+    these three.
     """
 
     def tracked(allocate: Callable[..., torch.Tensor]) -> Callable[..., Any]:
@@ -755,16 +757,26 @@ _PERSISTENT_CELL_BUFFERS = (
 def _persistent_storage(graph: Any) -> set[int]:
     """Storage addresses a published cell may own after verification.
 
-    These are its arena's device and host buffers, static inputs and owned
-    outputs; nothing else from capture may outlive it (Capture-lifetime rule).
+    These are its arena's one device buffer and two pinned host buffers,
+    static inputs and owned outputs; nothing else from capture may outlive it
+    (Capture-lifetime rule). Arena views must alias the device buffer, so a
+    copy kept among them still counts as live.
     """
     arena = graph.arena
+    host = list(arena._host)
+    assert len(host) == 2, "an arena owns exactly two host buffers"
+    device = arena._device.untyped_storage().data_ptr()
     tensors = [getattr(graph, name) for name in _PERSISTENT_CELL_BUFFERS]
-    tensors += [*arena.views.values(), *getattr(arena, "_host", ())]
-    return {
+    tensors += [arena._device, *host]
+    allowed = {
         tensor.untyped_storage().data_ptr()
         for tensor in tensors
         if tensor.untyped_storage().nbytes()
+    }
+    return allowed | {
+        view.untyped_storage().data_ptr()
+        for view in arena.views.values()
+        if view.untyped_storage().data_ptr() == device
     }
 
 
@@ -3708,8 +3720,21 @@ def test_published_cell_retains_no_capture_context(
             torch.clone(page),
             torch.empty_like(page).copy_(page),
         )
-    del graph
     assert _live_capture_clones([leaked]) == 3, "a snapshot kept on a graph counts"
+    del graph.page_snapshots
+    with _tracking_clones(leaked.clones):
+        kept = page.clone()
+    views = {**graph.arena.views, "snapshot": kept}
+    graph.arena.views = views
+    del kept
+    assert _live_capture_clones([leaked]) == 1, "a snapshot among arena views counts"
+    graph.arena.views = {k: v for k, v in views.items() if k != "snapshot"}
+    del views
+    with _tracking_clones(leaked.clones):
+        graph.arena._host.append(page.clone())
+    with pytest.raises(AssertionError, match="two host buffers"):
+        _live_capture_clones([leaked])
+    del graph.arena._host[-1], graph
 
 
 @pytest.mark.cpu_test
@@ -4576,6 +4601,7 @@ def test_cuda_replay_runs_on_the_current_stream(
     saved = pool[1:2].clone()
     other = torch.cuda.Stream(device)
     other.wait_stream(side)
+    other.wait_stream(torch.cuda.current_stream())
     writes = {
         "fill": lambda: pool[1:2].fill_(0),
         "indexed-assignment": lambda: pool.__setitem__(block, saved),
@@ -4584,6 +4610,7 @@ def test_cuda_replay_runs_on_the_current_stream(
         with _stream_trace(monkeypatch, targets) as stray, torch.cuda.stream(other):
             write()
         other.synchronize()
+        assert ("resident", other.cuda_stream) in stray, stray
         with pytest.raises(AssertionError):
             _assert_on_stream(stray, side.cuda_stream, {"resident"})
 
