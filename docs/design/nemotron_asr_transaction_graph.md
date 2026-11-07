@@ -82,14 +82,14 @@ g1 is unmeasured.
 
 `advance_model_rows` has three phases with one launch boundary:
 
-1. `prepare_transaction` (`advance.py:2910`) is the host prologue: structural
+1. `prepare_transaction` (`advance.py:2911`) is the host prologue: structural
    preflight, decode resolution, CHUNK bucket formation, per-step batch stats
-   (`advance.py:3148`) and every host-only check. It produces
+   (`advance.py:3149`) and every host-only check. It produces
    `TransactionInputs` and touches no resident page.
-2. `run_transaction_body` (`advance.py:3251`) is the device body: gathers,
+2. `run_transaction_body` (`advance.py:3252`) is the device body: gathers,
    frontend, encoder, decode, projection, row status, progress and the
    complete scatter plan. The whole plan is validated before any scatter.
-3. `commit_transaction_body` (`advance.py:4105`) makes one composite
+3. `commit_transaction_body` (`advance.py:4107`) makes one composite
    reservation, launches the prevalidated predicated scatters, then performs
    the no-fail stage.
 
@@ -121,7 +121,7 @@ pre-boundary contract (Failure Containment).
 
 ### Cells and classification
 
-A `TransactionCell` (`transaction_graph.py:47`) is `(kind, geometry,
+A `TransactionCell` (`transaction_graph.py:62`) is `(kind, geometry,
 population)`, where population is the exact real-row count. Only rows in the
 step count: admitted, parked or never-fed slots without a row in the step
 never contribute to its population.
@@ -132,7 +132,7 @@ never contribute to its population.
 | `chunk-continuing` | one CHUNK bucket, no fresh row |
 | `replay` | no CHUNK row and no fresh row: REPLAY, park-echo, FLUSH, forced-endpoint |
 
-`classify_transaction` (`transaction_graph.py:67`) returns the cell, or the
+`classify_transaction` (`transaction_graph.py:81`) returns the cell, or the
 reason the call has none. A declined call runs eager and is counted under
 `(cell or "uncovered", reason)`:
 
@@ -157,13 +157,13 @@ records their kernels directly rather than nested graph launches.
 `capture_scope.py` holds a `ContextVar`: while `outer_transaction_capture` is
 active, `nested_graph_mode` returns the eager mode (`capture_scope.py:37`), and
 every nested launch site consults it (`encoder_execution.py:1566`, `:1633`,
-`decode_graph.py:423`, `chunk_bucket_graph.py:253`). Host-to-device staging
+`decode_graph.py:451`, `chunk_bucket_graph.py:253`). Host-to-device staging
 inside the scope raises (`capture_scope.py:44`, `advance.py:1601`), because a
 captured copy would replay a frozen pinned source.
 
 ### Inputs, outputs and signature
 
-- **Arena.** Each cell owns a `TransactionArena` (`transaction_graph.py:163`):
+- **Arena.** Each cell owns a `TransactionArena` (`transaction_graph.py:270`):
   one device buffer holding every int64/bool vector the body reads, plus two
   pinned host buffers that alternate per call. Each host buffer is fenced by
   an event, so it is rewritten only after its previous upload has completed.
@@ -172,7 +172,7 @@ captured copy would replay a frozen pinned source.
   `static_embeds` receive the call's inputs before replay. Inside the graph,
   projection rows, status and progress are copied into per-cell buffers
   allocated outside the graph pool, so no pool tensor outlives a replay.
-- **Signature.** `transaction_signature` (`transaction_graph.py:115`) covers
+- **Signature.** `transaction_signature` (`transaction_graph.py:141`) covers
   every structural input the body bakes in: population, control ids,
   `endpoint_enabled`, `n_fresh`, decode and transition callable identities,
   resident pool layouts (address, shape, stride), lazily bound encoder
@@ -191,8 +191,8 @@ join the signature or the cell key before its cell is published. Within one
 cell and signature the graph is data-independent.
 
 Nested host-side checks and counters run only while a cell is captured and
-are frozen under replay: `_validate_result_structure` (`advance.py:3537`), the
-guarded-transition invocation counters (`encoder_execution.py:830`, `:2149`)
+are frozen under replay: `_validate_result_structure` (`advance.py:3539`), the
+guarded-transition invocation counters (`encoder_execution.py:830`, `:2180`)
 and the CHUNK binding's fallback counts (`chunk_bucket_graph.py:483`). For
 replayed steps, encoder invocation counts and CHUNK-binding fallback counts
 do not advance; per-step batch stats still do, because the prologue stages
@@ -200,7 +200,7 @@ them. The transaction counters are the per-replay record.
 
 ### Capture and the replay-cell oracle
 
-Capturing a cell (`transaction_graph.py:479`) runs an eager reference on
+Capturing a cell (`transaction_graph.py:1152`) runs an eager reference on
 capture rows the transaction rejects (so no page is stored), three eager
 warm-ups through the wrapper, the capture, and a replay that must reproduce the
 reference outputs and pages bitwise before the cell is published. That
@@ -209,15 +209,15 @@ tests that drive accepted rows of every kind through replay and compare with
 eager bitwise, including `replay` cells carrying accepted FLUSH and park-echo
 rows with endpointing on and off, and accepted forced-endpoint rows with
 endpointing on. With endpointing off the forced-endpoint control is not
-recognized (`advance.py:3420-3428`), so such a row is rejected, under replay
+recognized (`advance.py:3421-3429`), so such a row is rejected, under replay
 exactly as under eager.
 
 ### Callable identity
 
 The signature compares decode and CHUNK callables by `id`. This is sound
 because the dense decode binding caches one callable per graph key for the
-binding's lifetime (`decode_graph.py:463-470`), and the CHUNK binding accepts
-only its sealed callables (`chunk_bucket_graph.py:474-476`). Ids are not reused
+binding's lifetime (`decode_graph.py:374-379`), and the CHUNK binding accepts
+only its sealed callables (`chunk_bucket_graph.py:468-476`). Ids are not reused
 while those objects are alive. A resolver that rebuilds closures per call would
 require a different identity mechanism in the signature.
 
@@ -254,7 +254,7 @@ construction, each failure a configuration error naming the option:
 
 When memory, not the `max_num_seqs + 1` cap, binds capacity, the usable slot
 count is known only after profiling. In that case the serving-capture slot
-check (`transaction_graph.py:430`) fails startup.
+check (`transaction_graph.py:1048`) fails startup.
 
 ### g0 only: configuration and row admission
 
@@ -310,7 +310,7 @@ Runner shutdown discards the binding's graphs, arenas and owned buffers.
 `GPUModelRunner.shutdown` calls no model or `ModelState` discard hook
 (`model_runner.py:2483-2511`). Discard on shutdown therefore needs a core
 `ModelState` shutdown hook (Core Obligations). The model provides
-`TransactionGraphBinding.discard()` (`transaction_graph.py:396`). Until the
+`TransactionGraphBinding.discard()` (`transaction_graph.py:779`). Until the
 hook exists the model takes no shutdown action: `shutdown` drops
 `model_state` (`model_runner.py:2510-2511`), and graphs, arenas and owned
 buffers are released with the model object.
@@ -331,7 +331,7 @@ fallbacks. A change is worker-fatal, because
 an eager fallback would also run against nested graphs captured under the old
 settings. Sleep mode and the CuMem allocator are rejected for
 all persistent state (`vllm/v1/core/state_slot_manager.py:52-53`), as is weight
-reload after execution materialization (`nemotron_asr.py:552-556`).
+reload after execution materialization (`nemotron_asr.py:632-636`).
 
 ### Invariants
 
@@ -366,7 +366,7 @@ reload after execution materialization (`nemotron_asr.py:552-556`).
 - `profile_run` calls the model's `prepare_execution_memory` inside that window
   (`vllm/v1/worker/gpu/model_runner.py:1071-1073`). That hook retains the
   nested inventory and runs eager profile transactions alongside it
-  (`nemotron_asr.py:805-859`).
+  (`nemotron_asr.py:885-952`).
 - The budget is the memory left after `non_kv_cache_memory`, or
   `kv_cache_memory_bytes` when that is set. Resident capacity for persistent
   state is `count = min(budget // page_size_bytes, max_num_seqs + 1)` pages.
@@ -490,7 +490,7 @@ failure until their obligations land (Core Obligations).
 
 - Admission does not fit (capture failure or OOM in the window):
   `prepare_execution_memory` fails and latches `_execution_memory_failed`
-  (`nemotron_asr.py:812-816`).
+  (`nemotron_asr.py:947-951`).
 - Release not verified, or too few usable slots.
 - No capacity: core budget validation rejects the persistent-state budget,
   because fewer than two pages fit or a `num_gpu_blocks_override` exceeds the
@@ -548,7 +548,7 @@ the checks before it run in the Execute order.
 has a nonzero status, its pages stay unchanged and the step's other rows
 commit. Under replay exactly as under eager, its status flows through
 commit-sink collection, which classifies it as eager does: a terminal
-rejection goes to `state_slots.fail_requests` (`model_state_v2.py:292-295`)
+rejection goes to `state_slots.fail_requests` (`model_state_v2.py:315-318`)
 and core finishes that request with an error, while a recoverable status
 (`ROW_STATUS_GEOMETRY`, `commit_sink.py:74`) does not fail the request. Such a
 step neither raises nor latches the binding.
@@ -594,7 +594,7 @@ requirement `cudagraph_mode == NONE` keeps the runner's graph estimator
   engine dead (`core.py:1668-1674`).
 - Asynchronous device faults surface at the next synchronizing call, normally
   the commit-sink collection (`commit_sink.py:270`, via
-  `model_state_v2.py:292`), which fails before any progress is published and
+  `model_state_v2.py:315`), which fails before any progress is published and
   propagates to the same engine-death path. Collection runs outside
   `execute`, so it does not latch the binding; the engine, not the model,
   stops later steps. Faults are not attributed to cells and not resumed.
@@ -624,7 +624,7 @@ cell's next replay. The commit sink consumes them earlier in the step.
 - `vllm.models.nemotron_asr.transaction_graph:transaction_graph_counters` (its
   path on this branch) takes a model, runner, worker, executor or in-process
   EngineCore. It reaches the model by walking runner and worker attributes
-  (`_resolve_model`, `transaction_graph.py:793-810`), a harness convenience,
+  (`_resolve_model`, `transaction_graph.py:1598-1614`), a harness convenience,
   not a core contract. It returns
   host-only counts that never synchronize: captured cells, replays per cell,
   fallbacks per `(cell, reason)`, and prologue time. With the option off it
@@ -803,7 +803,7 @@ that does not exist yet. "Eager" means the same call through
 page tensor. A "configuration error" is a `ValueError` whose message contains
 `transaction_graph_populations`. "`endpoint_enabled` true" and "false" name the
 two pool configurations: endpoint history and book pools and `eou_token_id`
-present, or all absent (`advance.py:3029-3035`); neither is a step policy.
+present, or all absent (`advance.py:3030-3043`); neither is a step policy.
 "Endpoint" always means utterance endpointing, never endpoint plugins.
 Arena-only data flow into a replayed cell is a CUDA-level property, observed by
 TXG-REP-010, TXG-REP-011 and TXG-REP-017; the CPU re-executing runtime re-runs
