@@ -112,8 +112,12 @@ stages status.
 8. the commit reservation;
 9. `graph.replay()`, then status staging and the replay counter.
 
-A call declined at step 3 or 4 increments its fallback counter and returns for
-eager execution. A fatal raise at step 1, 2 or 5 increments no counter.
+A call declined at step 3 or 4 (no cell, an undeclared population, a mode
+reason or a signature mismatch) increments its fallback counter and returns for
+eager execution; the wrapper-entry check at step 5 is reached only by a call
+that passed both. An exception raised at any step increments no counter: at
+step 1, 2 or 5 it is worker-fatal; at steps 3, 4 and 6 to 8 it follows the
+pre-boundary contract (Failure Containment).
 
 ### Cells and classification
 
@@ -524,9 +528,11 @@ the checks before it run in the Execute order.
 **Per-row rejections are not step failures.** A row the transaction rejects
 has a nonzero status, its pages stay unchanged and the step's other rows
 commit. Under replay exactly as under eager, its status flows through
-commit-sink collection into `state_slots.fail_requests`
-(`model_state_v2.py:292-295`), and core finishes that request with an error.
-Such a step neither raises nor latches the binding.
+commit-sink collection, which classifies it as eager does: a terminal
+rejection goes to `state_slots.fail_requests` (`model_state_v2.py:292-295`)
+and core finishes that request with an error, while a recoverable status
+(`ROW_STATUS_GEOMETRY`, `commit_sink.py:74`) does not fail the request. Such a
+step neither raises nor latches the binding.
 
 **Unchanged-state baseline.** "Unchanged" means the resident state after core
 slot initialization in `begin_step` (`model_runner.py:1845`,
@@ -560,8 +566,9 @@ requirement `cudagraph_mode == NONE` keeps the runner's graph estimator
   host counter updates run.
 - Any exception from the replay onward, including `CommitTicket.stage` failing
   after it has set `_done` (`commit_sink.py:95-105`), latches the binding as
-  failed and propagates. The ticket's release state after a partial stage is
-  irrelevant because the worker is never reused; later `execute` calls raise
+  failed and propagates. Cancellation of the reservation is attempted on
+  every such raise; its outcome, including the ticket's state after a partial
+  stage, is irrelevant because the worker is never reused; later `execute` calls raise
   "a fresh worker is required".
 - In the engine, the exception leaves `execute_model`, is re-raised from
   `step` (`vllm/v1/engine/core.py:728`, `:623`), and the busy loop signals the
@@ -627,8 +634,12 @@ gates (pooling model, `max_num_reqs < 2`, `num_tokens < 3`, too few blocks;
 
 This design places the obligations below on the core persistent-state design.
 At the RFC 1 PR revision (`574efbd8f6`), none is yet recorded in that design;
-each is tracked by the criteria named, and the core-side criteria are deferred
-until core lands the obligation.
+each is tracked by the criteria named. TXG-CORE-001 and TXG-CORE-002 track the
+carried warmup fix and are testable now on this branch. TXG-VER-004,
+TXG-LIFE-007, TXG-LIFE-008, TXG-MEM-011 and TXG-MEM-012 are deferred until
+core lands their obligation. Core-side criteria name a model-supplied
+contributor label rather than this model's option, so core tests stay
+independent of the out-of-tree model.
 
 1. **Persistent-state mixed-warmup skip.** `run_mixed_prefill_decode_warmup`
    skips persistent-state groups. This branch carries the fix (Core
@@ -832,9 +843,9 @@ present, or all absent (`advance.py:3029-3035`); neither is a step policy.
 - **TXG-ENV-006**: When `transaction_graph_populations` is non-empty and `num_gpu_blocks_override` is set, if any declared population exceeds `num_gpu_blocks_override - 1` (the non-null slot count), then the model shall raise a configuration error at construction.
   - Design: Supported Envelope
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_population_declaration_respects_block_override` (new) [CPU]
-- **TXG-ENV-007**: When a request envelope names a geometry outside the configured served geometry set (`supported_num_lookahead_tokens`), with or without `transaction_graph_populations`, `NemotronASRMultiModalProcessor` shall reject that input with an error before the offending input reaches engine execution; for an unadmitted request nothing is admitted, and for an admitted stream (whose empty stream RFC 1 admits before any input) the stream's abort and fenced retirement are the core-owned frontend-preprocessing-failure path; in both cases other concurrently served sessions shall produce the tokens they produce without that request.
+- **TXG-ENV-007**: When a request envelope names a geometry outside the configured served geometry set (`supported_num_lookahead_tokens`), with or without `transaction_graph_populations`, `NemotronASRMultiModalProcessor` shall reject that input with an error before the offending input reaches engine execution; for an unadmitted request nothing is admitted, and for an admitted stream (whose empty stream RFC 1 admits before any input) the stream's abort and fenced retirement are the core-owned frontend-preprocessing-failure path; because the rejection happens in the frontend processor, the offending input never reaches `bind_rows` (TXG-ENV-008), and other sessions' isolation follows from that core-owned abort path.
   - Design: g0 only: configuration and row admission
-  - Test: `tests/models/nemotron_asr/test_processor.py::test_envelope_outside_served_geometries_is_rejected` (new) [CPU]; `tests/v1/engine/test_nemotron_asr.py::test_nemotron_engine_off_set_geometry_request_fails_alone` (new) [engine-CUDA]
+  - Test: `tests/models/nemotron_asr/test_processor.py::test_envelope_outside_served_geometries_is_rejected` (new; drives `NemotronASRMultiModalProcessor` directly, the path the in-process engine tests bypass) [CPU]
 - **TXG-ENV-008**: If a row's envelope header names a geometry outside the configured served geometry set, with or without `transaction_graph_populations`, then `bind_rows` shall raise a host structural failure before its delta commit, leaving the session registry unchanged and running no transaction, eager or replayed, for that step.
   - Design: g0 only: configuration and row admission
   - Test: `tests/models/nemotron_asr/test_plan_local.py::test_bind_rows_rejects_geometry_outside_served_set` (new) [CPU]
@@ -862,21 +873,21 @@ present, or all absent (`advance.py:3029-3035`); neither is a step policy.
 - **TXG-MEM-007**: When `transaction_graph_populations` is non-empty and neither `num_gpu_blocks_override` nor `kv_cache_memory_bytes` is set, `non_kv_cache_memory` from the memory-profiling window shall include the retained admission inventory and the admission preparation and capture peak, with no deduction for retained memory the peak headroom also counts, so resident capacity is fixed from the remaining budget; and the admission holder shall be alive when `prepare_execution_memory` returns, stay alive through the eager profile transactions and the window close, and be released only in `capture_transaction_graphs`.
   - Design: Budget mechanics; Ordering
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_admission_holder_lives_until_serving_capture` (new; event order of holder release against `prepare_execution_memory` return, eager profiles, window close and `capture_transaction_graphs`) [CPU]; `tests/v1/engine/test_nemotron_asr.py::test_nemotron_engine_transaction_graph_admission_is_charged` (new; option-on minus option-off: `non_kv_cache_memory >= A` as the integration check, `total_consumed >= A` for retention, `transient_peak_headroom` not smaller, and a memory-bound run whose block count equals the count core derives from the reduced budget) [engine-CUDA]
-- **TXG-MEM-008**: When `transaction_graph_populations` is non-empty and `num_gpu_blocks_override` or `kv_cache_memory_bytes` is set, the model shall still measure and report `A` and check `S <= A` under either override; once core budget validation has accepted the configuration, the resident block count shall equal `num_gpu_blocks_override` when it is set, and otherwise the count `kv_cache_memory_bytes` determines; and if serving capture then raises or runs out of memory, then startup shall fail with an admission-failure error naming `transaction_graph_populations`. Planner rejection of an oversized override is TXG-MEM-011 and KV-allocation failure is TXG-MEM-012, both core-owned.
+- **TXG-MEM-008**: When `transaction_graph_populations` is non-empty and `num_gpu_blocks_override` or `kv_cache_memory_bytes` is set, the model shall still measure and report `A` and check `S <= A` under either override, and shall not itself change the resident block count, which core derives from the override once its budget validation accepts the configuration; and if serving capture then raises or runs out of memory, then startup shall fail with an admission-failure error naming `transaction_graph_populations`. Planner rejection of an oversized override is TXG-MEM-011 and KV-allocation failure is TXG-MEM-012, both core-owned.
   - Design: Capacity overrides
-  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_override_capacity_reports_admission_and_wraps_failures` (new; serving-capture failure only) [CPU]
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_override_capacity_reports_admission_and_wraps_failures` (new; `A` and the `S <= A` check under each override, the model requesting no block-count change, and serving-capture failure) [CPU]
 - **TXG-MEM-009**: When `transaction_graph_populations` is non-empty, if admission capture raises or runs out of memory inside the profile window, then `prepare_execution_memory` shall raise an error naming `transaction_graph_populations` and latch `_execution_memory_failed`, and for an out-of-memory error the message shall report the normalized bytes admitted so far, the cells captured, the failing cell label and the device's free and total memory, and no projected total for the unfinished inventory.
   - Design: Failure modes and diagnostics
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_admission_oom_latches_and_reports_progress` (new) [CPU, injected OOM]
 - **TXG-MEM-010**: When `transaction_graph_populations` is non-empty, if serving capture raises, or the usable slot count after capacity is fixed is less than `max(populations)`, then the binding shall discard every graph and `initialize_kv_cache` shall raise an error naming `transaction_graph_populations`, and no step shall be served eager in its place.
   - Design: Lifetime: one serving capture per worker; Failure modes and diagnostics
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_failed_capture_publishes_nothing_and_every_call_runs_eager` (existing; rewrite to assert startup failure) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_serving_capture_rejects_too_few_usable_slots` (new) [CPU]
-- **TXG-MEM-011**: When `transaction_graph_populations` is non-empty, if core budget validation rejects the persistent-state budget after admission, because fewer than two pages fit or a set `num_gpu_blocks_override` exceeds the remaining budget, then startup shall fail with an error naming `transaction_graph_populations`, and no step shall be served eager in its place. How core learns the contributing option name is the core persistent-state design's choice.
+- **TXG-MEM-011**: When `transaction_graph_populations` is non-empty, if core budget validation rejects the persistent-state budget after admission, because fewer than two pages fit or a set `num_gpu_blocks_override` exceeds the remaining budget, then startup shall fail with an error naming the model-supplied contributor label (for this model, `transaction_graph_populations`), and no step shall be served eager in its place. How the model supplies that label is the core persistent-state design's choice.
   - Design: Failure modes and diagnostics; Core Obligations, item 4 (deferred until core lands it)
-  - Test: `tests/v1/core/test_kv_cache_planning.py::test_state_planner_rejection_names_the_transaction_graph_option` (new; requires the core change; too-small budget and oversized override, parametrized) [CPU]
-- **TXG-MEM-012**: When `transaction_graph_populations` is non-empty, if the KV allocation in `initialize_kv_cache` raises or runs out of memory before `initialize_state_slots`, then startup shall fail with an error naming `transaction_graph_populations`, and no step shall be served eager in its place.
+  - Test: `tests/v1/core/test_kv_cache_planning.py::test_state_planner_rejection_names_the_contributor_label` (new; requires the core change; generic label; too-small budget and oversized override, parametrized) [CPU]
+- **TXG-MEM-012**: When `transaction_graph_populations` is non-empty, if the KV allocation in `initialize_kv_cache` raises or runs out of memory before `initialize_state_slots`, then startup shall fail with an error naming the model-supplied contributor label (for this model, `transaction_graph_populations`), and no step shall be served eager in its place.
   - Design: Capacity overrides; Failure modes and diagnostics; Core Obligations, item 5 (deferred until core lands it)
-  - Test: `tests/v1/worker/test_gpu_model_runner_v2.py::test_state_kv_allocation_failure_names_the_contributing_option` (new; requires the core change; injected allocation failure) [CPU]
+  - Test: `tests/v1/worker/test_gpu_model_runner_v2.py::test_state_kv_allocation_failure_names_the_contributor_label` (new; requires the core change; generic label; injected allocation failure) [CPU]
 
 ### Capture lifetime (LIFE)
 
@@ -903,7 +914,7 @@ present, or all absent (`advance.py:3029-3035`); neither is a step policy.
   - Test: `tests/v1/worker/test_gpu_model_runner_v2.py::test_shutdown_calls_model_state_shutdown_hook` (new; requires the core hook) [CPU]
 - **TXG-LIFE-008**: When `transaction_graph_populations` is non-empty, the model shall reach the unowned resident pools for serving capture and the rejected-row reference only through the core-authorized startup pool access, use it only during `initialize_state_slots`, and commit no page through it.
   - Design: Lifetime: one serving capture per worker; Core Obligations, item 6 (deferred until core lands it)
-  - Test: `tests/v1/worker/test_gpu_model_runner_v2.py::test_startup_pool_access_expires_after_initialize_state_slots` (new; requires the core change) [CPU]
+  - Test: `tests/v1/worker/test_gpu_model_runner_v2.py::test_startup_pool_access_expires_after_initialize_state_slots` (new; requires the core change; generic model state) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_capture_reaches_pools_only_through_the_startup_accessor` (new; requires the core change; never reads `views._views`) [CPU]
 
 ### Replay exactness (REP)
 
@@ -976,7 +987,7 @@ present, or all absent (`advance.py:3029-3035`); neither is a step policy.
 
 ### Failure containment (FAIL)
 
-- **TXG-FAIL-001**: When `transaction_graph_populations` is non-empty, if a covered call fails before `graph.replay()` (classification, signature, arena upload, static-input copy, escaped-output allocation or commit reservation), then `execute` shall raise the exception type and message the eager transaction raises for the same input where eager has one, leave every resident page bitwise equal to the post-`begin_step` baseline, cancel a reserved commit ticket exactly once, and count no replay.
+- **TXG-FAIL-001**: When `transaction_graph_populations` is non-empty, if a covered call fails before `graph.replay()` (classification, signature, arena upload, static-input copy, escaped-output allocation or commit reservation), then `execute` shall raise the exception type and message the eager transaction raises for the same input where eager has one, leave every resident page bitwise equal to the post-`begin_step` baseline, cancel a reserved commit ticket exactly once, and increment no replay or fallback counter.
   - Design: Failure Containment
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_stale_lease_fails_before_replay_writes_a_page` (existing) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_pre_boundary_failure_keeps_baseline_and_cancels_ticket_once` (new; fault injected at each of classification, signature, arena upload, static-input copy, escaped-output allocation and commit reservation, parametrized; asserts the post-`begin_step` baseline, cancellation exactly once only where a ticket was reserved, and unchanged replay counts) [CPU]
 - **TXG-FAIL-002**: When `transaction_graph_populations` is non-empty and a cell replays, `execute` shall reserve the commit before any resident page write and stage status only after the replay, so the commit sink records exactly `reserve` then `stage`, and no request abort shall cancel that reservation: a launched transaction completes stage and collection, and ticket cancellation occurs only as error cleanup (TXG-FAIL-001, TXG-FAIL-004).
@@ -997,9 +1008,9 @@ present, or all absent (`advance.py:3029-3035`); neither is a step policy.
 - **TXG-FAIL-007**: When `transaction_graph_populations` is non-empty and a commit reservation is cancelled after a replay raised, or a request is aborted after a replay wrote its resident pages, the model shall leave those pages byte-identical to their post-replay contents until core rebinds the slot for a new generation or a later authorized write changes them.
   - Design: Failure Containment; Invariants
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_abort_after_replay_does_not_roll_back_pages` (new; pages compared after the abort and its collection, before any rebind) [CPU]
-- **TXG-FAIL-008**: When `transaction_graph_populations` is non-empty, if the cell's wrapper entry no longer holds its graph before replay (for example after `CUDAGraphWrapper.clear_all_graphs()`), then `execute` shall raise a worker-fatal `RuntimeError` before arena upload, capture nothing (`captured_cells` unchanged) and leave every resident page unchanged.
+- **TXG-FAIL-008**: When `transaction_graph_populations` is non-empty, if a call that passed classification and the signature check (Execute order) finds that its cell's wrapper entry no longer holds its graph (for example after `CUDAGraphWrapper.clear_all_graphs()`), then `execute` shall raise a worker-fatal `RuntimeError` before arena upload, capture nothing (`captured_cells` unchanged) and leave every resident page unchanged.
   - Design: Failure Containment
-  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_cleared_wrapper_entry_is_fatal_and_never_captures` (new) [CPU]
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_cleared_wrapper_entry_is_fatal_and_never_captures` (new; also a cleared entry with a signature mismatch, which is a counted `signature` fallback and not fatal) [CPU]
 
 ### Observability (OBS)
 
@@ -1034,7 +1045,7 @@ present, or all absent (`advance.py:3029-3035`); neither is a step policy.
 - **Core-owned.** Core Obligations lists every obligation on the core persistent-state design with its criteria. TXG-CORE-001 and TXG-CORE-002 are the carried warmup fix, testable now on this branch. TXG-VER-004, TXG-LIFE-007, TXG-LIFE-008, TXG-MEM-011 and TXG-MEM-012 are deferred until core lands them; the model-side halves (TXG-VER-001, TXG-LIFE-006, TXG-LIFE-001, the serving-capture case of TXG-MEM-008) are tested directly.
 - **Conservative defaults.** TXG-MEM-006 fixes zero tolerance for `S <= A`, and TXG-MEM-008 keeps it under both capacity overrides; TXG-MEM-002 requires the complete inventory, so no cross-cell reuse is assumed; TXG-MEM-007 forbids deducting double-counted peak.
 - **Contradictions.** The header status said acceptance criteria were "to be added"; it now points here. Existing tests that assert superseded behaviour are marked for rewrite: `test_failed_capture_publishes_nothing_and_every_call_runs_eager` (target: startup failure, TXG-MEM-010) and the `g2` cells in `test_capture_input_stores_no_page_and_publishes_every_cell` and `_replay_parity` (target: g0 only, TXG-REP-001). `test_arena_rejects_vectors_outside_its_layout` stays as an arena-level guard beside the execution-level `signature` fallback (TXG-REP-005). `test_cuda_graph_replay_matches_eager_across_varied_plans` excludes park tokens and is not park-echo coverage (TXG-REP-011).
-- **Implicit scoping resolved.** Processor and `bind_rows` geometry enforcement (TXG-ENV-007, TXG-ENV-008) and the unreachable-model reader (TXG-OBS-003) are option-independent, because the design passes the configured set to the plan context unconditionally. "Worker-fatal" is read as the latch of TXG-FAIL-004 for every fatal check, including pre-boundary process-constant, wrapper-entry and post-warmup failures; only non-fatal pre-boundary failures follow the structural-failure contract (TXG-FAIL-001). Signature-fallback pool preservation applies only to captured storage distinct from the live pools (TXG-REP-005). Budget-derived capacity applies only without an override, and an override's count only once core budget validation accepts it (TXG-MEM-007, TXG-MEM-008). "Every CHUNK step replays" means zero CHUNK-step fallbacks in the homogeneous lockstep workload, with echo steps at undeclared populations counted `undeclared`; mixed and staggered steps keep eager equivalence and their fallback counts (TXG-REP-010, TXG-REP-013). Request abort is not ticket cancellation, and post-replay page preservation lasts until a rebind or authorized write (TXG-FAIL-002, TXG-FAIL-007). Per-row rejections are request failures, not step failures (TXG-REP-012).
+- **Implicit scoping resolved.** Processor and `bind_rows` geometry enforcement (TXG-ENV-007, TXG-ENV-008) and the unreachable-model reader (TXG-OBS-003) are option-independent, because the design passes the configured set to the plan context unconditionally. "Worker-fatal" is read as the latch of TXG-FAIL-004 for every fatal check, including pre-boundary process-constant, wrapper-entry and post-warmup failures; only non-fatal pre-boundary failures follow the structural-failure contract (TXG-FAIL-001). Signature-fallback pool preservation applies only to captured storage distinct from the live pools (TXG-REP-005). Budget-derived capacity applies only without an override, and an override's count only once core budget validation accepts it (TXG-MEM-007, TXG-MEM-008). "Every CHUNK step replays" means zero CHUNK-step fallbacks in the homogeneous lockstep workload, with echo steps at undeclared populations counted `undeclared`; mixed and staggered steps keep eager equivalence and their fallback counts (TXG-REP-010, TXG-REP-013). Request abort is not ticket cancellation, and post-replay page preservation lasts until a rebind or authorized write (TXG-FAIL-002, TXG-FAIL-007). Per-row rejections are classified as eager classifies them, terminal ones as request failures, never step failures (TXG-REP-012). Processor geometry rejection is tested at the processor; the in-process engine tests bypass it (TXG-ENV-007).
 - **Context-free reading.** Every criterion names `transaction_graph_populations` and its state in its own clause; cross-file concepts (g0, eager, bitwise equal, configuration error, `endpoint_enabled`, `N()`) carry a parenthetical or the preamble definition.
 
 ## References
