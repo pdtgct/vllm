@@ -584,4 +584,5 @@ def test_nemotron_engine_transaction_graph_admission_is_charged(monkeypatch):
     utilization = (on["non_kv"] + 5.5 * on["page"]) / on["total"]
     bound = _startup_memory(option, utilization, max_num_seqs)
     assert 2 <= bound["count"] < max_num_seqs + 1
+    # ``capacity`` counts every allocated page, the null slot 0 included.
     assert bound["count"] == bound["budget"] // bound["page"]

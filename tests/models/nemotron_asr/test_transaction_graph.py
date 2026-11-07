@@ -14,13 +14,12 @@ from __future__ import annotations
 import gc
 import os
 import sys
-import types
 import weakref
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 import torch
@@ -99,7 +98,44 @@ Pools = dict[str, Any]
 # ---- runtimes --------------------------------------------------------------
 
 
-def _runtime(wrapper_factory: Callable[..., Any], mode: dict[str, str]) -> GraphRuntime:
+class _GraphEntries:
+    """Graph entries keyed by batch descriptor, as the platform wrapper keeps.
+
+    ``concrete_cudagraph_entries`` maps a descriptor to an entry holding its
+    ``cudagraph``; a graph-mode call whose descriptor has no graph captures
+    and publishes one. ``clear_graphs()`` empties a wrapper's entries and
+    ``_clear_all_graphs()`` every live wrapper's, as
+    ``CUDAGraphWrapper.clear_all_graphs()`` does.
+    """
+
+    instances: ClassVar[weakref.WeakSet[_GraphEntries]] = weakref.WeakSet()
+
+    def __init__(self, mode: dict[str, Any]) -> None:
+        self._mode = mode
+        self.concrete_cudagraph_entries: dict[Any, SimpleNamespace] = {}
+        _GraphEntries.instances.add(self)
+
+    def graph(self) -> Any:
+        """The current descriptor's graph; ``None`` means this call captures."""
+        entry = self.concrete_cudagraph_entries.get(self._mode["descriptor"])
+        return None if entry is None else entry.cudagraph
+
+    def publish(self, graph: Any) -> None:
+        descriptor = self._mode["descriptor"]
+        self.concrete_cudagraph_entries[descriptor] = SimpleNamespace(cudagraph=graph)
+
+    def clear_graphs(self) -> None:
+        self.concrete_cudagraph_entries.clear()
+
+
+def _clear_all_graphs() -> None:
+    for wrapper in list(_GraphEntries.instances):
+        wrapper.clear_graphs()
+
+
+def _runtime(wrapper_factory: Callable[..., Any], mode: dict[str, Any]) -> GraphRuntime:
+    """A runtime whose forward context sets ``mode``'s value and descriptor."""
+
     def context(
         _metadata: object,
         _config: object,
@@ -107,16 +143,14 @@ def _runtime(wrapper_factory: Callable[..., Any], mode: dict[str, str]) -> Graph
         cudagraph_runtime_mode: str,
         batch_descriptor: object,
     ) -> Any:
-        del batch_descriptor
-
         @contextmanager
         def scope() -> Iterator[None]:
-            previous = mode["value"]
-            mode["value"] = cudagraph_runtime_mode
+            previous = mode["value"], mode["descriptor"]
+            mode["value"], mode["descriptor"] = cudagraph_runtime_mode, batch_descriptor
             try:
                 yield
             finally:
-                mode["value"] = previous
+                mode["value"], mode["descriptor"] = previous
 
         return scope()
 
@@ -139,57 +173,58 @@ def _rerun_runtime(
 ) -> GraphRuntime:
     """Replay re-executes the body; used to test plumbing on CPU.
 
-    ``on_capture`` receives the creation index of the wrapper whose first
-    graph-mode call (its capture) is starting; raising from it injects a
-    capture failure.
+    ``on_capture`` receives the creation index of the wrapper whose
+    graph-mode call is capturing; raising from it injects a capture failure.
     """
-    mode = {"value": "none"}
+    mode: dict[str, Any] = {"value": "none", "descriptor": None}
     created = [0]
 
-    class Wrapper:
+    class Wrapper(_GraphEntries):
         def __init__(self, runnable: Callable[[], Any], *_: Any, **__: Any):
+            super().__init__(mode)
             self.runnable = runnable
             self.index = created[0]
-            self.captured = False
             created[0] += 1
 
         def __call__(self, *args: Any, **kwargs: Any) -> Any:
-            if mode["value"] == "graph" and not self.captured:
+            if mode["value"] == "graph" and self.graph() is None:
                 if on_capture is not None:
                     on_capture(self.index)
-                self.captured = True
+                self.publish(object())
             return self.runnable(*args, **kwargs)
 
     return _runtime(Wrapper, mode)
 
 
 def _cuda_runtime() -> GraphRuntime:
-    """Capture on the first graph-mode call, then replay the CUDA graph.
+    """Capture on a descriptor's first graph-mode call, then replay its graph.
 
     Every cell's graph is captured into one shared memory pool, as the
     platform wrapper does with its global pool, unless the caller replaces a
     wrapper's ``graph_pool`` before its capture, as it may on the platform
     wrapper.
     """
-    mode = {"value": "none"}
+    mode: dict[str, Any] = {"value": "none", "descriptor": None}
     pool = torch.cuda.graph_pool_handle()
 
-    class Wrapper:
+    class Wrapper(_GraphEntries):
         def __init__(self, runnable: Callable[[], Any], *_: Any, **__: Any):
+            super().__init__(mode)
             self.runnable = runnable
-            self.graph: torch.cuda.CUDAGraph | None = None
             self.graph_pool = pool
             self.output: Any = None
 
         def __call__(self, *args: Any, **kwargs: Any) -> Any:
             if mode["value"] != "graph":
                 return self.runnable(*args, **kwargs)
-            if self.graph is None:
-                self.graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(self.graph, pool=self.graph_pool):
+            graph = self.graph()
+            if graph is None:
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, pool=self.graph_pool):
                     self.output = self.runnable(*args, **kwargs)
+                self.publish(graph)
                 return self.output
-            self.graph.replay()
+            graph.replay()
             return self.output
 
     return _runtime(Wrapper, mode)
@@ -203,84 +238,51 @@ def _logging_runtime(
     When ``corrupt(index)`` holds, wrapper ``index``'s graph-mode calls after
     its capture return projection rows that differ from the eager body's.
     """
-    mode = {"value": "none"}
+    mode: dict[str, Any] = {"value": "none", "descriptor": None}
     created = [0]
 
-    class Wrapper:
+    class Wrapper(_GraphEntries):
         def __init__(self, runnable: Callable[[], Any], *_: Any, **__: Any):
+            super().__init__(mode)
             self.runnable = runnable
             self.index = created[0]
-            self.captured = False
             created[0] += 1
 
         def __call__(self) -> Any:
             log.append((self.index, mode["value"]))
             output = self.runnable()
             if mode["value"] == "graph":
-                if self.captured and corrupt is not None and corrupt(self.index):
+                if self.graph() is None:
+                    self.publish(object())
+                elif corrupt is not None and corrupt(self.index):
                     output[0].add_(1)
-                self.captured = True
             return output
 
     return _runtime(Wrapper, mode)
 
 
 def _entry_runtime(captures: list[Any]) -> SimpleNamespace:
-    """A re-executing runtime whose wrappers hold graphs as the platform's do.
+    """The re-executing runtime, recording every capture's batch descriptor.
 
-    Each wrapper keeps ``concrete_cudagraph_entries`` keyed by batch
-    descriptor, each entry holding its ``cudagraph``. A graph-mode call
-    without an entry captures, recording the descriptor in ``captures``.
     ``clear_all_graphs()`` empties every wrapper, as
     ``CUDAGraphWrapper.clear_all_graphs()`` does.
     """
     mode: dict[str, Any] = {"value": "none", "descriptor": None}
-    wrappers: list[Any] = []
 
-    class Wrapper:
+    class Wrapper(_GraphEntries):
         def __init__(self, runnable: Callable[[], Any], *_: Any, **__: Any):
+            super().__init__(mode)
             self.runnable = runnable
-            self.concrete_cudagraph_entries: dict[Any, SimpleNamespace] = {}
-            wrappers.append(self)
-
-        def clear_graphs(self) -> None:
-            self.concrete_cudagraph_entries.clear()
 
         def __call__(self) -> Any:
-            if mode["value"] == "graph":
-                descriptor = mode["descriptor"]
-                entry = self.concrete_cudagraph_entries.get(descriptor)
-                if entry is None or entry.cudagraph is None:
-                    captures.append(descriptor)
-                    self.concrete_cudagraph_entries[descriptor] = SimpleNamespace(
-                        cudagraph=object()
-                    )
+            if mode["value"] == "graph" and self.graph() is None:
+                captures.append(mode["descriptor"])
+                self.publish(object())
             return self.runnable()
 
-    def context(
-        _metadata: object,
-        _config: object,
-        *,
-        cudagraph_runtime_mode: str,
-        batch_descriptor: object,
-    ) -> Any:
-        @contextmanager
-        def scope() -> Iterator[None]:
-            previous = mode["value"], mode["descriptor"]
-            mode["value"], mode["descriptor"] = cudagraph_runtime_mode, batch_descriptor
-            try:
-                yield
-            finally:
-                mode["value"], mode["descriptor"] = previous
-
-        return scope()
-
-    def clear_all_graphs() -> None:
-        for wrapper in wrappers:
-            wrapper.clear_graphs()
-
-    runtime = replace(_runtime(Wrapper, mode), forward_context=context)
-    return SimpleNamespace(runtime=runtime, clear_all_graphs=clear_all_graphs)
+    return SimpleNamespace(
+        runtime=_runtime(Wrapper, mode), clear_all_graphs=_clear_all_graphs
+    )
 
 
 def _recording(runtime: GraphRuntime, modes: list[Any]) -> GraphRuntime:
@@ -443,6 +445,7 @@ def _engine_config(
     max_num_seqs: int = 2,
     max_num_batched_tokens: int = 8,
     cudagraph_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    cudagraph_mm_encoder: bool = False,
     num_gpu_blocks_override: int | None = None,
     kv_cache_memory_bytes: int | None = None,
 ) -> SimpleNamespace:
@@ -468,7 +471,7 @@ def _engine_config(
         compilation_config=SimpleNamespace(
             static_forward_context={},
             cudagraph_mode=cudagraph_mode,
-            cudagraph_mm_encoder=False,
+            cudagraph_mm_encoder=cudagraph_mm_encoder,
         ),
         parallel_config=SimpleNamespace(
             pipeline_parallel_size=1,
@@ -678,21 +681,25 @@ def _track_capture_cells(
 ) -> list[SimpleNamespace]:
     """Record every cell the shared capture path prepares, holding nothing.
 
-    Each record has the cell, weak references to its graph, arena and capture
-    callbacks, and the shapes of the pools it was prepared over. ``events``
-    receives ``("prepare", label)`` per cell.
+    Each record has the cell, weak references to its graph, arena, capture
+    callbacks and every tensor cloned while preparing it (page snapshots,
+    expected outputs and capture-input copies), and the shapes of the pools it
+    was prepared over. ``events`` receives ``("prepare", label)`` per cell.
     """
     prepared: list[SimpleNamespace] = []
     capture_cell = tg.TransactionGraphBinding._capture_cell
 
     def track(self: Any, core: Any, cell: tg.TransactionCell, **kwargs: Any) -> Any:
-        graph = capture_cell(self, core, cell, **kwargs)
+        clones: list[weakref.ref[torch.Tensor]] = []
+        with _tracking_clones(clones):
+            graph = capture_cell(self, core, cell, **kwargs)
         prepared.append(
             SimpleNamespace(
                 cell=cell,
                 graph=weakref.ref(graph),
                 arena=weakref.ref(graph.arena),
                 callbacks=_capture_callbacks(graph),
+                clones=clones,
                 pool_shapes=tuple(
                     tuple(pool.shape) for pool in kwargs["pools"].sequence()
                 ),
@@ -704,6 +711,43 @@ def _track_capture_cells(
 
     monkeypatch.setattr(tg.TransactionGraphBinding, "_capture_cell", track)
     return prepared
+
+
+@contextmanager
+def _tracking_clones(clones: list[weakref.ref[torch.Tensor]]) -> Iterator[None]:
+    """Append a weak reference to every tensor cloned in the scope."""
+    clone = torch.Tensor.clone
+
+    def tracked(tensor: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        copy = clone(tensor, *args, **kwargs)
+        clones.append(weakref.ref(copy))
+        return copy
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(torch.Tensor, "clone", tracked)
+        yield
+
+
+def _live_capture_clones(records: list[SimpleNamespace]) -> int:
+    """Count tensors cloned while preparing ``records`` that are still alive.
+
+    Storage a prepared graph or its arena owns as an attribute is persistent,
+    not a capture temporary, and is not counted.
+    """
+    gc.collect()
+    owned: set[int] = set()
+    for record in records:
+        graph = record.graph()
+        for owner in () if graph is None else (graph, graph.arena):
+            for value in vars(owner).values():
+                values = value if isinstance(value, list | tuple) else (value,)
+                owned.update(id(item) for item in values)
+        del graph
+    return sum(
+        (tensor := reference()) is not None and id(tensor) not in owned
+        for record in records
+        for reference in record.clones
+    )
 
 
 def _track_capture_inputs(
@@ -741,6 +785,25 @@ def _budget(released: int, admitted: int, served: int) -> Callable[[int], int]:
     """
     base = 1 << 34
     return _readings(base + admitted, base - released, base, base, base - served)
+
+
+@pytest.fixture
+def cpu_readings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Deterministic admission readings for CPU lifecycle paths.
+
+    Every five readings ``N0, Na, N1, Ns0, Ns1`` release far more than any
+    stand-in and admit as many bytes as serving uses, so admission passes
+    without real device memory queries. Tests of the readings patch their own.
+    """
+    budget = _budget(1 << 30, 1 << 20, 1 << 20)
+    calls = [0]
+
+    def read(_device: torch.device) -> int:
+        gc.collect()
+        calls[0] += 1
+        return budget((calls[0] - 1) % 5)
+
+    monkeypatch.setattr(tg, "normalized_free_memory", read, raising=False)
 
 
 def _model_call(model: Any) -> tg.TransactionCallBindings:
@@ -1085,19 +1148,21 @@ def _collected_step(
     call: tg.TransactionCallBindings,
     rows: Rows,
     graph: Any,
-) -> tuple[tuple[torch.Tensor, torch.Tensor], set[str]]:
+) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], set[str]]:
     """One step through the production sink and its collection.
 
-    Returns the projected rows and collected statuses, and the failed request
-    ids collection passes to ``state_slots.fail_requests``.
+    Returns the projected rows and the collected statuses and progress, and
+    the failed request ids collection passes to ``state_slots.fail_requests``.
     """
     plan = rows[2]
-    sink = _TrackedSink(rows=len(plan.bindings), device=rows[1].device)
+    count = len(plan.bindings)
+    sink = _TrackedSink(rows=count, device=rows[1].device)
     out = _advance(core, pools, call, rows, graph, sink).clone()
     assert sink.log == ["reserve", "stage"]
     failed = sink.failed_request_ids()
-    status = sink._status_host[: len(plan.bindings)].clone()
-    return (out.cpu(), status), failed
+    status = sink._status_host[:count].clone()
+    progress = sink._progress_host[:count].clone()
+    return (out.cpu(), status, progress), failed
 
 
 def _leased(request_id: str, block: int) -> tuple[SessionRegistry, _TrackedSink, Rows]:
@@ -2111,6 +2176,17 @@ def test_uncovered_calls_run_eager_and_are_counted(case: str) -> None:
     assert not any(name.endswith((":uncaptured", ":native-burst")) for name in counts)
 
 
+def _arena_snapshot(
+    binding: tg.TransactionGraphBinding,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Every published arena buffer (device and both pinned host) and a copy."""
+    return [
+        (buffer, buffer.clone())
+        for graph in binding._graphs.values()
+        for buffer in (graph.arena._device, *graph.arena._host)
+    ]
+
+
 @pytest.mark.cpu_test
 def test_relocated_pools_fall_back_instead_of_replaying() -> None:
     core = _core()
@@ -2118,13 +2194,16 @@ def test_relocated_pools_fall_back_instead_of_replaying() -> None:
     captured_pools = _endpoint_pools(4)
     binding = _binding(core, captured_pools, call, _rerun_runtime())
     captured = binding.counters()["captured_cells"]
+    arenas = _arena_snapshot(binding)
     moved = _clone_pools(captured_pools)
     reference = _clone_pools(captured_pools)
     kwargs = dict(core=core, call=call, blocks=[1], fresh=[True])
     actual = _first_step(binding, moved, **kwargs)
     expected = _first_step(None, reference, **kwargs)
     _assert_records_equal([actual], [expected])
+    _assert_pools_equal(moved, reference)
     _assert_pools_equal(captured_pools, _endpoint_pools(4))
+    assert all(torch.equal(buffer, saved) for buffer, saved in arenas)
     assert binding.counters()["fallbacks:chunk-fresh:g0:b1:signature"] == 1
     assert binding.counters()["captured_cells"] == captured
 
@@ -2261,11 +2340,7 @@ def test_arena_layout_mismatch_is_a_signature_fallback(
     eager_pools = _clone_pools(graph_pools)
     for pools in (graph_pools, eager_pools):
         pools["book_pool"][1:, _BOOK["last_label"]] = core.blank_id
-    arenas = [
-        (buffer, buffer.clone())
-        for graph in binding._graphs.values()
-        for buffer in (graph.arena._device, *graph.arena._host)
-    ]
+    arenas = _arena_snapshot(binding)
     captured = binding.counters()["captured_cells"]
     _extend_arena_layout(monkeypatch)
     kwargs = dict(core=core, call=call, blocks=[1], fresh=[True])
@@ -2363,6 +2438,14 @@ def test_signature_callable_identities_are_stable_across_calls() -> None:
     assert signatures[0] == signatures[1]
 
 
+#: Per-operation TF32 enablement; each case flips one ``fp32_precision``.
+_TF32_SETTINGS: dict[str, Callable[[], Any]] = {
+    "tf32-matmul": lambda: torch.backends.cuda.matmul,
+    "tf32-cudnn-conv": lambda: torch.backends.cudnn.conv,
+    "tf32-cudnn-rnn": lambda: torch.backends.cudnn.rnn,
+}
+
+
 @contextmanager
 def _changed_process_constant(
     name: str, monkeypatch: pytest.MonkeyPatch
@@ -2374,14 +2457,16 @@ def _changed_process_constant(
         mode = batch_invariant._batch_invariant_MODE
         monkeypatch.setattr(batch_invariant, "_batch_invariant_MODE", not mode)
         yield
-    elif name == "tf32":
-        # cuDNN's flag: the matmul flag is float32_matmul_precision's alias.
-        enabled = torch.backends.cudnn.allow_tf32
-        torch.backends.cudnn.allow_tf32 = not enabled
+    elif name in _TF32_SETTINGS:
+        # One API family, the per-operation settings ``exact_fp32`` sets;
+        # PyTorch rejects mixing them with the legacy ``allow_tf32`` flags.
+        target = _TF32_SETTINGS[name]()
+        precision = target.fp32_precision
+        target.fp32_precision = "ieee" if precision == "tf32" else "tf32"
         try:
             yield
         finally:
-            torch.backends.cudnn.allow_tf32 = enabled
+            target.fp32_precision = precision
     elif name == "float32_matmul_precision":
         precision = torch.get_float32_matmul_precision()
         torch.set_float32_matmul_precision(
@@ -2402,7 +2487,7 @@ def _changed_process_constant(
 #: Error-message pattern naming each process constant.
 _PROCESS_CONSTANTS = {
     "batch-invariant": r"(?i)batch.invariant",
-    "tf32": r"(?i)tf32",
+    **dict.fromkeys(_TF32_SETTINGS, r"(?i)fp32_precision"),
     "float32_matmul_precision": r"float32_matmul_precision",
     "CUBLAS_WORKSPACE_CONFIG": r"CUBLAS_WORKSPACE_CONFIG",
 }
@@ -2561,6 +2646,7 @@ _FATAL_SOURCES = (
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("later", ["covered", "fallback"])
 @pytest.mark.parametrize("source", _FATAL_SOURCES)
+@pytest.mark.usefixtures("cpu_readings")
 def test_every_fatal_source_latches_before_classification(
     monkeypatch: pytest.MonkeyPatch, source: str, later: str
 ) -> None:
@@ -2592,7 +2678,7 @@ def test_every_fatal_source_latches_before_classification(
             _advance(model.core, pools, call, rows, binding, _CommitRecorder())
     elif source == "wrapper-entry":
         platform.clear_all_graphs()
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match=r"(?i)wrapper entry"):
             _advance(model.core, pools, call, rows, binding, _CommitRecorder())
     elif source == "post-warmup":
         verify = _seam(model, "verify_transaction_graphs")
@@ -2601,7 +2687,7 @@ def test_every_fatal_source_latches_before_classification(
             verify()
     else:
         _other, moved = _model_state(model, config, num_blocks=4)
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match=r"(?i)pool layout|call binding"):
             state.initialize_state_slots(moved)
     path = "replay" if later == "covered" else "uncovered"
     _assert_latched(binding, model.core, call, pools, monkeypatch, (path,))
@@ -2720,14 +2806,10 @@ def test_cleared_wrapper_entry_is_fatal_and_never_captures() -> None:
     _assert_records_equal([actual], [expected])
     assert binding.counters()["fallbacks:chunk-fresh:g0:b1:signature"] == 1
 
-    arenas = [
-        (buffer, buffer.clone())
-        for graph in binding._graphs.values()
-        for buffer in (graph.arena._device, *graph.arena._host)
-    ]
+    arenas = _arena_snapshot(binding)
     before = _clone_pools(pools)
     sink = _CommitRecorder()
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match=r"(?i)wrapper entry"):
         _advance(core, pools, call, _rows(*_PATHS["replay"]), binding, sink)
     assert len(captures) == started
     assert binding.counters()["captured_cells"] == captured
@@ -2769,6 +2851,7 @@ def test_abort_after_replay_does_not_roll_back_pages(cause: str) -> None:
 
 
 @pytest.mark.cpu_test
+@pytest.mark.usefixtures("cpu_readings")
 def test_collection_failure_after_replay_publishes_no_progress(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2944,19 +3027,29 @@ def test_option_requires_native_burst_off_and_dense_decode(
         _model(monkeypatch, **hf)
 
 
+#: Runner graph configurations the option rejects: every outer mode but
+#: ``NONE``, and multimodal-encoder graphs under ``NONE``.
+_RUNNER_GRAPHS = {
+    **{
+        mode.name: {"cudagraph_mode": mode}
+        for mode in CUDAGraphMode
+        if mode != CUDAGraphMode.NONE
+    },
+    "mm-encoder": {"cudagraph_mm_encoder": True},
+}
+
+
 @pytest.mark.cpu_test
 @pytest.mark.parametrize(
-    "mode",
-    [mode for mode in CUDAGraphMode if mode != CUDAGraphMode.NONE],
-    ids=lambda mode: mode.name,
+    "engine", list(_RUNNER_GRAPHS.values()), ids=list(_RUNNER_GRAPHS)
 )
 def test_option_rejects_every_outer_cudagraph_mode_but_none(
-    monkeypatch: pytest.MonkeyPatch, mode: CUDAGraphMode
+    monkeypatch: pytest.MonkeyPatch, engine: dict[str, Any]
 ) -> None:
     model, _config = _model(monkeypatch)
     assert model._transaction_graph is not None
     with pytest.raises(ValueError, match="transaction_graph_populations"):
-        _model(monkeypatch, engine={"cudagraph_mode": mode})
+        _model(monkeypatch, engine=engine)
 
 
 @pytest.mark.cpu_test
@@ -3335,8 +3428,9 @@ def test_admission_oom_latches_and_reports_progress(
     prepared = _track_capture_cells(monkeypatch)
     base = 1 << 34
     _free_memory(monkeypatch, _readings(base, base - 111_111_111))
+    _seam(tg, "device_memory_info")
     monkeypatch.setattr(
-        torch.cuda, "mem_get_info", lambda *_args: (222_222_222, 333_333_333)
+        tg, "device_memory_info", lambda _device: (222_222_222, 333_333_333)
     )
     with pytest.raises(RuntimeError, match="transaction_graph_populations") as raised:
         model.prepare_execution_memory()
@@ -3376,6 +3470,7 @@ def test_serving_capture_rejects_too_few_usable_slots() -> None:
 
 
 @pytest.mark.cpu_test
+@pytest.mark.usefixtures("cpu_readings")
 def test_serving_capture_runs_once_from_initialize_state_slots(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3412,6 +3507,7 @@ def test_serving_capture_runs_once_from_initialize_state_slots(
 
 
 @pytest.mark.cpu_test
+@pytest.mark.usefixtures("cpu_readings")
 def test_identical_reinitialize_is_a_verified_no_op(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3432,19 +3528,39 @@ def test_identical_reinitialize_is_a_verified_no_op(
     assert {e["cell"]: e["capture_index"] for e in binding.receipt()["cells"]} == order
 
 
+def _rebound(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """A distinct callable with ``fn``'s behaviour, as a rebuilt binding is."""
+
+    def rebound(*args: Any, **kwargs: Any) -> Any:
+        return fn(*args, **kwargs)
+
+    return rebound
+
+
 @pytest.mark.cpu_test
+@pytest.mark.usefixtures("cpu_readings")
+@pytest.mark.parametrize(
+    "change", ["pool-layout", "decode-callable", "transition-callable"]
+)
 def test_changed_pool_layout_on_reinitialize_is_fatal(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, change: str
 ) -> None:
     model, config = _model(monkeypatch)
     model.prepare_execution_memory()
     state, slots = _model_state(model, config, num_blocks=4)
     state.initialize_state_slots(slots)
     binding = model._transaction_graph
-    _other, moved = _model_state(model, config, num_blocks=4)
+    again = slots
+    if change == "pool-layout":
+        _other, again = _model_state(model, config, num_blocks=4)
+    elif change == "decode-callable":
+        monkeypatch.setattr(model, "_decode_resolver", _rebound(model._decode_resolver))
+    else:
+        execution = model._encoder_execution
+        monkeypatch.setattr(execution, "transition", _rebound(execution.transition))
     prepared = _track_capture_cells(monkeypatch)
-    with pytest.raises(RuntimeError):
-        state.initialize_state_slots(moved)
+    with pytest.raises(RuntimeError, match=r"(?i)pool layout|call binding"):
+        state.initialize_state_slots(again)
     assert not prepared
     with pytest.raises(RuntimeError, match="a fresh worker is required"):
         _first_step(
@@ -3466,27 +3582,20 @@ def test_published_cell_retains_no_capture_context(
     stand_in = _StandIn()
     inputs = _track_capture_inputs(monkeypatch)
     prepared = _track_capture_cells(monkeypatch)
-    at_na: dict[str, int] = {}
+    observed: dict[int, dict[str, int]] = {}
 
     def observe(index: int) -> None:
-        if index != 1:
+        if index not in (1, 2):
             return
-        storage = stand_in.storage[0]()
-        assert storage is not None, "the stand-in storage was released before Na"
-        owners = [
-            referrer
-            for referrer in gc.get_referrers(storage)
-            if not isinstance(referrer, types.FrameType)
-        ]
-        at_na.update(
-            inputs=len(_live(inputs)),
-            callbacks=len(
+        observed[index] = {
+            "inputs": len(_live(inputs)),
+            "callbacks": len(
                 _live([ref for record in prepared for ref in record.callbacks])
             ),
-            views=len(_live(stand_in.views)),
-            owners=len(owners),
-        )
-        del storage, owners
+            "clones": _live_capture_clones(prepared),
+            "views": len(_live(stand_in.views)),
+            "storage": len(_live(stand_in.storage)),
+        }
 
     _free_memory(
         monkeypatch,
@@ -3497,12 +3606,20 @@ def test_published_cell_retains_no_capture_context(
     )
     binding = _admission_binding()
     _admit(binding, core, call, stand_in)
-    assert at_na == {"inputs": 0, "callbacks": 0, "views": 0, "owners": 1}
+    admission = list(prepared)
+    assert admission
+    cleared = {"inputs": 0, "callbacks": 0, "clones": 0, "views": 0}
+    assert observed[1] == {**cleared, "storage": 1}, "Na: only the holder's storage"
+    assert observed[2] == {**cleared, "storage": 0}, "N1: the holder was the owner"
     resident = _transaction_view(_scratch(3))
     _serve(binding, core, call, resident)
     assert binding.ready
+    serving = prepared[len(admission) :]
+    assert len(serving) == len(binding.cells)
     assert not _live(inputs)
     assert not _live([ref for record in prepared for ref in record.callbacks])
+    assert _live_capture_clones(serving) == 0
+    assert _live_capture_clones(admission) == 0
 
 
 @pytest.mark.cpu_test
@@ -3566,6 +3683,7 @@ def test_discard_leaves_no_published_cell_or_arena() -> None:
     strict=True,
     reason="Deferred: core persistent-state obligation 6 (design: Core Obligations)",
 )
+@pytest.mark.usefixtures("cpu_readings")
 def test_capture_reaches_pools_only_through_the_startup_accessor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3617,20 +3735,63 @@ def _assert_names_cell_and_buffer(model: Any, message: str) -> None:
     assert "pos_enc" in message
 
 
+#: Post-warmup changes the verification must reject.
+_VERIFY_MISMATCHES = ("resized-buffer", "relocated-buffer", "later-cell-signature")
+
+
+def _later_cell(binding: tg.TransactionGraphBinding) -> tg.TransactionCell:
+    """A cell first in neither declaration nor capture order."""
+    first = {binding.cells[0].label} | {
+        entry["cell"]
+        for entry in binding.receipt()["cells"]
+        if entry["capture_index"] == 0
+    }
+    return next(cell for cell in reversed(binding.cells) if cell.label not in first)
+
+
+def _verification_mismatch(model: Any, kind: str) -> Callable[[str], None]:
+    """Apply mismatch ``kind``; return a check of the error message.
+
+    ``relocated-buffer`` moves the positional buffer to a same-size copy, so
+    only its address changes; ``later-cell-signature`` changes one later
+    cell's captured signature and no buffer.
+    """
+    if kind == "resized-buffer":
+        _resize_positional_buffer(model)
+        return lambda message: _assert_names_cell_and_buffer(model, message)
+    if kind == "relocated-buffer":
+        encoder = model.core.encoder
+        encoder.pos_enc.pe = encoder.pos_enc.pe.clone()
+        return lambda message: _assert_names_cell_and_buffer(model, message)
+    binding = model._transaction_graph
+    cell = _later_cell(binding)
+    graph = binding._graphs[cell]
+    graph.signature = (*graph.signature, "changed")
+
+    def check(message: str) -> None:
+        assert "transaction_graph_populations" in message
+        assert cell.label in message
+
+    return check
+
+
 @pytest.mark.cpu_test
+@pytest.mark.usefixtures("cpu_readings")
+@pytest.mark.parametrize("mismatch", _VERIFY_MISMATCHES)
 def test_post_warmup_verification_rejects_resized_external_buffer(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, mismatch: str
 ) -> None:
     model, _state, _slots = _verified_model(monkeypatch)
     verify = _seam(model, "verify_transaction_graphs")
     verify()
-    _resize_positional_buffer(model)
+    check = _verification_mismatch(model, mismatch)
     with pytest.raises(RuntimeError, match="transaction_graph_populations") as raised:
         verify()
-    _assert_names_cell_and_buffer(model, str(raised.value))
+    check(str(raised.value))
 
 
 @pytest.mark.cpu_test
+@pytest.mark.usefixtures("cpu_readings")
 def test_first_real_step_verifies_once_before_pruning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3680,20 +3841,22 @@ def test_first_real_step_verifies_once_before_pruning(
 
 
 @pytest.mark.cpu_test
+@pytest.mark.usefixtures("cpu_readings")
+@pytest.mark.parametrize("mismatch", _VERIFY_MISMATCHES)
 def test_first_real_step_mismatch_is_fatal_before_any_state_change(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, mismatch: str
 ) -> None:
     model, state, slots = _verified_model(monkeypatch)
     pruned: list[Any] = []
     monkeypatch.setattr(model._registry, "prune", pruned.append)
     resident = slots.views[model._persistent_state_layer.prefix]._tensor
     before = resident.clone()
-    _resize_positional_buffer(model)
+    check = _verification_mismatch(model, mismatch)
     with pytest.raises(RuntimeError, match="transaction_graph_populations") as raised:
         state.prepare_step(
             SchedulerOutput.make_empty(), dummy_run=False, is_profile=False
         )
-    _assert_names_cell_and_buffer(model, str(raised.value))
+    check(str(raised.value))
     assert not pruned
     assert torch.equal(resident, before)
     with pytest.raises(RuntimeError, match="a fresh worker is required"):
@@ -3744,7 +3907,7 @@ def test_option_off_receipt_has_no_transaction_graph_entry(
     ids=["foreign", "multiprocess-executor", "remote-worker"],
 )
 def test_counters_raise_when_the_model_is_unreachable(target: Any) -> None:
-    with pytest.raises(RuntimeError):
+    with pytest.raises(Exception, match=r"(?i)reach"):
         tg.transaction_graph_counters(target)
 
 
@@ -4016,9 +4179,9 @@ def test_cuda_receipt_reports_admission_and_serving_bytes(
     receipt = binding.receipt()
     assert receipt["ready"] is True
     assert all(receipt[name] is not None for name in _ADMISSION_FIELDS)
-    admitted, served = receipt["admission_bytes"], receipt["serving_bytes"]
-    assert isinstance(admitted, int) and isinstance(served, int)
-    assert 0 < served <= admitted
+    admitted, serving = receipt["admission_bytes"], receipt["serving_bytes"]
+    assert isinstance(admitted, int) and isinstance(serving, int)
+    assert 0 < serving <= admitted
     assert receipt["admission_release_verified"] is True
     assert receipt["admission_capture_seconds"] > 0
     assert receipt["serving_capture_seconds"] > 0
@@ -4118,7 +4281,7 @@ def _control_trajectory(
     A fresh CHUNK drains to its park, then a park-echo and a forced-endpoint
     row; a final CHUNK drains to its park, then a FLUSH. Returns the records
     and each control row's record index. A rejected control row must leave
-    every page unchanged.
+    every page unchanged and has no emission to echo.
     """
     device = pools["book_pool"].device
     records: list[Any] = []
@@ -4128,9 +4291,9 @@ def _control_trajectory(
         records.append(_step(core, pools, call, ids, embeds, plan, graph))
         return int(records[-1][0][0, 0])
 
-    def echo(token: int) -> None:
+    def echo(token: int | None) -> None:
         for _ in range(CAP + 2):
-            if token == PARK_ID:
+            if token is None or token == PARK_ID:
                 return
             token = step(
                 [token],
@@ -4151,7 +4314,7 @@ def _control_trajectory(
         plan = _plan(prefills=[1], num_pool_blocks=4, has_initial=[seq > 0])
         echo(step([PLACEHOLDER_ID], embeds.unsqueeze(0).to(device), plan))
 
-    def control(name: str, token: int) -> int:
+    def control(name: str, token: int) -> int | None:
         controls[name] = len(records)
         before = _clone_pools(pools)
         emitted = step(
@@ -4161,6 +4324,7 @@ def _control_trajectory(
         )
         if int(records[-1][1][0]):
             _assert_pools_equal(pools, before)
+            return None
         return emitted
 
     chunk(0, final=False)
@@ -4204,12 +4368,50 @@ def test_cuda_replay_cell_accepted_control_rows_match_eager(endpoint: bool) -> N
     _control_parity(torch.device("cuda"), _cuda_runtime(), endpoint)
 
 
-def _traced(stream_log: list[tuple[str, int]], name: str, fn: Any) -> Any:
-    def traced(*args: Any, **kwargs: Any) -> Any:
-        stream_log.append((name, torch.cuda.current_stream().cuda_stream))
-        return fn(*args, **kwargs)
+def _storage(tensor: torch.Tensor) -> int:
+    return tensor.untyped_storage().data_ptr()
 
-    return traced
+
+@contextmanager
+def _stream_trace(
+    monkeypatch: pytest.MonkeyPatch, targets: dict[str, list[torch.Tensor]]
+) -> Iterator[list[tuple[str, int]]]:
+    """Log ``(name, current stream)`` inside every graph replay and ``copy_``.
+
+    The stream is read inside the innermost call, so work an implementation
+    moves to another stream is logged on that stream. A copy into storage
+    shared with a ``targets[name]`` tensor is logged as ``name``, any other
+    copy as ``"other"``.
+    """
+    log: list[tuple[str, int]] = []
+    names = {
+        _storage(tensor): name
+        for name, tensors in targets.items()
+        for tensor in tensors
+    }
+    replay, copy = torch.cuda.CUDAGraph.replay, torch.Tensor.copy_
+
+    def traced_replay(graph: Any, *args: Any, **kwargs: Any) -> Any:
+        log.append(("replay", torch.cuda.current_stream().cuda_stream))
+        return replay(graph, *args, **kwargs)
+
+    def traced_copy(tensor: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+        name = names.get(_storage(tensor), "other")
+        log.append((name, torch.cuda.current_stream().cuda_stream))
+        return copy(tensor, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.cuda.CUDAGraph, "replay", traced_replay)
+        patch.setattr(torch.Tensor, "copy_", traced_copy)
+        yield log
+
+
+def _assert_on_stream(
+    log: list[tuple[str, int]], stream: int, required: set[str]
+) -> None:
+    """Every logged operation ran on ``stream``, and each ``required`` ran."""
+    assert required <= {name for name, _stream in log}, log
+    assert all(issued == stream for _name, issued in log), log
 
 
 @pytest.mark.nemotron_gpu
@@ -4228,33 +4430,34 @@ def test_cuda_replay_runs_on_the_current_stream(
     kwargs = dict(core=core, call=call, blocks=[1], fresh=[True])
     expected = _first_step(None, eager_pools, **kwargs)
     torch.cuda.synchronize()
-    streams: list[tuple[str, int]] = []
-    replay = torch.cuda.CUDAGraph.replay
-    monkeypatch.setattr(
-        torch.cuda.CUDAGraph, "replay", _traced(streams, "replay", replay)
-    )
-    for graph in binding._graphs.values():
-        monkeypatch.setattr(
-            graph.arena, "upload", _traced(streams, "upload", graph.arena.upload)
-        )
-        for name in ("static_ids", "static_embeds"):
-            tensor = getattr(graph, name)
-            monkeypatch.setattr(tensor, "copy_", _traced(streams, name, tensor.copy_))
+    graphs = list(binding._graphs.values())
+    targets = {
+        "arena": [graph.arena._device for graph in graphs],
+        "static_ids": [graph.static_ids for graph in graphs],
+        "static_embeds": [graph.static_embeds for graph in graphs],
+        "resident": [tensor for tensor in _transaction_pools(graph_pools).sequence()],
+    }
     side = torch.cuda.Stream(device)
     side.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side):
+    with _stream_trace(monkeypatch, targets) as log, torch.cuda.stream(side):
         actual = _first_step(binding, graph_pools, **kwargs)
     side.synchronize()
     _assert_records_equal([actual], [expected])
     _assert_pools_equal(graph_pools, eager_pools)
-    assert {name for name, _stream in streams} == {
-        "replay",
-        "upload",
-        "static_ids",
-        "static_embeds",
-    }
-    assert all(stream == side.cuda_stream for _name, stream in streams), streams
+    required = {"replay", "arena", "static_ids", "static_embeds"}
+    _assert_on_stream(log, side.cuda_stream, required)
     assert binding.counters()["replays:chunk-fresh:g0:b1"] == 1
+
+    # The oracle fails on a resident write issued to another stream.
+    page = graph_pools["book_pool"][1:2]
+    saved = page.clone()
+    other = torch.cuda.Stream(device)
+    other.wait_stream(side)
+    with _stream_trace(monkeypatch, targets) as stray, torch.cuda.stream(other):
+        page.copy_(saved)
+    other.synchronize()
+    with pytest.raises(AssertionError):
+        _assert_on_stream(stray, side.cuda_stream, {"resident"})
 
 
 def _segment_pool(tensor: torch.Tensor) -> tuple[int, int]:

@@ -9,6 +9,7 @@ minted plan must pass the canonical transaction structural preflight.
 
 from __future__ import annotations
 
+import dataclasses
 import importlib
 import types
 from pathlib import Path
@@ -301,23 +302,49 @@ def test_bind_rows_is_atomic_when_a_later_row_is_invalid() -> None:
     assert binding.admission_generation == 1
 
 
+def _registry_state(registry: Any) -> dict[str, Any]:
+    """Every session's complete metadata, keyed by request id."""
+    return {
+        request_id: dataclasses.asdict(session)
+        for request_id, session in registry._sessions.items()
+    }
+
+
 @pytest.mark.parametrize("fresh", [True, False])
-def test_bind_rows_rejects_geometry_outside_served_set(fresh: bool) -> None:
+@pytest.mark.parametrize("path", ["registry", "model-option-on", "model-option-off"])
+def test_bind_rows_rejects_geometry_outside_served_set(
+    monkeypatch: pytest.MonkeyPatch, path: str, fresh: bool
+) -> None:
     """A header geometry outside the configured set fails before any commit.
 
     Geometry 1 is a published cadence index, so only the served set excludes
-    it. The step's valid fresh row is not registered either.
+    it: ``(0, 2)`` given to ``bind_rows`` directly, or the model's configured
+    g0 set through its plan context with the option on or off. The step's
+    valid fresh row is not registered and no session's metadata changes.
     """
-    registry = plan_mod.SessionRegistry()
+    if path == "registry":
+        registry = plan_mod.SessionRegistry()
 
-    def bind(rows: list[Any]) -> Any:
-        return registry.bind_rows(
-            rows,
-            placeholder_id=PLACEHOLDER_ID,
-            num_prompts=NUM_PROMPTS,
-            served_geometries=(0, 2),
-            now_ns=NOW_NS,
+        def bind(rows: list[Any]) -> Any:
+            return registry.bind_rows(
+                rows,
+                placeholder_id=PLACEHOLDER_ID,
+                num_prompts=NUM_PROMPTS,
+                served_geometries=(0, 2),
+                now_ns=NOW_NS,
+            )
+    else:
+        from tests.models.nemotron_asr import test_transaction_graph as txg
+
+        model, _config = txg._model(
+            monkeypatch,
+            supported_num_lookahead_tokens=[0],
+            transaction_graph_populations=[1, 2] if path == "model-option-on" else [],
         )
+        registry = model._registry
+
+        def bind(rows: list[Any]) -> Any:
+            return model._stage_plan(rows, resident_request_ids=("a", "b", "c"))
 
     bind([_row("a", 3, chunk=True, prior=False)])
     offending = (
@@ -325,9 +352,10 @@ def test_bind_rows_rejects_geometry_outside_served_set(fresh: bool) -> None:
         if fresh
         else _row("a", 3, chunk=True, header=_header(geometry=1, seq=1))
     )
+    before = _registry_state(registry)
     with pytest.raises(ValueError, match="geometry 1"):
         bind([_row("b", 4, chunk=True, prior=False), offending])
-    assert len(registry) == 1
+    assert _registry_state(registry) == before
     assert registry.live_block_ids() == [3]
 
 
