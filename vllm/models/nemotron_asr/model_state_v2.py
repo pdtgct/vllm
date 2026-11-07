@@ -143,7 +143,7 @@ class NemotronASRModelState(ModelState):
         transaction_graph = getattr(self.model, "_transaction_graph", None)
         if transaction_graph is not None:
             transaction_graph.check_latch()
-            if not getattr(self, "_transaction_graphs_verified", False):
+            if not self._transaction_graphs_verified:
                 self.model.verify_transaction_graphs()
                 self._transaction_graphs_verified = True
         cached = scheduler_output.scheduled_cached_reqs

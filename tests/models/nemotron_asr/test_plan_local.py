@@ -57,6 +57,8 @@ commit_sink_mod = mods["commit_sink"]
 PLACEHOLDER_ID = 9001
 NUM_PROMPTS = 4
 NUM_GEOMETRIES = 5
+#: Every published cadence index, the served set these tests bind against.
+SERVED_GEOMETRIES = tuple(range(NUM_GEOMETRIES))
 #: Round numbers chosen so the deadline-reconstruction math in the
 #: tests below is easy to verify by hand: NOW_NS is exactly 10,000 ms
 #: since epoch, and _DEFAULT_ADMISSION_MS matches it exactly — the
@@ -110,7 +112,7 @@ def _bind(registry: Any, rows: list[Any], *, now_ns: int = NOW_NS) -> Any:
         rows,
         placeholder_id=PLACEHOLDER_ID,
         num_prompts=NUM_PROMPTS,
-        num_geometries=NUM_GEOMETRIES,
+        served_geometries=SERVED_GEOMETRIES,
         now_ns=now_ns,
     )
 
@@ -373,7 +375,7 @@ def test_prepare_context_rolls_back_prune_when_binding_fails() -> None:
             resident_request_ids=["a", "c", "d"],
             placeholder_id=PLACEHOLDER_ID,
             num_prompts=NUM_PROMPTS,
-            num_geometries=NUM_GEOMETRIES,
+            served_geometries=SERVED_GEOMETRIES,
             now_ns=NOW_NS,
             step=2,
         )
@@ -389,7 +391,7 @@ def test_prepare_context_rejects_rows_missing_from_resident_authority() -> None:
             resident_request_ids=[],
             placeholder_id=PLACEHOLDER_ID,
             num_prompts=NUM_PROMPTS,
-            num_geometries=NUM_GEOMETRIES,
+            served_geometries=SERVED_GEOMETRIES,
             now_ns=NOW_NS,
             step=1,
         )
@@ -625,7 +627,7 @@ def _context(registry: Any, rows: list[Any], *, step: int = 1) -> Any:
         resident_request_ids=[row.request_id for row in rows],
         placeholder_id=PLACEHOLDER_ID,
         num_prompts=NUM_PROMPTS,
-        num_geometries=NUM_GEOMETRIES,
+        served_geometries=SERVED_GEOMETRIES,
         now_ns=NOW_NS,
         step=step,
     )

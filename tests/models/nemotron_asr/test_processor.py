@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+from vllm.models.nemotron_asr.advance import ENV_GEOMETRY_ID
 from vllm.models.nemotron_asr.processor import (
     NemotronASRMultiModalProcessor,
     NemotronASRProcessingInfo,
@@ -38,6 +39,8 @@ def processor() -> NemotronASRMultiModalProcessor:
 
 def _audio_items(processor: NemotronASRMultiModalProcessor):
     audio = np.linspace(-1.0, 1.0, 1600, dtype=np.float64)
+    # Every audio item is an envelope; this one names a served geometry.
+    audio[ENV_GEOMETRY_ID] = 0.0
     return processor.data_parser.parse_mm_data({"audio": audio}), audio
 
 
@@ -159,3 +162,51 @@ def test_envelope_outside_served_geometries_is_rejected(
     assert apply(0)["prompt_token_ids"] == [_CARRIER_ID]
     with pytest.raises(ValueError, match="geometry"):
         apply(3)
+
+
+def _apply_envelope(processor: NemotronASRMultiModalProcessor, geometry: float):
+    """Process one CHUNK envelope whose header names ``geometry``."""
+    from vllm.multimodal.processing import ProcessorInputs, TimingContext
+
+    header = torch.tensor([2, 1_280, geometry, 0, 0, 0, 1], dtype=torch.float32)
+    envelope = torch.cat((header, torch.zeros(1_280)))
+    items = processor.data_parser.parse_mm_data({"audio": envelope.numpy()})
+    return processor.apply(
+        ProcessorInputs(prompt=[_CARRIER_ID], mm_data_items=items), TimingContext()
+    )
+
+
+@pytest.mark.parametrize("geometry", [5, 999], ids=["next-index", "far-index"])
+def test_envelope_beyond_published_cadences_is_rejected_without_the_field(
+    tmp_path, monkeypatch, geometry
+):
+    """Without ``supported_num_lookahead_tokens`` every published cadence is
+    served: a finite set the processor still enforces."""
+    from vllm.models.nemotron_asr.manifests import CADENCES, served_geometry_ids
+
+    _, processor = _registry_processor(tmp_path, monkeypatch)
+    hf_config = processor.info.get_hf_config()
+    assert getattr(hf_config, "supported_num_lookahead_tokens", None) is None
+    published = tuple(range(len(CADENCES)))
+    assert served_geometry_ids(hf_config) == published
+    assert geometry not in published
+    for served in published:
+        assert _apply_envelope(processor, served)["prompt_token_ids"] == [_CARRIER_ID]
+    with pytest.raises(ValueError, match="geometry"):
+        _apply_envelope(processor, geometry)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{}, {"supported_num_lookahead_tokens": [0]}],
+    ids=["field-absent", "g0"],
+)
+def test_envelope_with_invalid_geometry_index_is_rejected(
+    tmp_path, monkeypatch, overrides
+):
+    """A geometry slot that is not a served cadence index fails in the processor."""
+    _, processor = _registry_processor(tmp_path, monkeypatch, overrides)
+    assert _apply_envelope(processor, 0)["prompt_token_ids"] == [_CARRIER_ID]
+    for geometry in (-1.0, 0.5, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="geometry"):
+            _apply_envelope(processor, geometry)

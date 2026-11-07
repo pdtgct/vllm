@@ -116,13 +116,16 @@ def _tensor_layout(tensor: torch.Tensor) -> tuple[Any, ...]:
     )
 
 
-def _lazy_buffer_signature(core: Any) -> tuple[Any, ...]:
-    """Addresses of encoder buffers that eager calls may rebind lazily."""
+def _lazy_buffer_signature(core: Any) -> tuple[tuple[str, Any], ...]:
+    """Named layouts of the encoder buffers eager calls may rebind lazily."""
     encoder = getattr(core, "encoder", None)
     pe = getattr(getattr(encoder, "pos_enc", None), "pe", None)
     return (
-        None if pe is None else _tensor_layout(pe),
-        tuple(getattr(encoder, "_stream_relative_position_lengths", ())),
+        ("encoder.pos_enc.pe", None if pe is None else _tensor_layout(pe)),
+        (
+            "encoder._stream_relative_position_lengths",
+            tuple(getattr(encoder, "_stream_relative_position_lengths", ())),
+        ),
     )
 
 
@@ -173,6 +176,95 @@ def transaction_signature(
         (tuple(inputs_embeds.shape), inputs_embeds.dtype, inputs_embeds.device),
         _arena_layout(inputs),
     )
+
+
+#: The names of :func:`transaction_signature`'s entries, in order.
+_SIGNATURE_FIELDS = (
+    "population",
+    "carrier width",
+    "replay queue capacity",
+    "blank id",
+    "endpoint_enabled",
+    "EOU token id",
+    "placeholder id",
+    "park id",
+    "decode coverage",
+    "fresh row count",
+    "CHUNK buckets and their decode and transition callables",
+    "emission adapter",
+    "encoder transition",
+    "resident pools",
+    "lazily bound encoder buffers",
+    "input ids",
+    "input embeddings",
+    "arena layout",
+)
+
+#: The names of a startup key's call-binding entries, in order.
+_CALL_FIELDS = (
+    "adapter",
+    "decode_resolver",
+    "encoder_transition",
+    "bucket_transition",
+    "execution_tier",
+    "placeholder_id",
+    "park_id",
+    "eou_token_id",
+    "graph_covers_decode",
+    "hidden_size",
+    "device",
+    "null_block_id",
+)
+
+
+def _pool_names(pools: TransactionPools) -> tuple[str, ...]:
+    """Names of ``pools.sequence()``'s entries, in order."""
+    names = [
+        f"{family}.{index}"
+        for family, members in (
+            ("channel", pools.channel),
+            ("time", pools.time),
+            ("valid_length", pools.valid_length),
+        )
+        for index in range(len(members))
+    ]
+    names += ("h", "c", "queue", "book")
+    names += ("frontend_raw", "frontend_mel", "frontend_counter")
+    names += [
+        name
+        for name in ("endpoint_history", "endpoint_book")
+        if getattr(pools, name) is not None
+    ]
+    return tuple(names)
+
+
+def _first_change(
+    names: Sequence[str], captured: Sequence[Any], live: Sequence[Any]
+) -> str | None:
+    """The name of the first entry that differs, or ``None`` if none does."""
+    if len(captured) != len(live):
+        return "inventory"
+    for name, old, new in zip(names, captured, live, strict=True):
+        if old != new:
+            return name
+    return None
+
+
+def _signature_change(
+    captured: tuple[Any, ...], live: tuple[Any, ...], pools: TransactionPools
+) -> str | None:
+    """Describe the first signature entry that differs, naming its buffer."""
+    field = _first_change(_SIGNATURE_FIELDS, captured, live)
+    if field == "resident pools":
+        index = _SIGNATURE_FIELDS.index(field)
+        pool = _first_change(_pool_names(pools), captured[index], live[index])
+        return f"resident pool {pool}"
+    if field == "lazily bound encoder buffers":
+        index = _SIGNATURE_FIELDS.index(field)
+        names = [name for name, _ in live[index]]
+        buffer = _first_change(names, captured[index], live[index])
+        return f"lazily bound buffer {buffer}"
+    return field
 
 
 class TransactionArena:
@@ -317,8 +409,12 @@ def _process_constants() -> dict[str, Any]:
     }
 
 
-def _external_buffers(core: Any) -> dict[str, Any]:
-    """Layouts of the core-owned tensors the captured graphs read."""
+def _external_buffers(core: Any, nested: Sequence[Any] = ()) -> dict[str, Any]:
+    """Layouts of the binding-external tensors the captured graphs read.
+
+    These are the core's parameters and buffers and the scratch each nested
+    binding in ``nested`` reports through ``external_tensors()``.
+    """
     if isinstance(core, torch.nn.Module):
         modules = [("", core)]
     else:
@@ -338,6 +434,9 @@ def _external_buffers(core: Any) -> dict[str, Any]:
     layouts["encoder._stream_relative_position_lengths"] = tuple(
         getattr(encoder, "_stream_relative_position_lengths", ())
     )
+    for owner in nested:
+        for name, tensor in owner.external_tensors().items():
+            layouts[name] = _tensor_layout(tensor)
     return layouts
 
 
@@ -441,6 +540,11 @@ class _TransactionGraph:
         self.capture_graph = None
         self.verify = None
         self.context.clear()
+
+
+def _free_blocks(num_pool_blocks: int, null_block_id: int) -> list[int]:
+    """The pool's usable block ids; capture rows occupy a leading prefix."""
+    return [block for block in range(num_pool_blocks) if block != null_block_id]
 
 
 def _capture_plan(
@@ -577,10 +681,12 @@ class _AdmissionHolder:
 
 @dataclass(frozen=True)
 class _Startup:
-    """What the published serving inventory was captured for and against."""
+    """The startup key and binding-external buffers recorded at publication.
+
+    Each cell's own signature is recorded on its graph.
+    """
 
     key: tuple[tuple[Any, ...], tuple[Any, ...]]
-    signatures: Mapping[TransactionCell, tuple[Any, ...]]
     external: Mapping[str, Any]
 
 
@@ -663,7 +769,21 @@ class TransactionGraphBinding:
         self._graphs = {}
         self._admission = None
         self._pool_signature = None
+        self._startup = None
         self._retained_bytes_total = None
+
+    def require_admission(self) -> None:
+        """Raise, latching the binding, unless admission measured its inventory.
+
+        Serving capture compares its retained memory with the admitted bytes;
+        without them that comparison cannot run.
+        """
+        self.check_latch()
+        if self._admission_bytes is None:
+            raise self._fatal(
+                f"{OPTION}: serving capture requires the admission capture of "
+                "prepare_execution_memory, which did not measure this inventory"
+            )
 
     # ------------------------------------------------------------ the latch
     def check_latch(self) -> None:
@@ -782,6 +902,7 @@ class TransactionGraphBinding:
         hidden_size: int,
         device: torch.device,
         null_block_id: int = 0,
+        nested: Sequence[Any] = (),
     ) -> None:
         """Capture every declared cell over the allocated resident pools.
 
@@ -790,7 +911,9 @@ class TransactionGraphBinding:
         verifies and ``S = Ns0 - Ns1`` does not exceed the admitted ``A``. A
         repeated call with identical pool layout and call bindings is a no-op;
         any difference, and any capture failure, discards every graph and
-        latches the binding.
+        latches the binding. Publication records the layout of every
+        binding-external buffer: the core's, and the scratch of each nested
+        binding in ``nested`` the outer body runs eagerly.
 
         Capture inputs use real free block ids and rows the transaction rejects
         (a non-envelope CHUNK payload, or a placeholder id on a non-CHUNK row),
@@ -849,11 +972,7 @@ class TransactionGraphBinding:
             )
         self._graphs = inventory.graphs
         self._pool_signature = key[0]
-        self._startup = _Startup(
-            key=key,
-            signatures={cell: graph.signature for cell, graph in self._graphs.items()},
-            external=_external_buffers(core),
-        )
+        self._startup = _Startup(key=key, external=_external_buffers(core, nested))
         self._retained_bytes_total = inventory.retained_bytes
         self._serving_bytes = serving
         self._serving_seconds = inventory.seconds
@@ -907,7 +1026,7 @@ class TransactionGraphBinding:
         else:
             self._verify_process_constants()
         num_pool_blocks = int(pools.queue.shape[0])
-        free = [block for block in range(num_pool_blocks) if block != null_block_id]
+        free = _free_blocks(num_pool_blocks, null_block_id)
         largest = max(cell.population for cell in self._cells)
         if len(free) < largest:
             raise ValueError(
@@ -964,6 +1083,55 @@ class TransactionGraphBinding:
             consume_batch_stats()
         return _Inventory(graphs, retained, time.perf_counter() - started)
 
+    def _cell_inputs(
+        self,
+        core: Any,
+        cell: TransactionCell,
+        input_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        *,
+        pools: TransactionPools,
+        call: TransactionCallBindings,
+        block_ids: Sequence[int],
+        num_pool_blocks: int,
+        null_block_id: int,
+    ) -> TransactionInputs:
+        """The host prologue of ``cell``'s capture rows over ``pools``.
+
+        Capture and post-warmup verification both build a cell's inputs here,
+        so a cell's live signature is computed exactly as at capture.
+        """
+        geometry = self._replay_geometry if cell.kind == CELL_REPLAY else cell.geometry
+        plan = _capture_plan(
+            cell,
+            block_ids=block_ids,
+            num_pool_blocks=num_pool_blocks,
+            null_block_id=null_block_id,
+            geometry=geometry,
+            execution_tier=(
+                call.execution_tier(cell.population) if call.graph_covers_decode else 0
+            ),
+        )
+        return prepare_transaction(
+            core,
+            input_ids,
+            inputs_embeds,
+            plan,
+            pools=pools,
+            eou_token_id=call.eou_token_id,
+            adapter=call.adapter,
+            decode_resolver=call.decode_resolver,
+            encoder_transition=call.encoder_transition,
+            bucket_transition=call.bucket_transition,
+            placeholder_id=call.placeholder_id,
+            park_id=call.park_id,
+            has_commit_sink=False,
+            capture=False,
+            graph_covers_decode=call.graph_covers_decode,
+            memory_profile=False,
+            native_burst_handoff=None,
+        )
+
     def _capture_cell(
         self,
         core: Any,
@@ -986,41 +1154,22 @@ class TransactionGraphBinding:
         which the wrapper's body and the callbacks read through.
         """
         started = time.perf_counter()
-        geometry = self._replay_geometry if cell.kind == CELL_REPLAY else cell.geometry
-        plan = _capture_plan(
-            cell,
-            block_ids=block_ids,
-            num_pool_blocks=num_pool_blocks,
-            null_block_id=null_block_id,
-            geometry=geometry,
-            execution_tier=(
-                call.execution_tier(cell.population) if call.graph_covers_decode else 0
-            ),
-        )
         input_ids = torch.full(
             (cell.population,), call.placeholder_id, dtype=torch.int64, device=device
         )
         inputs_embeds = torch.zeros(
             cell.population, hidden_size, dtype=torch.float32, device=device
         )
-        inputs = prepare_transaction(
+        inputs = self._cell_inputs(
             core,
+            cell,
             input_ids,
             inputs_embeds,
-            plan,
             pools=pools,
-            eou_token_id=call.eou_token_id,
-            adapter=call.adapter,
-            decode_resolver=call.decode_resolver,
-            encoder_transition=call.encoder_transition,
-            bucket_transition=call.bucket_transition,
-            placeholder_id=call.placeholder_id,
-            park_id=call.park_id,
-            has_commit_sink=False,
-            capture=False,
-            graph_covers_decode=call.graph_covers_decode,
-            memory_profile=False,
-            native_burst_handoff=None,
+            call=call,
+            block_ids=block_ids,
+            num_pool_blocks=num_pool_blocks,
+            null_block_id=null_block_id,
         )
         classified, reason = classify_transaction(inputs)
         if classified != cell:
@@ -1169,31 +1318,106 @@ class TransactionGraphBinding:
         return graph
 
     # ------------------------------------------------- post-warmup verification
-    def verify_after_warmup(self, core: Any) -> None:
-        """Check every published cell against what it was captured against.
+    def verify_after_warmup(
+        self,
+        core: Any,
+        *,
+        resident_pools: Callable[[], TransactionPools] | None,
+        call: TransactionCallBindings,
+        hidden_size: int,
+        null_block_id: int = 0,
+        nested: Sequence[Any] = (),
+    ) -> None:
+        """Check every published cell against live state.
 
-        Each cell's signature must equal its capture-time signature, and every
-        core-owned buffer the graphs read must keep its capture-time address
-        and size. A mismatch is worker-fatal and latches the binding.
+        ``resident_pools`` projects the live resident pools; ``call`` and
+        ``nested`` are the live call bindings and nested bindings. Each cell's
+        signature is rebuilt from them as at capture and compared with the one
+        recorded at publication; so are the startup key and every
+        binding-external buffer's address and size. Nothing built here is
+        retained. A mismatch is worker-fatal and latches the binding.
         """
         self.check_latch()
         startup = self._startup
-        if startup is None or not self.ready:
+        if startup is None or not self.ready or resident_pools is None:
             raise self._fatal(f"{OPTION}: no serving inventory was published")
-        live = _external_buffers(core)
-        for name, layout in startup.external.items():
-            if live.get(name) != layout:
-                labels = ", ".join(cell.label for cell in self._cells)
-                raise self._fatal(
-                    f"{OPTION}: post-warmup verification failed for cells {labels}: "
-                    f"buffer {name} changed from {layout} to {live.get(name)}"
+        labels = ", ".join(cell.label for cell in self._cells)
+
+        def failed(cells: str, change: str) -> RuntimeError:
+            return self._fatal(
+                f"{OPTION}: post-warmup verification failed for {cells}: {change}"
+            )
+
+        try:
+            pools = resident_pools()
+        except Exception as error:
+            raise failed(
+                f"cells {labels}", f"the resident pools no longer project: {error}"
+            ) from error
+        device = pools.queue.device
+        num_pool_blocks = int(pools.queue.shape[0])
+        free = _free_blocks(num_pool_blocks, null_block_id)
+        try:
+            for cell in self._cells:
+                # Only the shapes, dtypes and device of these inputs are read.
+                input_ids = torch.empty(
+                    cell.population, dtype=torch.int64, device=device
                 )
-        for cell in self._cells:
-            if self._graphs[cell].signature != startup.signatures[cell]:
-                raise self._fatal(
-                    f"{OPTION}: post-warmup verification failed for cell "
-                    f"{cell.label}: its signature differs from its capture-time "
-                    "signature"
+                inputs_embeds = torch.empty(
+                    cell.population, hidden_size, dtype=torch.float32, device=device
+                )
+                try:
+                    inputs = self._cell_inputs(
+                        core,
+                        cell,
+                        input_ids,
+                        inputs_embeds,
+                        pools=pools,
+                        call=call,
+                        block_ids=free[: cell.population],
+                        num_pool_blocks=num_pool_blocks,
+                        null_block_id=null_block_id,
+                    )
+                except Exception as error:
+                    raise failed(
+                        f"cell {cell.label}",
+                        f"its capture rows no longer prepare over live state: {error}",
+                    ) from error
+                live = transaction_signature(
+                    core,
+                    inputs,
+                    input_ids,
+                    inputs_embeds,
+                    graph_covers_decode=call.graph_covers_decode,
+                )
+                del inputs
+                change = _signature_change(self._graphs[cell].signature, live, pools)
+                if change is not None:
+                    raise failed(
+                        f"cell {cell.label}",
+                        f"its signature's {change} changed since capture",
+                    )
+        finally:
+            consume_batch_stats()
+        key = _startup_key(
+            pools,
+            call,
+            hidden_size=hidden_size,
+            device=device,
+            null_block_id=null_block_id,
+        )
+        pool = _first_change(_pool_names(pools), startup.key[0], key[0])
+        if pool is not None:
+            raise failed(f"cells {labels}", f"resident pool {pool} changed")
+        binding = _first_change(_CALL_FIELDS, startup.key[1], key[1])
+        if binding is not None:
+            raise failed(f"cells {labels}", f"call binding {binding} changed")
+        external = _external_buffers(core, nested)
+        for name, layout in startup.external.items():
+            if external.get(name) != layout:
+                raise failed(
+                    f"cells {labels}",
+                    f"buffer {name} changed from {layout} to {external.get(name)}",
                 )
 
     # ----------------------------------------------------------- execution

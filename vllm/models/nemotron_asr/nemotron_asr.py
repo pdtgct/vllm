@@ -139,10 +139,16 @@ def _transaction_graph_populations(vllm_config: Any, hf_config: Any) -> tuple[in
     if getattr(compilation, "cudagraph_mm_encoder", False):
         raise ValueError(f"{option} requires cudagraph_mm_encoder disabled")
     lookaheads = getattr(hf_config, "supported_num_lookahead_tokens", None)
-    if lookaheads is None or [int(value) for value in lookaheads] != [0]:
+    # Exactly the integer 0: no coercion, so 0.5, True and "0" are rejected.
+    if not (
+        isinstance(lookaheads, (list, tuple))
+        and len(lookaheads) == 1
+        and type(lookaheads[0]) is int
+        and lookaheads[0] == 0
+    ):
         raise ValueError(
             f"{option} serves only g0: supported_num_lookahead_tokens must be "
-            f"[0], not {lookaheads}"
+            f"[0], not {lookaheads!r}"
         )
     scheduler = vllm_config.scheduler_config
     bound = min(int(scheduler.max_num_seqs), int(scheduler.max_num_batched_tokens))
@@ -584,6 +590,9 @@ class NemotronASRForRNNT(nn.Module):
                 chunk_populations,
             )
         self._transaction_graph = None
+        # The resident storage serving capture ran over; post-warmup
+        # verification re-projects the live pools from it.
+        self._transaction_storage: Any = None
         if transaction_populations:
             from vllm.models.nemotron_asr.transaction_graph import (
                 TransactionGraphBinding,
@@ -989,24 +998,22 @@ class NemotronASRForRNNT(nn.Module):
         """Capture the declared transaction cells over allocated resident pools.
 
         ``storage`` exposes the aggregate state group's ``spec`` and named
-        component ``views``. Runs once the execution inventory is ready. A
-        repeated call over identical pools and call bindings is a verified
-        no-op; any change, or a failed capture, is worker-fatal.
+        component ``views``. Runs once the execution inventory is ready and,
+        on CUDA, after admission measured the inventory. A repeated call over
+        identical pools and call bindings is a verified no-op; any change, or a
+        failed capture, is worker-fatal.
         """
         binding = self._transaction_graph
         if binding is None:
             return
-        from vllm.models.nemotron_asr.state_profile import (
-            project_nemotron_state_pools,
-        )
         from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
         self._require_execution_inventory_ready()
-        resident = _transaction_pools(
-            project_nemotron_state_pools(storage, n_layers=int(self.config.n_layers))
-        )
+        resident = self._project_transaction_pools(storage)
         try:
             if not binding.serving_captured:
+                if resident.queue.device.type == "cuda":
+                    binding.require_admission()
                 _warm_scatter(resident)
             binding.capture(
                 self.core,
@@ -1015,20 +1022,56 @@ class NemotronASRForRNNT(nn.Module):
                 hidden_size=int(self.config.hidden_size),
                 device=resident.queue.device,
                 null_block_id=int(NULL_BLOCK_ID),
+                nested=self._nested_execution_bindings(),
             )
         except Exception:
             binding.discard()
             raise
+        self._transaction_storage = storage
+
+    def _project_transaction_pools(self, storage: Any) -> TransactionPools:
+        from vllm.models.nemotron_asr.state_profile import (
+            project_nemotron_state_pools,
+        )
+
+        return _transaction_pools(
+            project_nemotron_state_pools(storage, n_layers=int(self.config.n_layers))
+        )
+
+    def _nested_execution_bindings(self) -> tuple[Any, ...]:
+        """The nested bindings whose scratch the outer transaction body reads."""
+        return tuple(
+            binding
+            for binding in (self._encoder_execution, self._decode_graph_binding)
+            if binding is not None
+        )
 
     def verify_transaction_graphs(self) -> None:
         """Verify every published transaction cell after the worker warmups.
 
-        Until a core post-warmup hook exists, the model state runs this once on
-        the first non-dummy step. A mismatch is worker-fatal.
+        Every cell is checked against the live resident pools, call bindings
+        and nested bindings. Until a core post-warmup hook exists, the model
+        state runs this once on the first non-dummy step. A mismatch is
+        worker-fatal.
         """
         binding = getattr(self, "_transaction_graph", None)
-        if binding is not None:
-            binding.verify_after_warmup(self.core)
+        if binding is None:
+            return
+        from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
+        storage = self._transaction_storage
+        binding.verify_after_warmup(
+            self.core,
+            resident_pools=(
+                None
+                if storage is None
+                else lambda: self._project_transaction_pools(storage)
+            ),
+            call=self._transaction_call_bindings(),
+            hidden_size=int(self.config.hidden_size),
+            null_block_id=int(NULL_BLOCK_ID),
+            nested=self._nested_execution_bindings(),
+        )
 
     def execution_profile_receipt(self) -> dict[str, Any]:
         """Report the resolved execution arms and startup coverage."""

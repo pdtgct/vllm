@@ -1639,6 +1639,37 @@ class ResolvedEncoderExecution:
                 destination[:live].copy_(source[:live])
             return entry.raw[:live].clone(), entry.conditioned[:live].clone()
 
+    def external_tensors(self) -> dict[str, torch.Tensor]:
+        """Every graph entry's stable storage, keyed by entry and field.
+
+        An enclosing capture that runs these entries eagerly records the
+        addresses of these tensors, so they must not be rebound after it.
+        """
+        tensors: dict[str, torch.Tensor] = {}
+        for key, entry in self._graph_entries.items():
+            prefix = "encoder.graph." + ".".join(str(part) for part in key)
+            storage = entry.cache_storage()
+            named: list[tuple[str, torch.Tensor | None]] = [
+                ("mel", entry.mel),
+                ("out_offsets", entry.out_offsets),
+                ("out_lengths", entry.out_lengths),
+                ("prompt_index", entry.prompt_index),
+                ("mel_lengths", entry.mel_lengths),
+                ("raw", entry.raw),
+                ("conditioned", entry.conditioned),
+            ]
+            for family in ("channel", "time", "valid"):
+                named += [
+                    (f"cache.{family}.{index}", tensor)
+                    for index, tensor in enumerate(getattr(storage, family))
+                ]
+            tensors.update(
+                (f"{prefix}.{name}", tensor)
+                for name, tensor in named
+                if tensor is not None
+            )
+        return tensors
+
     def ready_receipt(self) -> dict[str, Any]:
         """Return the machine-readable resolved-arm readiness receipt."""
         receipt: dict[str, Any] = {

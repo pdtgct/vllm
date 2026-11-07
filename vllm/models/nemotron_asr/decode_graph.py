@@ -158,6 +158,34 @@ class DenseGraphBinding:
     def captured_keys(self) -> tuple[tuple[Any, ...], ...]:
         return tuple(sorted(self._entries))
 
+    def external_tensors(self) -> dict[str, torch.Tensor]:
+        """Every entry's stable input and output storage, keyed by entry and field.
+
+        An enclosing capture that runs these entries eagerly records the
+        addresses of these tensors, so they must not be rebound after it.
+        """
+        fields = (
+            "enc_frames",
+            "enc_lengths",
+            "h",
+            "c",
+            "last_label",
+            "token_ids",
+            "token_lengths",
+            "out_h",
+            "out_c",
+            "out_last_label",
+            "frame_emission_counts",
+            "frame_final_labels",
+        )
+        return {
+            f"decode.graph.{'.'.join(str(part) for part in key)}.{name}": getattr(
+                entry, name
+            )
+            for key, entry in self._entries.items()
+            for name in fields
+        }
+
     def execution_tier(self, live_rows: int) -> int:
         for tier in self._tiers:
             if live_rows <= tier:

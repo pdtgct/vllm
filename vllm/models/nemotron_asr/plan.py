@@ -249,18 +249,6 @@ def reject_unsupported_outer_graph_mode(compilation_config: object) -> None:
         )
 
 
-def _served_geometry_set(
-    num_geometries: int | None, served_geometries: Collection[int] | None
-) -> frozenset[int]:
-    """The admitted geometry ids; ``num_geometries`` admits ``0..n-1``."""
-    if (num_geometries is None) == (served_geometries is None):
-        raise TypeError("pass exactly one of served_geometries or num_geometries")
-    if served_geometries is None:
-        assert num_geometries is not None
-        return frozenset(range(num_geometries))
-    return frozenset(int(geometry) for geometry in served_geometries)
-
-
 def _header_int(header: tuple[float, ...], slot: int, name: str) -> int:
     value = header[slot]
     if not math.isfinite(value) or value != math.trunc(value):
@@ -465,9 +453,8 @@ class SessionRegistry:
         placeholder_id: int,
         num_prompts: int,
         now_ns: int,
+        served_geometries: Collection[int],
         resident_request_ids: Sequence[str] | None = None,
-        served_geometries: Collection[int] | None = None,
-        num_geometries: int | None = None,
     ) -> tuple[PreparedRowBinding, ...]:
         """Mint one binding per observed row, atomically per step.
 
@@ -488,9 +475,8 @@ class SessionRegistry:
 
         ``served_geometries`` is the configured served geometry set; a CHUNK
         header naming any other geometry fails here, before the delta commit.
-        ``num_geometries`` admits every geometry id below it instead.
         """
-        served = _served_geometry_set(num_geometries, served_geometries)
+        served = frozenset(int(geometry) for geometry in served_geometries)
         if now_ns <= 0:
             raise ValueError("now_ns must be a positive wall-clock nanosecond stamp")
         # Two-phase delta commit: validate the complete row set against
@@ -665,8 +651,7 @@ def prepare_plan_context(
     num_prompts: int,
     now_ns: int,
     step: int,
-    served_geometries: Collection[int] | None = None,
-    num_geometries: int | None = None,
+    served_geometries: Collection[int],
 ) -> PlanContext:
     """One hook invocation: prune, mint bindings, build the columns."""
     bindings = registry.bind_rows(
@@ -676,7 +661,6 @@ def prepare_plan_context(
         now_ns=now_ns,
         resident_request_ids=resident_request_ids,
         served_geometries=served_geometries,
-        num_geometries=num_geometries,
     )
     return PlanContext(
         step=step,

@@ -20,7 +20,6 @@ carrier token during the prompt-update stage.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Any
 
 import numpy as np
 import torch
@@ -54,18 +53,9 @@ from vllm.multimodal.processing.processor import (
 _DUMMY_SAMPLES = 16_000
 
 
-def _declared_geometries(hf_config: Any) -> tuple[int, ...] | None:
-    """The served geometry ids, or ``None`` when every cadence is served."""
-    if getattr(hf_config, "supported_num_lookahead_tokens", None) is None:
-        return None
-    return served_geometry_ids(hf_config)
-
-
-def _reject_unserved_geometry(
-    envelope: torch.Tensor, served: tuple[int, ...] | None
-) -> None:
+def _reject_unserved_geometry(envelope: torch.Tensor, served: tuple[int, ...]) -> None:
     """Fail one request whose envelope names a geometry outside ``served``."""
-    if served is None or envelope.numel() <= ENV_GEOMETRY_ID:
+    if envelope.numel() <= ENV_GEOMETRY_ID:
         return
     geometry = float(envelope[ENV_GEOMETRY_ID])
     if not geometry.is_integer() or int(geometry) not in served:
@@ -101,8 +91,8 @@ class NemotronASRDummyInputsBuilder(BaseDummyInputsBuilder[NemotronASRProcessing
     ) -> MultiModalDataDict:
         num_audios = mm_counts.get("audio", 0)
         audios = self._get_dummy_audios(length=_DUMMY_SAMPLES, num_audios=num_audios)
-        served = _declared_geometries(self.info.get_hf_config())
-        if audios and served is not None and 0 not in served:
+        served = served_geometry_ids(self.info.get_hf_config())
+        if audios and 0 not in served:
             # The silent profile chunk must name a served geometry too.
             audio = audios[0].copy()
             audio[ENV_GEOMETRY_ID] = float(min(served))
@@ -119,9 +109,10 @@ class NemotronASRMultiModalProcessor(
     the raw chunk directly (the model's ``embed_multimodal`` owns the
     mel front-end). The realtime prompt carries exactly one placeholder
     token, so placeholder positions are built manually (one carrier row
-    per audio) rather than by text-target replacement. When the served
-    geometry set is configured, an envelope naming any other geometry is
-    rejected here, so that request fails alone before engine execution.
+    per audio) rather than by text-target replacement. An envelope naming a
+    geometry outside the served set (every published cadence unless
+    ``supported_num_lookahead_tokens`` narrows it) is rejected here, so that
+    request fails alone before engine execution.
     """
 
     def _cached_apply_hf_processor(
@@ -148,7 +139,7 @@ class NemotronASRMultiModalProcessor(
         # via _encode_nested_tensors, which only handles torch tensors
         # (it recurses into an ndarray and chokes on the scalar leaves).
         arrays = [torch.as_tensor(np.asarray(a, dtype=np.float32)) for a in audios]
-        served = _declared_geometries(self.info.get_hf_config())
+        served = served_geometry_ids(self.info.get_hf_config())
         for array in arrays:
             _reject_unserved_geometry(array, served)
         return BatchFeature({**passthrough_data, "audio": arrays})

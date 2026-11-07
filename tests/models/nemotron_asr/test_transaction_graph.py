@@ -3142,7 +3142,9 @@ def test_option_rejects_every_outer_cudagraph_mode_but_none(
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize(
-    "lookaheads", [[1], [0, 1], [3], _ABSENT], ids=["g1", "g0-g1", "g2", "every"]
+    "lookaheads",
+    [[1], [0, 1], [3], _ABSENT, [0.5], [True], ["0"]],
+    ids=["g1", "g0-g1", "g2", "every", "fractional", "bool", "string"],
 )
 def test_option_rejects_served_geometries_other_than_g0(
     monkeypatch: pytest.MonkeyPatch, lookaheads: Any
@@ -3824,10 +3826,24 @@ def test_capture_reaches_pools_only_through_the_startup_accessor(
 
 
 def _verified_model(
-    monkeypatch: pytest.MonkeyPatch, *, num_blocks: int = 3
+    monkeypatch: pytest.MonkeyPatch, *, num_blocks: int = 3, graphed: bool = False
 ) -> tuple[Any, NemotronASRModelState, StateSlotBindings]:
-    """A served model with every cell captured over resident slots."""
-    model, config = _model(monkeypatch)
+    """A served model with every cell captured over resident slots.
+
+    ``graphed`` serves the graphed encoder and decode arms over the CPU
+    re-executing runtime, so the outer body reads their entries' scratch.
+    """
+    hf: dict[str, Any] = {}
+    if graphed:
+        from vllm.models.nemotron_asr import decode_graph, encoder_execution
+
+        monkeypatch.setattr(encoder_execution, "platform_graph_runtime", _rerun_runtime)
+        monkeypatch.setattr(decode_graph, "platform_graph_runtime", _rerun_runtime)
+        hf = {
+            "encoder_execution_arm": "eager-graphed",
+            "decode_dispatch_arm": "dense-graphed",
+        }
+    model, config = _model(monkeypatch, **hf)
     model.prepare_execution_memory()
     state, slots = _model_state(model, config, num_blocks=num_blocks)
     state.initialize_state_slots(slots)
@@ -3844,50 +3860,82 @@ def _resize_positional_buffer(model: Any) -> None:
     )
 
 
-def _assert_names_cell_and_buffer(model: Any, message: str) -> None:
-    assert "transaction_graph_populations" in message
-    assert any(cell.label in message for cell in model._transaction_graph.cells)
-    assert "pos_enc" in message
+#: Post-warmup changes to the live inputs of every cell signature and to
+#: binding-external buffers, each of which the verification must reject.
+_VERIFY_MISMATCHES = (
+    "resized-buffer",
+    "relocated-buffer",
+    "rebound-encoder-transition",
+    "relocated-pool-view",
+    "lazy-projection",
+    "relocated-encoder-entry",
+    "relocated-decoder-entry",
+)
+#: The mismatches in nested-binding scratch, which need the graphed arms.
+_NESTED_MISMATCHES = ("relocated-encoder-entry", "relocated-decoder-entry")
 
 
-#: Post-warmup changes the verification must reject.
-_VERIFY_MISMATCHES = ("resized-buffer", "relocated-buffer", "later-cell-signature")
-
-
-def _later_cell(binding: tg.TransactionGraphBinding) -> tg.TransactionCell:
-    """A cell first in neither declaration nor capture order."""
-    first = {binding.cells[0].label} | {
-        entry["cell"]
-        for entry in binding.receipt()["cells"]
-        if entry["capture_index"] == 0
-    }
-    return next(cell for cell in reversed(binding.cells) if cell.label not in first)
-
-
-def _verification_mismatch(model: Any, kind: str) -> Callable[[str], None]:
-    """Apply mismatch ``kind``; return a check of the error message.
+def _verification_mismatch(
+    model: Any, slots: StateSlotBindings, kind: str
+) -> Callable[[str], None]:
+    """Change one live input after capture; return a check of the error message.
 
     ``relocated-buffer`` moves the positional buffer to a same-size copy, so
-    only its address changes; ``later-cell-signature`` changes one later
-    cell's captured signature and no buffer.
+    only its address changes. ``rebound-encoder-transition`` rebinds the
+    encoder transition every call binds; ``relocated-pool-view`` moves one
+    resident pool view; ``lazy-projection`` binds the encoder's lazily prepared
+    positional projections. The nested cases move one encoder graph entry's
+    mel storage or one decode graph entry's frame input.
     """
+
+    def names(*parts: str) -> Callable[[str], None]:
+        def check(message: str) -> None:
+            assert "transaction_graph_populations" in message
+            assert any(
+                cell.label in message for cell in model._transaction_graph.cells
+            ), message
+            for part in parts:
+                assert part in message, message
+
+        return check
+
+    encoder = model.core.encoder
     if kind == "resized-buffer":
         _resize_positional_buffer(model)
-        return lambda message: _assert_names_cell_and_buffer(model, message)
+        return names("encoder.pos_enc.pe")
     if kind == "relocated-buffer":
-        encoder = model.core.encoder
         encoder.pos_enc.pe = encoder.pos_enc.pe.clone()
-        return lambda message: _assert_names_cell_and_buffer(model, message)
-    binding = model._transaction_graph
-    cell = _later_cell(binding)
-    graph = binding._graphs[cell]
-    graph.signature = (*graph.signature, "changed")
-
-    def check(message: str) -> None:
-        assert "transaction_graph_populations" in message
-        assert cell.label in message
-
-    return check
+        return names("encoder.pos_enc.pe")
+    if kind == "rebound-encoder-transition":
+        execution = model._encoder_execution
+        transition = execution.transition
+        execution.transition = lambda *args, **kwargs: transition(*args, **kwargs)
+        return names("encoder transition")
+    if kind == "relocated-pool-view":
+        views = slots.views[model._persistent_state_layer.prefix]._views
+        name = "encoder.layers.0.window.channel"
+        views[name] = views[name].clone()
+        return names("resident pool channel.0")
+    if kind == "lazy-projection":
+        assert encoder._stream_relative_position_lengths == ()
+        with torch.inference_mode():
+            encoder.prepare_stream_relative_position_projections(
+                out_widths=(2,), cache_len=WINDOW, reference=encoder.pos_enc.pe
+            )
+        assert encoder._stream_relative_position_lengths
+        return names("lazily bound buffer encoder.")
+    if kind == "relocated-encoder-entry":
+        entries = model._encoder_execution._graph_entries
+        assert entries
+        entry = next(iter(entries.values()))
+        entry.mel = entry.mel.clone()
+        return names("buffer encoder.graph.", ".mel")
+    assert kind == "relocated-decoder-entry"
+    entries = model._decode_graph_binding._entries
+    assert entries
+    entry = next(iter(entries.values()))
+    entry.enc_frames = entry.enc_frames.clone()
+    return names("buffer decode.graph.", ".enc_frames")
 
 
 @pytest.mark.cpu_test
@@ -3896,10 +3944,12 @@ def test_post_warmup_verification_rejects_resized_external_buffer(
     monkeypatch: pytest.MonkeyPatch, cpu_readings: SimpleNamespace, mismatch: str
 ) -> None:
     cpu_readings.expected = 5
-    model, _state, _slots = _verified_model(monkeypatch)
+    model, _state, slots = _verified_model(
+        monkeypatch, graphed=mismatch in _NESTED_MISMATCHES
+    )
     verify = _seam(model, "verify_transaction_graphs")
     verify()
-    check = _verification_mismatch(model, mismatch)
+    check = _verification_mismatch(model, slots, mismatch)
     with pytest.raises(RuntimeError, match="transaction_graph_populations") as raised:
         verify()
     check(str(raised.value))
@@ -3962,12 +4012,14 @@ def test_first_real_step_mismatch_is_fatal_before_any_state_change(
     monkeypatch: pytest.MonkeyPatch, cpu_readings: SimpleNamespace, mismatch: str
 ) -> None:
     cpu_readings.expected = 5
-    model, state, slots = _verified_model(monkeypatch)
+    model, state, slots = _verified_model(
+        monkeypatch, graphed=mismatch in _NESTED_MISMATCHES
+    )
     pruned: list[Any] = []
     monkeypatch.setattr(model._registry, "prune", pruned.append)
     resident = slots.views[model._persistent_state_layer.prefix]._tensor
     before = resident.clone()
-    check = _verification_mismatch(model, mismatch)
+    check = _verification_mismatch(model, slots, mismatch)
     with pytest.raises(RuntimeError, match="transaction_graph_populations") as raised:
         state.prepare_step(
             SchedulerOutput.make_empty(), dummy_run=False, is_profile=False

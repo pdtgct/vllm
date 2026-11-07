@@ -509,7 +509,10 @@ Worker warmups run after serving capture and can resize workspaces:
 `kernel_warmup`, `warmup_kernels` and the compile dummy runs
 (`gpu_worker.py:980-1004`). Every published cell's signature, together with
 the address and size of every binding-external buffer its graph reads, is
-verified after those warmups and before the worker serves.
+verified after those warmups and before the worker serves. The binding-external
+buffers are the core's parameters and buffers and the entry scratch of the
+nested encoder and decode graph bindings, which each reports through its
+`external_tensors()` inventory.
 
 This branch has no runner or `ModelState` hook after
 `_compile_or_warm_up_model` (with `cudagraph_mode` `NONE`, `capture_model`
@@ -828,6 +831,9 @@ page tensor. A "configuration error" is a `ValueError` whose message contains
 two pool configurations: endpoint history and book pools and `eou_token_id`
 present, or all absent (`advance.py:3029-3035`); neither is a step policy.
 "Endpoint" always means utterance endpointing, never endpoint plugins.
+Arena-only data flow into a replayed cell is a CUDA-level property, observed by
+TXG-REP-010, TXG-REP-011 and TXG-REP-017; the CPU re-executing runtime re-runs
+the body on the live call's inputs and cannot observe it.
 
 ### Configuration and envelope (ENV)
 
