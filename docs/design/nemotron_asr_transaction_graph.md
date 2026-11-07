@@ -393,7 +393,11 @@ that is measured.
 synchronize, `gc.collect()` and an allocator `empty_cache()`, with no other
 allocation in flight, using `mem_get_info`. Every admission figure is a
 difference of two `N()` readings. This includes memory the torch allocator does
-not track: instantiated graphs and fragmentation.
+not track: instantiated graphs and fragmentation. Only the admission release
+check reads the allocator itself (Ordering): free memory does not rise when a
+release leaves its block in a segment the allocator keeps, so the check
+compares the allocator's allocated bytes, which are exact for storage of any
+size.
 
 ### Capture-lifetime rule
 
@@ -424,11 +428,15 @@ makes the binding ready.
    through the same capture path, cell order, capture stream and verification
    as serving capture; clear every capture-only temporary (page snapshots,
    expected outputs, capture and verify callbacks, capture inputs) while the
-   admission holder retains the stand-in storage explicitly; read `Na`;
-   release the stand-in storage; read `N1`. Release is verified when `N1 - Na
-   >= stand-in bytes` and no owning reference to the stand-in storage remains
-   (checked separately through a weak reference), else startup fails. Admitted
-   bytes are `A = N0 - N1`. Stand-in
+   admission holder retains the stand-in storage explicitly; read `Na`, then
+   the allocator's allocated bytes on the device; release the stand-in
+   storage; read `N1`, then the allocated bytes again. Release is verified
+   when the allocated bytes drop by at least the stand-in bytes between the
+   two allocated-bytes readings and no owning reference to the stand-in
+   storage remains (checked separately through a weak reference), else
+   startup fails. Admitted bytes are `A = N0 - N1`, a free-memory difference:
+   stand-in storage released into a segment the allocator keeps stays in `A`,
+   which can only over-charge. Stand-in
    storage provides capture indices and matching component strides, not
    proven-identical allocator or graph-exec bytes; the final check is the
    authority.
@@ -870,12 +878,12 @@ the body on the live call's inputs and cannot observe it.
 - **TXG-MEM-002**: When `transaction_graph_populations` is non-empty, `prepare_execution_memory` shall, after the nested inventory is ready and before the eager profile transactions, capture every declared cell (never a subset or an extrapolation) over stand-in storage of `max(populations) + 1` slots with the real persistent-state layout into a dedicated graph pool, using the same capture path, cell order, capture stream and replay self-check as serving capture.
   - Design: Ordering
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_admission_captures_full_inventory_before_eager_profiles` (new; call order and captured-cell inventory) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_cuda_admission_and_serving_capture_share_cell_order` (new; capture stream identical across both inventories and the admission graph pool handle distinct from the platform and nested pools) [CUDA]
-- **TXG-MEM-003**: When `transaction_graph_populations` is non-empty, every admission reading `N()` (`N0`, `Na`, `N1`, `Ns0`, `Ns1`) shall be a `mem_get_info` free-memory value taken after a device synchronize, `gc.collect()` and an allocator `empty_cache()`; `Na` shall be read after every capture-only temporary (page snapshots, expected outputs, capture and verify callbacks, capture inputs) is cleared and while the admission holder still retains the stand-in storage, and `N1` after that storage is released; and the model shall compute `A = N0 - N1` and `S = Ns0 - Ns1`.
+- **TXG-MEM-003**: When `transaction_graph_populations` is non-empty, every admission reading `N()` (`N0`, `Na`, `N1`, `Ns0`, `Ns1`) shall be a `mem_get_info` free-memory value taken after a device synchronize, `gc.collect()` and an allocator `empty_cache()`; `Na` shall be read after every capture-only temporary (page snapshots, expected outputs, capture and verify callbacks, capture inputs) is cleared and while the admission holder still retains the stand-in storage, and `N1` after that storage is released; the model shall read the allocator's allocated bytes on the device (`torch.cuda.memory_allocated`) immediately after the `Na` and the `N1` readings; and the model shall compute `A = N0 - N1` and `S = Ns0 - Ns1` from free memory alone.
   - Design: Normalized measurement; Ordering
-  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_normalized_readings_synchronize_collect_and_empty_first` (new; also the order: temporaries cleared, `Na`, stand-in release, `N1`) [CPU, patched device calls]
-- **TXG-MEM-004**: When `transaction_graph_populations` is non-empty, if `N1 - Na` is less than the stand-in storage bytes after admission release, or any owning reference to the stand-in storage survives its release, then startup shall fail with an error naming `transaction_graph_populations` and reporting both figures.
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_normalized_readings_synchronize_collect_and_empty_first` (new; also the order: temporaries cleared, `Na` and its allocated-bytes reading, stand-in release, `N1` and its allocated-bytes reading; release verified with no free-memory rise at release) [CPU, patched device calls]
+- **TXG-MEM-004**: When `transaction_graph_populations` is non-empty, if the allocator's allocated bytes drop by less than the stand-in storage bytes between the readings taken with `Na` and `N1`, or any owning reference to the stand-in storage survives its release, then startup shall fail with an error naming `transaction_graph_populations` and reporting both figures (the allocated-bytes drop and the stand-in bytes).
   - Design: Ordering
-  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_unverified_admission_release_fails_startup` (new; injected readings, and a weak reference to the stand-in storage kept alive by an injected owner) [CPU]
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_unverified_admission_release_fails_startup` (new; injected allocated-bytes readings one byte short while free memory rises past the stand-in bytes, and a weak reference to the stand-in storage kept alive by an injected owner) [CPU]
 - **TXG-MEM-005**: When `transaction_graph_populations` is non-empty, `capture_transaction_graphs` shall release the admission holder and its graph pool before reading `Ns0`, and shall capture the serving inventory into a fresh dedicated graph pool distinct from the admission pool.
   - Design: Ordering
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_serving_capture_releases_admission_before_measuring` (new; release before the `Ns0` read, call order) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_cuda_serving_pool_is_distinct_from_released_admission_pool` (new; pool handles differ, `Ns0` read after the admission pool is released) [CUDA]
@@ -884,7 +892,7 @@ the body on the live call's inputs and cannot observe it.
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_serving_bytes_above_admission_fail_startup` (new) [CPU, injected readings including `S = A + 1`]
 - **TXG-MEM-007**: When `transaction_graph_populations` is non-empty and neither `num_gpu_blocks_override` nor `kv_cache_memory_bytes` is set, `non_kv_cache_memory` from the memory-profiling window shall include the retained admission inventory and the admission preparation and capture peak, with no deduction for retained memory the peak headroom also counts, so resident capacity is fixed from the remaining budget; and the admission holder shall be alive when `prepare_execution_memory` returns, stay alive through the eager profile transactions and the window close, and be released only in `capture_transaction_graphs`.
   - Design: Budget mechanics; Ordering
-  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_admission_holder_lives_until_serving_capture` (new; event order of holder release against `prepare_execution_memory` return, eager profiles, window close and `capture_transaction_graphs`) [CPU]; `tests/v1/engine/test_nemotron_asr.py::test_nemotron_engine_transaction_graph_admission_is_charged` (new; option-on minus option-off: `non_kv_cache_memory >= A` as the integration check, `total_consumed >= A` for retention, `transient_peak_headroom` not smaller, and a memory-bound run whose block count equals the count core derives from the reduced budget) [engine-CUDA]
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_admission_holder_lives_until_serving_capture` (new; event order of holder release against `prepare_execution_memory` return, eager profiles, window close and `capture_transaction_graphs`) [CPU]; `tests/v1/engine/test_nemotron_asr.py::test_nemotron_engine_transaction_graph_admission_is_charged` (new; option-on minus option-off, where the option-off arm runs twice before the option-on arm, takes admission's normalized readings at the admission point, and is represented by its second run because the first engine in a process also creates process-wide device memory that later engines start with; the spread between the two option-off runs is reported, with no tolerance below `A`: `non_kv_cache_memory >= A` as the integration check, `total_consumed >= A` for retention, `transient_peak_headroom` not smaller, and a memory-bound run whose block count equals the count core derives from the reduced budget) [engine-CUDA]
 - **TXG-MEM-008**: When `transaction_graph_populations` is non-empty and `num_gpu_blocks_override` or `kv_cache_memory_bytes` is set, the model shall still measure and report `A` and check `S <= A` under either override, and shall not itself change the resident block count, which core derives from the override once its budget validation accepts the configuration; and if serving capture then raises or runs out of memory, then startup shall fail with an admission-failure error naming `transaction_graph_populations`. Planner rejection of an oversized override is TXG-MEM-011 and KV-allocation failure is TXG-MEM-012, both core-owned.
   - Design: Capacity overrides
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_override_capacity_reports_admission_and_wraps_failures` (new; `A` and the `S <= A` check under each override, the model requesting no block-count change, and serving-capture failure) [CPU]

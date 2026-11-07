@@ -372,6 +372,18 @@ def normalized_free_memory(device: torch.device) -> int | None:
     return int(free)
 
 
+def allocated_bytes(device: torch.device) -> int | None:
+    """Bytes the caching allocator has allocated on the device.
+
+    Exact for storage of any size, unlike free memory, which does not change
+    when a release leaves its block in a segment the allocator keeps. Returns
+    ``None`` off CUDA.
+    """
+    if device.type != "cuda":
+        return None
+    return int(torch.cuda.memory_allocated(device))
+
+
 def device_memory_info(device: torch.device) -> tuple[int | None, int | None]:
     """The device's free and total memory; ``(None, None)`` off CUDA."""
     if device.type != "cuda":
@@ -831,8 +843,9 @@ class TransactionGraphBinding:
         transactions. ``allocate(slots)`` returns raw stand-in storage of
         ``slots`` pages with the real layout and its pools. The unpublished
         inventory stays alive until serving capture releases it. The stand-in
-        storage is released after ``Na``; release is verified when ``N1 - Na``
-        covers its bytes and no owning reference survives. ``A = N0 - N1``.
+        storage is released after ``Na``; release is verified when the
+        allocator's allocated bytes, read with ``Na`` and ``N1``, drop by at
+        least its bytes and no owning reference survives. ``A = N0 - N1``.
         """
         self.check_latch()
         if self._startup is not None or self._admission is not None:
@@ -858,9 +871,12 @@ class TransactionGraphBinding:
                 progress=progress,
             )
             del pools
-            retained = normalized_free_memory(device)
+            # Na: after the synchronize and collection, allocated bytes are settled.
+            normalized_free_memory(device)
+            held = allocated_bytes(device)
             holder.storage = None
             released = normalized_free_memory(device)
+            freed = allocated_bytes(device)
         except Exception as error:
             failure = self._inventory_error(
                 "admission", error, progress, device, baseline
@@ -871,15 +887,16 @@ class TransactionGraphBinding:
             raise failure from error
         inventory = holder.inventory
         assert inventory is not None
-        release = None if retained is None or released is None else released - retained
+        release = None if held is None or freed is None else held - freed
         owned = stand_in() is not None
         verified = not owned and (release is None or release >= stand_in_bytes)
         self._admission_release_verified = verified
         if not verified:
             holder.inventory = None
             message = (
-                f"{OPTION}: admission release is not verified: N1 - Na is "
-                f"{release} bytes for {stand_in_bytes} stand-in bytes"
+                f"{OPTION}: admission release is not verified: allocated bytes "
+                f"dropped by {release} between Na and N1 for {stand_in_bytes} "
+                "stand-in bytes"
             )
             if owned:
                 message += ", and an owning reference to the stand-in storage survived"

@@ -608,18 +608,29 @@ class _StandIn:
         return scratch.raw, pools
 
 
+#: Device total of the scripted readings; every scripted ``N()`` is below it.
+_SCRIPTED_TOTAL = 1 << 36
+
+
 def _free_memory(
     monkeypatch: pytest.MonkeyPatch,
     readings: Callable[[int], int],
     on_read: Callable[[int], None] | None = None,
+    allocated: Callable[[int], int] | None = None,
 ) -> list[int]:
     """Script every normalized free-memory reading ``N()`` by call index.
 
     Like the real reading, each call collects garbage first; ``on_read`` then
-    observes the process at that reading. Returns the call log.
+    observes the process at that reading. The allocator's allocated bytes
+    follow ``allocated`` by call index when given; otherwise they mirror the
+    latest ``N()`` as an allocator that tracks every byte would, so ``N1 -
+    Na`` is also the allocated-bytes release. Returns the ``N()`` call log.
     """
     _seam(tg, "normalized_free_memory")
+    _seam(tg, "allocated_bytes")
     calls: list[int] = []
+    latest: list[int] = []
+    allocated_calls: list[int] = []
 
     def read(_device: torch.device) -> int:
         gc.collect()
@@ -627,9 +638,19 @@ def _free_memory(
         calls.append(index)
         if on_read is not None:
             on_read(index)
-        return readings(index)
+        latest[:] = [readings(index)]
+        return latest[0]
+
+    def held(_device: torch.device) -> int:
+        index = len(allocated_calls)
+        allocated_calls.append(index)
+        if allocated is not None:
+            return allocated(index)
+        assert latest, "allocated bytes were read before any N() reading"
+        return _SCRIPTED_TOTAL - latest[0]
 
     monkeypatch.setattr(tg, "normalized_free_memory", read)
+    monkeypatch.setattr(tg, "allocated_bytes", held)
     return calls
 
 
@@ -832,7 +853,9 @@ def _capture_callbacks(graph: Any) -> list[weakref.ref[Any]]:
 def _budget(released: int, admitted: int, served: int) -> Callable[[int], int]:
     """Readings ``N0, Na, N1, Ns0, Ns1`` with ``N1 - Na == released``.
 
-    ``A = N0 - N1 == admitted`` and ``S = Ns0 - Ns1 == served``.
+    ``A = N0 - N1 == admitted`` and ``S = Ns0 - Ns1 == served``. Unless a test
+    scripts allocated bytes, they drop by ``released`` between ``Na`` and
+    ``N1`` too.
     """
     base = 1 << 34
     return _readings(base + admitted, base - released, base, base, base - served)
@@ -844,11 +867,12 @@ def cpu_readings(
 ) -> Iterator[SimpleNamespace]:
     """Deterministic admission readings for one CPU startup.
 
-    The readings ``N0, Na, N1, Ns0, Ns1`` release far more than any stand-in
-    and admit as many bytes as serving uses, so admission passes without real
-    device memory queries; later readings repeat ``Ns1``. A test whose sequence
-    is fixed sets ``expected``, checked at teardown when the test passed.
-    Tests of the readings patch their own.
+    The readings ``N0, Na, N1, Ns0, Ns1`` and the allocated bytes read with
+    ``Na`` and ``N1`` release far more than any stand-in and admit as many
+    bytes as serving uses, so admission passes without real device memory
+    queries; later readings repeat ``Ns1``. A test whose sequence is fixed
+    sets ``expected``, checked at teardown when the test passed. Tests of the
+    readings patch their own.
     """
     readings = SimpleNamespace(
         calls=_free_memory(monkeypatch, _budget(1 << 30, 1 << 20, 1 << 20)),
@@ -3293,6 +3317,11 @@ def test_normalized_readings_synchronize_collect_and_empty_first(
         for index, name in enumerate(device_calls)
         if index == 0 or name != device_calls[index - 1]
     ] == ["synchronize", "collect", "empty_cache", "mem_get_info"]
+    allocated_reading = _seam(tg, "allocated_bytes")
+    monkeypatch.setattr(torch.cuda, "memory_allocated", record("allocated", 11))
+    assert allocated_reading(torch.device("cuda", 0)) == 11
+    assert device_calls[-1] == "allocated"
+    assert allocated_reading(CPU) is None
     monkeypatch.undo()
 
     core = _core()
@@ -3300,28 +3329,35 @@ def test_normalized_readings_synchronize_collect_and_empty_first(
     stand_in = _StandIn()
     inputs = _track_capture_inputs(monkeypatch)
     prepared = _track_capture_cells(monkeypatch)
-    observed: dict[int, tuple[int, int, int]] = {}
+    order: list[tuple[str, int]] = []
+    observed: dict[tuple[str, int], tuple[int, int, int]] = {}
 
-    def observe(index: int) -> None:
-        observed[index] = (
+    def observe(kind: str, index: int) -> None:
+        order.append((kind, index))
+        observed[kind, index] = (
             len(_live(inputs)),
             len(_live([ref for record in prepared for ref in record.callbacks])),
             len(_live(stand_in.storage)),
         )
 
-    budget = _budget(4096, 1 << 20, 1 << 19)
-    _free_memory(
-        monkeypatch,
-        lambda index: (
-            budget(index) if index != 1 else budget(1) + 4096 - stand_in.nbytes[0]
-        ),
-        observe,
-    )
+    def allocated(index: int) -> int:
+        observe("allocated", index)
+        return (1 << 30) + (stand_in.nbytes[0] if index == 0 else 0)
+
+    # Free memory does not rise at the release, as when the stand-in shares a
+    # segment the allocator keeps; allocated bytes drop by exactly its size.
+    budget = _budget(0, 1 << 20, 1 << 19)
+    _free_memory(monkeypatch, budget, lambda index: observe("N", index), allocated)
     binding = _admission_binding()
     _admit(binding, core, call, stand_in)
-    assert observed[0][2] == 0, "N0 is read before the stand-in exists"
-    assert observed[1] == (0, 0, 1), "Na: temporaries cleared, stand-in retained"
-    assert observed[2][2] == 0, "N1 is read after the stand-in is released"
+    at_na, at_n1 = (("N", 1), ("allocated", 0)), (("N", 2), ("allocated", 1))
+    assert order == [("N", 0), *at_na, *at_n1]
+    assert observed["N", 0][2] == 0, "N0 is read before the stand-in exists"
+    for key in at_na:
+        assert observed[key] == (0, 0, 1), "Na: temporaries cleared, stand-in held"
+    for key in at_n1:
+        assert observed[key][2] == 0, "N1 is read after the stand-in is released"
+    assert binding.receipt()["admission_release_verified"] is True
     resident = _transaction_view(_scratch(3))
     _serve(binding, core, call, resident)
     receipt = binding.receipt()
@@ -3340,11 +3376,12 @@ def test_unverified_admission_release_fails_startup(
     stand_in = _StandIn(owner=owner if cause == "owner" else None)
     short = 1 if cause == "readings" else 0
 
-    def readings(index: int) -> int:
-        released = stand_in.nbytes[0] - short if stand_in.nbytes else 0
-        return _budget(released, 1 << 20, 1 << 20)(index)
+    def allocated(index: int) -> int:
+        drop = stand_in.nbytes[0] - short
+        return (1 << 30) + (drop if index == 0 else 0)
 
-    _free_memory(monkeypatch, readings)
+    # Free memory rises far above the stand-in bytes; only allocated bytes count.
+    _free_memory(monkeypatch, _budget(1 << 30, 1 << 20, 1 << 20), None, allocated)
     binding = _admission_binding()
     with pytest.raises(RuntimeError, match="transaction_graph_populations") as raised:
         _admit(binding, core, call, stand_in)

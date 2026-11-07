@@ -518,8 +518,38 @@ def test_nemotron_engine_transaction_graph_collection_failure_propagates_from_st
     assert transaction_graph_counters(model)["replays:chunk-fresh:g0:b1"] == 1
 
 
-def _startup_memory(hf_overrides, gpu_memory_utilization, max_num_seqs=8):
-    """Start an engine without a block override and report its memory figures."""
+def _read_where_admission_reads(monkeypatch):
+    """Take admission's normalized readings in an option-off engine.
+
+    Admission reads ``N0``, ``Na`` and ``N1`` after the nested warm-ups and
+    before the first eager profile transaction, and every reading releases the
+    allocator's cached blocks. The same readings at the same point leave an
+    option-off engine with the same allocator cache for the rest of the
+    profile window.
+    """
+    from vllm.models.nemotron_asr import profile_execution, transaction_graph
+
+    profile = profile_execution.run_persistent_state_profile
+    pending = [True]
+
+    def profiled(model, **kwargs):
+        if pending and kwargs.get("ready_domain"):
+            pending.clear()
+            for _ in range(3):
+                transaction_graph.normalized_free_memory(kwargs["device"])
+        return profile(model, **kwargs)
+
+    monkeypatch.setattr(profile_execution, "run_persistent_state_profile", profiled)
+
+
+def _startup_memory(
+    hf_overrides, gpu_memory_utilization, max_num_seqs=8, admission_readings=False
+):
+    """Start an engine without a block override and report its memory figures.
+
+    ``admission_readings`` makes an option-off engine take admission's
+    normalized readings where admission takes them.
+    """
     import gc
     from dataclasses import replace
 
@@ -534,7 +564,10 @@ def _startup_memory(hf_overrides, gpu_memory_utilization, max_num_seqs=8):
         gpu_memory_utilization=gpu_memory_utilization,
         hf_overrides=hf_overrides,
     )
-    core = EngineCore(args.create_engine_config(), UniProcExecutor, log_stats=False)
+    with pytest.MonkeyPatch.context() as patch:
+        if admission_readings:
+            _read_where_admission_reads(patch)
+        core = EngineCore(args.create_engine_config(), UniProcExecutor, log_stats=False)
     try:
         worker = core.model_executor.driver_worker.worker
         view = next(iter(worker.model_runner.state_slots.views.values()))
@@ -547,6 +580,7 @@ def _startup_memory(hf_overrides, gpu_memory_utilization, max_num_seqs=8):
             "budget": core.available_gpu_memory_for_kv_cache,
             "page": view.spec.page_size_bytes,
             "count": view.capacity,
+            "free": worker.init_snapshot.free_memory,
             "total": worker.init_snapshot.total_memory,
             "admitted": receipt.get("transaction", {}).get("admission_bytes"),
         }
@@ -563,22 +597,40 @@ def test_nemotron_engine_transaction_graph_admission_is_charged(monkeypatch):
 
     Option-on minus option-off at equal utilization must cover ``A`` in
     ``non_kv_cache_memory`` and in retained consumption, without shrinking the
-    transient peak. A third, memory-bound run sized from the option-on figures
-    must hold exactly the pages core derives from its reduced budget.
+    transient peak. The first engine in a process also creates process-wide
+    device memory that later engines start with, so the option-off arm runs
+    twice, first, and the option-on arm is compared with its second run; the
+    spread between the two option-off runs is reported. Both option-off runs
+    take admission's normalized readings where admission takes them. A final,
+    memory-bound run sized from the option-on figures must hold exactly the
+    pages core derives from its reduced budget.
     """
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     # Zero cudagraph estimate: peak_activation_memory is then the peak headroom.
     monkeypatch.setenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "0")
     max_num_seqs = 8
     option = {**_G0_BASE_OVERRIDES, "transaction_graph_populations": [1]}
-    off = _startup_memory(dict(_G0_BASE_OVERRIDES), 0.4, max_num_seqs)
+    first, off = [
+        _startup_memory(
+            dict(_G0_BASE_OVERRIDES), 0.4, max_num_seqs, admission_readings=True
+        )
+        for _ in range(2)
+    ]
     on = _startup_memory(option, 0.4, max_num_seqs)
     admitted = on["admitted"]
-    assert off["admitted"] is None
+    charged = ("non_kv", "total_consumed", "headroom")
+    figures = {
+        "A": admitted,
+        "on - off": {key: on[key] - off[key] for key in charged},
+        "first off - off": {key: first[key] - off[key] for key in charged},
+        "startup free": (first["free"], off["free"], on["free"]),
+    }
+    print(f"admission charge figures: {figures}")
+    assert first["admitted"] is None and off["admitted"] is None
     assert admitted is not None and admitted > 0
-    assert on["non_kv"] - off["non_kv"] >= admitted
-    assert on["total_consumed"] - off["total_consumed"] >= admitted
-    assert on["headroom"] >= off["headroom"]
+    assert on["non_kv"] - off["non_kv"] >= admitted, figures
+    assert on["total_consumed"] - off["total_consumed"] >= admitted, figures
+    assert on["headroom"] >= off["headroom"], figures
 
     # Aim the budget at 5.5 pages so memory, not max_num_seqs + 1, binds.
     utilization = (on["non_kv"] + 5.5 * on["page"]) / on["total"]
