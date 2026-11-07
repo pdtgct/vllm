@@ -270,6 +270,9 @@ Runner shutdown discards the binding's graphs, arenas and owned buffers.
 obligation owned by the core persistent-state design: a `ModelState` shutdown
 hook, alongside the post-warmup hook (Post-Warmup Verification). The model
 provides `TransactionGraphBinding.discard()` (`transaction_graph.py:396`).
+Until the hook exists the model takes no shutdown action: `shutdown` drops
+`model_state` (`model_runner.py:2510-2511`), and graphs, arenas and owned
+buffers are released with the model object.
 
 ### Process constants and excluded paths
 
@@ -493,7 +496,9 @@ requirement `cudagraph_mode == NONE` keeps the runner's graph estimator
 - Asynchronous device faults surface at the next synchronizing call, normally
   the commit-sink collection (`commit_sink.py:270`, via
   `model_state_v2.py:292`), which fails before any progress is published and
-  takes the same path. Faults are not attributed to cells and not resumed.
+  propagates to the same engine-death path. Collection runs outside
+  `execute`, so it does not latch the binding; the engine, not the model,
+  stops later steps. Faults are not attributed to cells and not resumed.
 - In-process callers of `advance_model_rows` see pre-boundary failures as
   structural failures; engine callers see any raise as engine death. Recovery
   is a fresh worker process.
@@ -591,8 +596,10 @@ Each item gives the current behavior on this branch, then the target.
 10. **Reader and shutdown.** `_resolve_model` returns `None` for an unreachable
     model, so the reader reports off (`transaction_graph.py:793-823`);
     `GPUModelRunner.shutdown` (`model_runner.py:2483-2511`) does not discard
-    the binding, and no `ModelState` shutdown hook exists. Target: the core
-    shutdown hook calling `discard()`.
+    the binding, and no `ModelState` shutdown hook exists; `discard()`
+    (`transaction_graph.py:396-399`) clears graphs only, not arenas or owned
+    buffers. Target: `discard()` drops all three, and the core shutdown hook
+    calls it.
 11. **Inaccurate comments.** `advance.py:3535-3536` says structural rejection
     runs on every invocation including graph replay; under outer replay it is
     frozen at capture. `transaction_graph.py:451-455` and the receipt
@@ -742,7 +749,7 @@ present, or all absent (`advance.py:3029-3035`); neither is a step policy.
 - **TXG-MEM-010**: When `transaction_graph_populations` is non-empty, if serving capture raises, or the usable slot count after capacity is fixed is less than `max(populations)`, then the binding shall discard every graph and `initialize_kv_cache` shall raise an error naming `transaction_graph_populations`, and no step shall be served eager in its place.
   - Design: Lifetime: one serving capture per worker; Failure modes and diagnostics
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_failed_capture_publishes_nothing_and_every_call_runs_eager` (existing; rewrite to assert startup failure) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_serving_capture_rejects_too_few_usable_slots` (new) [CPU]
-- **TXG-MEM-011**: When `transaction_graph_populations` is non-empty, if the persistent-state planner rejects the budget after admission (`count < 2` or `count * page_size_bytes > budget`), then startup shall fail with an error naming `transaction_graph_populations`, and no step shall be served eager in its place.
+- **TXG-MEM-011**: When `transaction_graph_populations` is non-empty, if the persistent-state planner rejects the budget after admission (`count < 2` or `count * page_size_bytes > budget`), then startup shall fail with an error naming `transaction_graph_populations`, and no step shall be served eager in its place. How core learns the contributing option name is the core persistent-state design's choice.
   - Design: Failure modes and diagnostics (core obligation owned by the core persistent-state design; deferred until that obligation lands, like TXG-CORE-*)
   - Test: `tests/v1/core/test_kv_cache_planning.py::test_state_planner_rejection_names_the_transaction_graph_option` (new; requires the core change) [CPU]
 
@@ -853,12 +860,12 @@ present, or all absent (`advance.py:3029-3035`); neither is a step policy.
 - **TXG-FAIL-004**: When `transaction_graph_populations` is non-empty, if any exception arises in `execute` from `graph.replay()` onward, including `CommitTicket.stage` failing after it set `_done`, or from a worker-fatal check (process constants, wrapper entry, post-warmup, changed reinitialization per TXG-LIFE-003), then the binding shall latch as failed and propagate the exception, and every later `execute` call, covered or fallback, shall raise `RuntimeError` containing "a fresh worker is required" before any classification, upload or replay.
   - Design: Failure Containment
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_replay_failure_cancels_the_reservation_once` (existing; extend with the latch and a later call) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_stage_failure_after_done_latches_the_binding` (new) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_every_fatal_source_latches_before_classification` (new; parametrized over replay, stage, process constant, wrapper entry, post-warmup and changed reinitialization × a later covered and a later fallback call) [CPU]
-- **TXG-FAIL-005**: When `transaction_graph_populations` is non-empty and `execute` raises inside an `EngineCore` step, the exception shall propagate out of `execute_model` and `EngineCore.step`, and no later step shall run a transaction.
+- **TXG-FAIL-005**: When `transaction_graph_populations` is non-empty and `execute` raises inside an `EngineCore` step, the exception shall propagate out of `execute_model` and `EngineCore.step` with no progress from that step published. Stopping later steps is the core engine-death path (`EngineCoreProc`), not a model obligation; the model adds no in-process recovery guard.
   - Design: Failure Containment
-  - Test: `tests/v1/engine/test_nemotron_asr.py::test_nemotron_engine_transaction_graph_replay_failure_propagates_from_step` (new; injected replay failure, in-process `EngineCore`, transaction counters unchanged after the raise) [engine-CUDA]
-- **TXG-FAIL-006**: When `transaction_graph_populations` is non-empty, if the commit-sink collection in `postprocess_state` raises after a replayed step (the surfacing point of an asynchronous device fault), then no progress from that step shall be published, the exception shall propagate out of `EngineCore.step`, and no later step shall run a transaction.
+  - Test: `tests/v1/engine/test_nemotron_asr.py::test_nemotron_engine_transaction_graph_replay_failure_propagates_from_step` (new; injected replay failure, in-process `EngineCore`; asserts propagation and no published progress) [engine-CUDA]
+- **TXG-FAIL-006**: When `transaction_graph_populations` is non-empty, if the commit-sink collection in `postprocess_state` raises after a replayed step (the surfacing point of an asynchronous device fault), then no progress from that step shall be published and the exception shall propagate out of `EngineCore.step`. Collection runs outside `execute`, so this failure does not set the TXG-FAIL-004 latch; stopping later steps is the core engine-death path, as for TXG-FAIL-005.
   - Design: Failure Containment
-  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_collection_failure_after_replay_publishes_no_progress` (new) [CPU]; `tests/v1/engine/test_nemotron_asr.py::test_nemotron_engine_transaction_graph_collection_failure_propagates_from_step` (new; injected collection failure, in-process `EngineCore`) [engine-CUDA]
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_collection_failure_after_replay_publishes_no_progress` (new) [CPU]; `tests/v1/engine/test_nemotron_asr.py::test_nemotron_engine_transaction_graph_collection_failure_propagates_from_step` (new; injected collection failure, in-process `EngineCore`; asserts propagation and no published progress) [engine-CUDA]
 - **TXG-FAIL-007**: When `transaction_graph_populations` is non-empty and a commit reservation is cancelled or a request is aborted after a replay wrote resident pages, the model shall leave those pages byte-identical to their post-replay contents.
   - Design: Failure Containment
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_abort_after_replay_does_not_roll_back_pages` (new) [CPU]
@@ -895,8 +902,8 @@ present, or all absent (`advance.py:3029-3035`); neither is a step policy.
 
 ### Consistency report
 
-- **Coverage.** Every target behaviour has a criterion except: the slot-reuse invariant between commit reservation and collection, replay serialization, and nested-scratch write-before-read (Invariants), which rest on core synchronous scheduling for persistent state, are tested there, and are exercised end to end by TXG-REP-017; the sleep-mode, CuMem and weight-reload rejections, which are existing persistent-state contracts owned elsewhere; "a nonzero `signature` count is a defect", an operating judgement observed through TXG-REP-005's counter; and the client-level `EngineDeadError` after a fatal step, which is the core-owned `EngineCoreProc` busy-loop path (`core.py:1668-1674`), covered generically by `tests/v1/shutdown/test_forward_error.py`, with no existing harness driving a Nemotron streaming session through the multiprocess client (TXG-FAIL-005/006 observe propagation out of `EngineCore.step` instead). The Default-On Gate, Open Questions probes, the startup-count proposal and the exploratory measurements carry no criteria by decision.
-- **Core-owned, deferred.** TXG-VER-004 (post-warmup hook), TXG-LIFE-007 (shutdown hook), TXG-MEM-011 (planner rejection naming the option) and TXG-CORE-* belong to the core persistent-state design; the model-side halves (TXG-VER-001, TXG-LIFE-006) are tested directly.
+- **Coverage.** Every target behaviour has a criterion except: the slot-reuse invariant between commit reservation and collection and replay serialization (Invariants), which rest on core synchronous scheduling for persistent state and are tested there; nested-scratch write-before-read, a model property whose behavioural coverage is TXG-REP-017; the sleep-mode, CuMem and weight-reload rejections, which are existing persistent-state contracts owned elsewhere; "a nonzero `signature` count is a defect", an operating judgement observed through TXG-REP-005's counter; and the client-level `EngineDeadError` after a fatal step, which is the core-owned `EngineCoreProc` busy-loop path (`core.py:1668-1674`), which stops later steps and is covered generically by `tests/v1/shutdown/test_forward_error.py`, with no existing harness driving a Nemotron streaming session through the multiprocess client (TXG-FAIL-005/006 observe propagation out of `EngineCore.step` instead). The Default-On Gate, Open Questions probes, the startup-count proposal and the exploratory measurements carry no criteria by decision.
+- **Core-owned.** TXG-CORE-001 and TXG-CORE-002 are the carried warmup fix, testable now on this branch. TXG-VER-004 (post-warmup hook), TXG-LIFE-007 (shutdown hook) and TXG-MEM-011 (planner rejection naming the option) are deferred until the core persistent-state design adds them; the model-side halves (TXG-VER-001, TXG-LIFE-006) are tested directly.
 - **Conservative defaults.** TXG-MEM-006 fixes zero tolerance for `S <= A`, and TXG-MEM-008 keeps it under both capacity overrides; TXG-MEM-002 requires the complete inventory, so no cross-cell reuse is assumed; TXG-MEM-007 forbids deducting double-counted peak.
 - **Contradictions.** The header status said acceptance criteria were "to be added"; it now points here. Existing tests that assert superseded behaviour are marked for rewrite: `test_failed_capture_publishes_nothing_and_every_call_runs_eager` (target: startup failure, TXG-MEM-010) and the `g2` cells in `test_capture_input_stores_no_page_and_publishes_every_cell` and `_replay_parity` (target: g0 only, TXG-REP-001). `test_arena_rejects_vectors_outside_its_layout` stays as an arena-level guard beside the execution-level `signature` fallback (TXG-REP-005). `test_cuda_graph_replay_matches_eager_across_varied_plans` excludes park tokens and is not park-echo coverage (TXG-REP-011).
 - **Implicit scoping resolved.** Processor and `bind_rows` geometry enforcement (TXG-ENV-007, TXG-ENV-008) and the unreachable-model reader (TXG-OBS-003) are option-independent, because the design passes the configured set to the plan context unconditionally. "Worker-fatal" is read as the latch of TXG-FAIL-004 for every fatal check, including pre-boundary process-constant, wrapper-entry and post-warmup failures; only non-fatal pre-boundary failures follow the structural-failure contract (TXG-FAIL-001). Signature-fallback pool preservation applies only to captured storage distinct from the live pools (TXG-REP-005). Budget-derived capacity applies only without an override (TXG-MEM-007). "Every CHUNK step replays" means zero CHUNK-step fallbacks, with echo steps at undeclared populations counted `undeclared` (TXG-REP-010, TXG-REP-013).
