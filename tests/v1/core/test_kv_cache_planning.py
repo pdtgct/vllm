@@ -1985,6 +1985,39 @@ def test_check_enough_kv_cache_memory_reserves_null_block():
     )
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="Deferred: core persistent-state obligation 4 (design: Core Obligations)",
+)
+@pytest.mark.parametrize(
+    ("override", "pages"), [(None, 1), (4, 3)], ids=["too-small", "override"]
+)
+def test_state_planner_rejection_names_the_contributor_label(
+    monkeypatch, override, pages
+):
+    """A rejected state budget names the model option that consumed memory.
+
+    The model attaches a generic label to its state spec; one page cannot hold
+    the null slot plus a live slot, and four pages exceed a three-page budget.
+    """
+    from tests.v1.core.utils import create_scheduler, create_state_spec
+    from vllm.v1.kv_cache_interface import PersistentStateSpec
+
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    config = create_scheduler(max_num_seqs=2, max_model_len=32).vllm_config
+    config.cache_config.kv_cache_layout = "LBNHC"
+    config.cache_config.num_gpu_blocks_override = override
+    base = create_state_spec()
+    spec = PersistentStateSpec(
+        state_name=base.state_name,
+        descriptors=base.descriptors,
+        page_size_bytes=base.page_size_bytes,
+        memory_contributors=("example_admitted_option",),
+    )
+    with pytest.raises(ValueError, match="example_admitted_option"):
+        get_kv_cache_configs(config, [{"state": spec}], [pages * spec.page_size_bytes])
+
+
 def _spec_decode_kv_cache_groups(worker_specs, use_eagle_block_drop=True):
     config = VllmConfig(model_config=ModelConfig(max_model_len=64))
     config.cache_config.kv_cache_layout = "BLHNC"

@@ -58,16 +58,15 @@ def test_mixed_warmup_skipped_for_persistent_state_groups():
     )
 
 
-def test_mixed_warmup_disables_watermarking():
-    outputs: list[SchedulerOutput] = []
-    runner = SimpleNamespace(
-        is_pooling_model=False,
+def _token_runner(*, is_pooling_model=False, num_blocks=128):
+    return SimpleNamespace(
+        is_pooling_model=is_pooling_model,
         max_num_reqs=2,
         kv_cache_config=SimpleNamespace(
             kv_cache_groups=[
                 SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))
             ],
-            num_blocks=128,
+            num_blocks=num_blocks,
         ),
         vllm_config=SimpleNamespace(num_lookahead_tokens=0),
         max_model_len=128,
@@ -75,6 +74,34 @@ def test_mixed_warmup_disables_watermarking():
         model_state=SimpleNamespace(max_encoder_len=0),
         kv_connector=SimpleNamespace(set_disabled=lambda disabled: None),
     )
+
+
+@pytest.mark.parametrize(
+    ("runner_kwargs", "num_tokens"),
+    [({"is_pooling_model": True}, 32), ({}, 2), ({"num_blocks": 3}, 32)],
+    ids=["pooling", "short", "block-starved"],
+)
+def test_mixed_warmup_skipped_for_pooling_short_and_block_starved_runs(
+    runner_kwargs, num_tokens
+):
+    """Token-cache models keep the pooling, length and block-budget gates.
+
+    Three blocks of 16 cannot hold the 3-token decode and 31-token prefill.
+    """
+    assert (
+        run_mixed_prefill_decode_warmup(
+            _token_runner(**runner_kwargs),
+            worker_execute_model=_fail,
+            worker_sample_tokens=_fail,
+            num_tokens=num_tokens,
+        )
+        is False
+    )
+
+
+def test_mixed_warmup_disables_watermarking():
+    outputs: list[SchedulerOutput] = []
+    runner = _token_runner()
 
     assert run_mixed_prefill_decode_warmup(
         runner,

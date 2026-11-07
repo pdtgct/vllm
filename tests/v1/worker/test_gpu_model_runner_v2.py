@@ -545,22 +545,10 @@ def test_standalone_draft_kv_dtype_override(
 
 def test_state_only_cache_reaches_mrv2_initialization(monkeypatch):
     """Real MRv2 initialization exposes typed per-slot views from core allocation."""
-    from tests.v1.core.utils import (
-        create_scheduler,
-        create_state_spec,
-        get_kv_cache_configs,
-    )
-    from vllm.config.compilation import CUDAGraphMode
-    from vllm.platforms import current_platform
-    from vllm.v1.attention.backend import AttentionCGSupport
+    from tests.v1.core.utils import create_state_spec, get_kv_cache_configs
     from vllm.v1.core.kv_cache_manager import KVCacheManager
-    from vllm.v1.worker.gpu import buffer_utils
-    from vllm.v1.worker.gpu.model_states.interface import ModelState
 
-    monkeypatch.setattr(buffer_utils, "is_uva_available", lambda: False)
-    monkeypatch.setattr(current_platform, "device_type", "cpu")
-    config = create_scheduler(max_num_seqs=2, max_model_len=32).vllm_config
-    config.cache_config.kv_cache_layout = "LBNHC"
+    config = _state_only_config(monkeypatch)
     state = create_state_spec()
     plan = get_kv_cache_configs(config, [{"state": state}], [96])[0]
     from vllm.model_executor.layers.state import PersistentStateLayerBase
@@ -573,51 +561,12 @@ def test_state_only_cache_reaches_mrv2_initialization(monkeypatch):
     PersistentStateLayerBase(state, prefix="state", vllm_config=config)
     assert get_kv_cache_spec(config)["state"] == state
 
-    class _ModelState:
-        num_new_sampled_tokens_per_step = 1
-        initialize_state_slots = ModelState.initialize_state_slots
-
-        def get_additional_cg_support(self):
-            return AttentionCGSupport.ALWAYS, None
-
+    class _ModelState(_StateOnlyModelState):
         def initialize_kv_cache(self, cache_config, block_tables):
             assert len(cache_config.kv_cache_groups) == 1
             assert block_tables.num_kv_cache_groups == 1
 
-    runner = GPUModelRunner.__new__(GPUModelRunner)
-    runner.batch_sharder = None
-    runner.draft_tokens_handler = Mock()
-    runner.encoder_cache = None
-    runner.state_slots = None
-    runner.vllm_config = config
-    runner.parallel_config = config.parallel_config
-    runner.model_config = config.model_config
-    runner.scheduler_config = config.scheduler_config
-    runner.cache_config = config.cache_config
-    runner.compilation_config = config.compilation_config
-    runner.jit_warmup_registry = JitWarmupRegistry(config)
-    runner.max_model_len = 32
-    runner.is_encoder_decoder = False
-    runner.dcp_size = 1
-    runner.dcp_rank = 0
-    runner.pcp_manager = None
-    runner.speculator = None
-    runner.req_states = []
-    runner.input_buffers = SimpleNamespace(query_start_loc=None)
-    runner.vocab_size = 100
-    runner.max_num_reqs = 2
-    runner.max_num_tokens = 32
-    runner.device = torch.device("cpu")
-    runner.model_state = _ModelState()
-    runner.model = torch.nn.Module()
-    runner.decode_query_len = 1
-    runner.lora_capture_cases = []
-    monkeypatch.setattr(
-        config.compilation_config,
-        "resolve_cudagraph_mode_and_sizes",
-        lambda *a, **kw: CUDAGraphMode.NONE,
-    )
-    monkeypatch.setattr(model_runner_module, "ModelCudaGraphManager", Mock())
+    runner = _state_only_runner(monkeypatch, config, _ModelState())
     runner.initialize_kv_cache(plan, is_profiling=True)
     assert runner.block_tables.block_sizes == [1]
     assert runner.state_slots is runner.model_state.state_slots
@@ -654,6 +603,263 @@ def test_state_only_cache_reaches_mrv2_initialization(monkeypatch):
     assert torch.all(views.view("c", c)["hidden"] == 1)
     with pytest.raises(ValueError, match="Stale"):
         allocator.complete(a, 10)
+
+
+class _StateOnlyModelState:
+    """Generic model state for a state-only cache; no model-specific hooks."""
+
+    num_new_sampled_tokens_per_step = 1
+    supports_mm_inputs = False
+
+    def initialize_state_slots(self, bindings):
+        from vllm.v1.worker.gpu.model_states.interface import ModelState
+
+        ModelState.initialize_state_slots(self, bindings)
+
+    def get_additional_cg_support(self):
+        from vllm.v1.attention.backend import AttentionCGSupport
+
+        return AttentionCGSupport.ALWAYS, None
+
+    def initialize_kv_cache(self, cache_config, block_tables):
+        return None
+
+
+def _state_only_config(monkeypatch):
+    from tests.v1.core.utils import create_scheduler
+    from vllm.platforms import current_platform
+    from vllm.v1.worker.gpu import buffer_utils
+
+    monkeypatch.setattr(buffer_utils, "is_uva_available", lambda: False)
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    config = create_scheduler(max_num_seqs=2, max_model_len=32).vllm_config
+    config.cache_config.kv_cache_layout = "LBNHC"
+    return config
+
+
+def _state_only_runner(monkeypatch, config, model_state):
+    """A CPU runner whose ``initialize_kv_cache`` runs unmodified."""
+    from vllm.config.compilation import CUDAGraphMode
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.batch_sharder = None
+    runner.draft_tokens_handler = Mock()
+    runner.encoder_cache = None
+    runner.state_slots = None
+    runner.vllm_config = config
+    runner.parallel_config = config.parallel_config
+    runner.model_config = config.model_config
+    runner.scheduler_config = config.scheduler_config
+    runner.cache_config = config.cache_config
+    runner.compilation_config = config.compilation_config
+    runner.jit_warmup_registry = JitWarmupRegistry(config)
+    runner.max_model_len = 32
+    runner.is_encoder_decoder = False
+    runner.dcp_size = 1
+    runner.dcp_rank = 0
+    runner.pcp_manager = None
+    runner.speculator = None
+    runner.req_states = []
+    runner.input_buffers = SimpleNamespace(query_start_loc=None)
+    runner.vocab_size = 100
+    runner.max_num_reqs = 2
+    runner.max_num_tokens = 32
+    runner.device = torch.device("cpu")
+    runner.model_state = model_state
+    runner.model = torch.nn.Module()
+    runner.decode_query_len = 1
+    runner.lora_capture_cases = []
+    runner.aux_output_connector = None
+    monkeypatch.setattr(
+        config.compilation_config,
+        "resolve_cudagraph_mode_and_sizes",
+        lambda *a, **kw: CUDAGraphMode.NONE,
+    )
+    monkeypatch.setattr(model_runner_module, "ModelCudaGraphManager", Mock())
+    return runner
+
+
+def _labelled_state_plan(config, label):
+    """Plan three pages of a generic state spec carrying a contributor label."""
+    from tests.v1.core.utils import create_state_spec, get_kv_cache_configs
+    from vllm.v1.kv_cache_interface import PersistentStateSpec
+
+    base = create_state_spec()
+    spec = PersistentStateSpec(
+        state_name=base.state_name,
+        descriptors=base.descriptors,
+        page_size_bytes=base.page_size_bytes,
+        memory_contributors=(label,),
+    )
+    return get_kv_cache_configs(config, [{"state": spec}], [96])[0]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Deferred: core persistent-state obligation 5 (design: Core Obligations)",
+)
+@pytest.mark.parametrize(
+    "failure",
+    [torch.OutOfMemoryError("injected"), RuntimeError("injected allocation")],
+    ids=["oom", "raise"],
+)
+def test_state_kv_allocation_failure_names_the_contributor_label(monkeypatch, failure):
+    """A failed state allocation names the option that consumed memory.
+
+    The allocation precedes every model hook, so core must attribute it.
+    """
+    config = _state_only_config(monkeypatch)
+    plan = _labelled_state_plan(config, "example_admitted_option")
+    bound = []
+
+    class _ModelState(_StateOnlyModelState):
+        def initialize_state_slots(self, bindings):
+            bound.append(bindings)
+
+    def fail(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(model_runner_module, "init_kv_cache", fail)
+    runner = _state_only_runner(monkeypatch, config, _ModelState())
+    with pytest.raises(RuntimeError, match="example_admitted_option"):
+        runner.initialize_kv_cache(plan, is_profiling=True)
+    assert bound == []
+
+
+def _initialized_state_runner(monkeypatch, model_state):
+    from tests.v1.core.utils import create_state_spec, get_kv_cache_configs
+
+    config = _state_only_config(monkeypatch)
+    plan = get_kv_cache_configs(config, [{"state": create_state_spec()}], [96])[0]
+    runner = _state_only_runner(monkeypatch, config, model_state)
+    runner.initialize_kv_cache(plan, is_profiling=True)
+    return runner
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Deferred: core persistent-state obligation 3 (design: Core Obligations)",
+)
+def test_shutdown_calls_model_state_shutdown_hook(monkeypatch):
+    """Runner shutdown lets the model state release its resources first."""
+    calls = []
+
+    class _ModelState(_StateOnlyModelState):
+        def shutdown(self):
+            calls.append(getattr(runner, "model_state", None) is self)
+
+    runner = _initialized_state_runner(monkeypatch, _ModelState())
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    runner.shutdown()
+    assert calls == [True]
+    assert not hasattr(runner, "model_state")
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Deferred: core persistent-state obligation 6 (design: Core Obligations)",
+)
+def test_startup_pool_access_expires_after_initialize_state_slots(monkeypatch):
+    """Unowned resident pools are reachable only inside slot initialization.
+
+    The startup access covers every page, including unbound ones, and is
+    refused once ``initialize_state_slots`` has returned.
+    """
+    accesses = []
+
+    class _ModelState(_StateOnlyModelState):
+        def initialize_state_slots(self, bindings):
+            super().initialize_state_slots(bindings)
+            access = bindings.startup_pool_access("state")
+            hidden = access.component_pools["hidden"]
+            assert hidden.shape == (3, 4) and hidden.dtype == torch.float32
+            accesses.append(access)
+
+    runner = _initialized_state_runner(monkeypatch, _ModelState())
+    (access,) = accesses
+    with pytest.raises(ValueError):
+        access.component_pools  # noqa: B018
+    with pytest.raises(ValueError):
+        runner.state_slots.startup_pool_access("state")
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Deferred: core persistent-state obligation 2 (design: Core Obligations)",
+)
+@pytest.mark.parametrize("mismatch", [False, True])
+def test_post_warmup_hook_runs_after_warmups(monkeypatch, mismatch):
+    """The model state verifies after every worker warmup, before serving.
+
+    Compile dummy runs, kernel warmups, JIT warmups and graph capture all
+    precede the hook; a hook failure fails startup.
+    """
+    from contextlib import nullcontext
+
+    import vllm.v1.worker.gpu_worker as gpu_worker
+    from vllm.config.compilation import CompilationMode, CUDAGraphMode
+
+    events = []
+
+    class _ModelState(_StateOnlyModelState):
+        def post_warmup(self):
+            events.append("post_warmup")
+            if mismatch:
+                raise RuntimeError("signature changed after warmup")
+
+    runner = _initialized_state_runner(monkeypatch, _ModelState())
+    config = runner.vllm_config
+    config.compilation_config.mode = CompilationMode.VLLM_COMPILE
+    config.compilation_config.backend = "eager"
+    config.compilation_config.compile_sizes = [8]
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+    config.kernel_config.enable_jit_warmup = True
+    config.model_config.enforce_eager = False
+    runner.lora_config = None
+    monkeypatch.setattr(
+        runner, "_dummy_run", lambda size, **_: events.append(f"dummy_run:{size}")
+    )
+    monkeypatch.setattr(runner, "maybe_remove_all_loras", lambda _: None)
+    monkeypatch.setattr(
+        runner, "capture_model", lambda: events.append("capture_model") or 0
+    )
+    monkeypatch.setattr(gpu_worker, "has_compiled_submodule", lambda _: True)
+    monkeypatch.setattr(
+        gpu_worker, "kernel_warmup", lambda _: events.append("kernel_warmup")
+    )
+    monkeypatch.setattr(
+        gpu_worker, "warmup_kernels", lambda *_: events.append("warmup_kernels")
+    )
+    for name in ("freeze_gc_heap", "maybe_attach_gc_debug_callback"):
+        monkeypatch.setattr(gpu_worker, name, lambda: None)
+    monkeypatch.setattr(gpu_worker, "enable_gpu_sync_check", lambda: None)
+    monkeypatch.setattr(gpu_worker, "set_random_seed", lambda *_: None)
+    worker = gpu_worker.Worker.__new__(gpu_worker.Worker)
+    worker.vllm_config = config
+    worker.model_config = config.model_config
+    worker.cache_config = config.cache_config
+    worker.compilation_config = config.compilation_config
+    worker.parallel_config = config.parallel_config
+    worker.scheduler_config = config.scheduler_config
+    worker.model_runner = runner
+    worker.use_v2_model_runner = True
+    worker.device = torch.device("cpu")
+    monkeypatch.setattr(worker, "_get_cudagraph_capture_context", nullcontext)
+    monkeypatch.setattr(worker, "_maybe_activate_jit_monitor", lambda: None)
+    monkeypatch.setattr(runner, "get_model", lambda: runner.model)
+    if mismatch:
+        with pytest.raises(RuntimeError, match="signature changed"):
+            worker._compile_or_warm_up_model()
+    else:
+        worker._compile_or_warm_up_model()
+    assert events == [
+        "dummy_run:8",
+        "kernel_warmup",
+        "warmup_kernels",
+        "capture_model",
+        "post_warmup",
+    ]
 
 
 def test_state_slot_rows_validate_step_handles_and_alias_resident_pools(monkeypatch):

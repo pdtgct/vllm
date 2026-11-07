@@ -240,7 +240,7 @@ _G0_BASE_OVERRIDES = {
 }
 
 
-def _run_g0_stream(hf_overrides, num_chunks, sessions=1):
+def _run_g0_stream(hf_overrides, num_chunks, sessions=1, inject=None):
     """Feed ``sessions`` fresh g0 sessions ``num_chunks`` CHUNKs in lockstep.
 
     Every session's CHUNK is queued before the step that carries them, and the
@@ -248,6 +248,7 @@ def _run_g0_stream(hf_overrides, num_chunks, sessions=1):
     the whole population. Returns per-chunk output tokens per session, the
     resident state storage after each park, the model's transaction graph
     counters and the number of executed steps after each CHUNK step.
+    ``inject`` receives the model after admission, before the first CHUNK.
     """
     import gc
     from dataclasses import replace
@@ -257,6 +258,7 @@ def _run_g0_stream(hf_overrides, num_chunks, sessions=1):
     from vllm import SamplingParams
     from vllm.models.nemotron_asr.manifests import RAW_SAMPLES_PER_CHUNK
     from vllm.models.nemotron_asr.transaction_graph import (
+        _resolve_model,
         transaction_graph_counters,
     )
     from vllm.multimodal.inputs import (
@@ -311,6 +313,8 @@ def _run_g0_stream(hf_overrides, num_chunks, sessions=1):
             assert core.admit_stream(
                 owner, StreamAdmissionId(epoch, index), request(name)
             ).accepted
+        if inject is not None:
+            inject(_resolve_model(core))
         size = RAW_SAMPLES_PER_CHUNK["80ms"]
         generators = [torch.Generator().manual_seed(i) for i in range(sessions)]
         tokens, pages, echo_steps = [], [], []
@@ -384,19 +388,20 @@ def test_nemotron_engine_transaction_graph_matches_eager(monkeypatch):
     """A fresh g0 B1 session replays its whole transactions bitwise exactly.
 
     The eager arm runs first, then the replay arm adds only the transaction
-    graph option. Tokens and the resident storage after every park must match,
-    and every transaction must replay a captured cell.
+    graph option. Tokens, echo counts and the resident storage after every
+    park must match, and every transaction must replay a captured cell.
     """
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     num_chunks = 12
-    eager_tokens, eager_pages, eager_counters, _ = _run_g0_stream(
+    eager_tokens, eager_pages, eager_counters, eager_echoes = _run_g0_stream(
         dict(_G0_BASE_OVERRIDES), num_chunks
     )
     assert eager_counters == {}
-    tokens, pages, counters, _ = _run_g0_stream(
+    tokens, pages, counters, echoes = _run_g0_stream(
         {**_G0_BASE_OVERRIDES, "transaction_graph_populations": [1]}, num_chunks
     )
     assert tokens == eager_tokens
+    assert echoes == eager_echoes
     for actual, expected in zip(pages, eager_pages, strict=True):
         assert torch.equal(actual, expected)
     assert counters["captured_cells"] == 3
@@ -447,3 +452,136 @@ def test_nemotron_engine_transaction_graph_b31_lockstep_matches_eager(monkeypatc
     assert counters[f"replays:replay:b{sessions}"] + sum(fallbacks.values()) == sum(
         echoes
     )
+
+
+def _fail_first_replayed_step(monkeypatch, inject_failure):
+    """Run one option-on B1 CHUNK whose replayed step fails as injected.
+
+    Returns the exception ``EngineCore.step`` raised, the committed progress
+    the model holds afterwards and its counters.
+    """
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    seen = {}
+
+    def inject(model):
+        model.consume_committed_progress()
+        inject_failure(model)
+        seen["model"] = model
+
+    with pytest.raises(RuntimeError, match="injected") as raised:
+        _run_g0_stream(
+            {**_G0_BASE_OVERRIDES, "transaction_graph_populations": [1]},
+            num_chunks=1,
+            inject=inject,
+        )
+    model = seen["model"]
+    return raised.value, model.consume_committed_progress(), model
+
+
+@create_new_process_for_each_test(method="spawn")
+def test_nemotron_engine_transaction_graph_replay_failure_propagates_from_step(
+    monkeypatch,
+):
+    """A replay failure leaves ``EngineCore.step`` and publishes no progress."""
+
+    def fail_replay(model):
+        def replay():
+            raise RuntimeError("injected replay failure")
+
+        for graph in model._transaction_graph._graphs.values():
+            monkeypatch.setattr(graph, "replay", replay)
+
+    error, progress, _ = _fail_first_replayed_step(monkeypatch, fail_replay)
+    assert str(error) == "injected replay failure"
+    assert progress == {}
+
+
+@create_new_process_for_each_test(method="spawn")
+def test_nemotron_engine_transaction_graph_collection_failure_propagates_from_step(
+    monkeypatch,
+):
+    """A commit-sink collection failure after a replay publishes no progress."""
+    from vllm.models.nemotron_asr.transaction_graph import (
+        transaction_graph_counters,
+    )
+
+    def fail_collection(model):
+        def collect(*args, **kwargs):
+            raise RuntimeError("injected collection failure")
+
+        sink = model._ensure_commit_sink(next(model.parameters()).device)
+        monkeypatch.setattr(sink, "collect", collect)
+
+    error, progress, model = _fail_first_replayed_step(monkeypatch, fail_collection)
+    assert str(error) == "injected collection failure"
+    assert progress == {}
+    assert transaction_graph_counters(model)["replays:chunk-fresh:g0:b1"] == 1
+
+
+def _startup_memory(hf_overrides, gpu_memory_utilization, max_num_seqs=8):
+    """Start an engine without a block override and report its memory figures."""
+    import gc
+    from dataclasses import replace
+
+    from vllm.models.nemotron_asr.transaction_graph import _resolve_model
+    from vllm.v1.engine.core import EngineCore
+    from vllm.v1.executor.uniproc_executor import UniProcExecutor
+
+    args = replace(
+        _engine_args(),
+        max_num_seqs=max_num_seqs,
+        num_gpu_blocks_override=None,
+        gpu_memory_utilization=gpu_memory_utilization,
+        hf_overrides=hf_overrides,
+    )
+    core = EngineCore(args.create_engine_config(), UniProcExecutor, log_stats=False)
+    try:
+        worker = core.model_executor.driver_worker.worker
+        view = next(iter(worker.model_runner.state_slots.views.values()))
+        receipt = _resolve_model(core).execution_profile_receipt()
+        headroom = worker.peak_activation_memory
+        return {
+            "total_consumed": worker.total_consumed,
+            "headroom": headroom,
+            "non_kv": worker.total_consumed + headroom,
+            "budget": core.available_gpu_memory_for_kv_cache,
+            "page": view.spec.page_size_bytes,
+            "count": view.capacity,
+            "total": worker.init_snapshot.total_memory,
+            "admitted": receipt.get("transaction", {}).get("admission_bytes"),
+        }
+    finally:
+        core.shutdown()
+        del core
+        gc.collect()
+        torch.accelerator.empty_cache()
+
+
+@create_new_process_for_each_test(method="spawn")
+def test_nemotron_engine_transaction_graph_admission_is_charged(monkeypatch):
+    """Admitted graph memory is charged before resident capacity is fixed.
+
+    Option-on minus option-off at equal utilization must cover ``A`` in
+    ``non_kv_cache_memory`` and in retained consumption, without shrinking the
+    transient peak. A third, memory-bound run sized from the option-on figures
+    must hold exactly the pages core derives from its reduced budget.
+    """
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    # Zero cudagraph estimate: peak_activation_memory is then the peak headroom.
+    monkeypatch.setenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "0")
+    max_num_seqs = 8
+    option = {**_G0_BASE_OVERRIDES, "transaction_graph_populations": [1]}
+    off = _startup_memory(dict(_G0_BASE_OVERRIDES), 0.4, max_num_seqs)
+    on = _startup_memory(option, 0.4, max_num_seqs)
+    admitted = on["admitted"]
+    assert off["admitted"] is None
+    assert admitted is not None and admitted > 0
+    assert on["non_kv"] - off["non_kv"] >= admitted
+    assert on["total_consumed"] - off["total_consumed"] >= admitted
+    assert on["headroom"] >= off["headroom"]
+
+    # Aim the budget at 5.5 pages so memory, not max_num_seqs + 1, binds.
+    utilization = (on["non_kv"] + 5.5 * on["page"]) / on["total"]
+    bound = _startup_memory(option, utilization, max_num_seqs)
+    assert 2 <= bound["count"] < max_num_seqs + 1
+    assert bound["count"] == bound["budget"] // bound["page"]

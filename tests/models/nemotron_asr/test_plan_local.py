@@ -301,6 +301,36 @@ def test_bind_rows_is_atomic_when_a_later_row_is_invalid() -> None:
     assert binding.admission_generation == 1
 
 
+@pytest.mark.parametrize("fresh", [True, False])
+def test_bind_rows_rejects_geometry_outside_served_set(fresh: bool) -> None:
+    """A header geometry outside the configured set fails before any commit.
+
+    Geometry 1 is a published cadence index, so only the served set excludes
+    it. The step's valid fresh row is not registered either.
+    """
+    registry = plan_mod.SessionRegistry()
+
+    def bind(rows: list[Any]) -> Any:
+        return registry.bind_rows(
+            rows,
+            placeholder_id=PLACEHOLDER_ID,
+            num_prompts=NUM_PROMPTS,
+            served_geometries=(0, 2),
+            now_ns=NOW_NS,
+        )
+
+    bind([_row("a", 3, chunk=True, prior=False)])
+    offending = (
+        _row("c", 5, chunk=True, prior=False, header=_header(geometry=1))
+        if fresh
+        else _row("a", 3, chunk=True, header=_header(geometry=1, seq=1))
+    )
+    with pytest.raises(ValueError, match="geometry 1"):
+        bind([_row("b", 4, chunk=True, prior=False), offending])
+    assert len(registry) == 1
+    assert registry.live_block_ids() == [3]
+
+
 def test_prepare_context_rolls_back_prune_when_binding_fails() -> None:
     registry = plan_mod.SessionRegistry()
     _bind(registry, [_row("a", 3, chunk=True, prior=False)])
