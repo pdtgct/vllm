@@ -4728,6 +4728,7 @@ def _interleaved_parity(model: Any, slots: StateSlotBindings) -> None:
     call = _model_call(model)
     graph_pools = _pool_arguments(_resident(model, slots))
     eager_pools = _clone_pools(graph_pools)
+    advance.warmup_advance_model_rows_scatter(**eager_pools)
     decoder = model._decode_graph_binding
 
     def tier(rows: int) -> int:
