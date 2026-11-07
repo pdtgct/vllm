@@ -19,10 +19,11 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any, ClassVar
+from typing import Any
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from tests.models.nemotron_asr import test_encoder_execution as encoder_tests
 from tests.models.nemotron_asr.test_advance_model_rows_local import (
@@ -104,16 +105,14 @@ class _GraphEntries:
     ``concrete_cudagraph_entries`` maps a descriptor to an entry holding its
     ``cudagraph``; a graph-mode call whose descriptor has no graph captures
     and publishes one. ``clear_graphs()`` empties a wrapper's entries and
-    ``_clear_all_graphs()`` every live wrapper's, as
+    ``_clear_all_graphs(mode)`` every live wrapper's of that runtime, as
     ``CUDAGraphWrapper.clear_all_graphs()`` does.
     """
-
-    instances: ClassVar[weakref.WeakSet[_GraphEntries]] = weakref.WeakSet()
 
     def __init__(self, mode: dict[str, Any]) -> None:
         self._mode = mode
         self.concrete_cudagraph_entries: dict[Any, SimpleNamespace] = {}
-        _GraphEntries.instances.add(self)
+        mode.setdefault("wrappers", weakref.WeakSet()).add(self)
 
     def graph(self) -> Any:
         """The current descriptor's graph; ``None`` means this call captures."""
@@ -128,8 +127,9 @@ class _GraphEntries:
         self.concrete_cudagraph_entries.clear()
 
 
-def _clear_all_graphs() -> None:
-    for wrapper in list(_GraphEntries.instances):
+def _clear_all_graphs(mode: dict[str, Any]) -> None:
+    """Empty every live wrapper that ``mode``'s runtime created."""
+    for wrapper in list(mode.get("wrappers", ())):
         wrapper.clear_graphs()
 
 
@@ -281,7 +281,8 @@ def _entry_runtime(captures: list[Any]) -> SimpleNamespace:
             return self.runnable()
 
     return SimpleNamespace(
-        runtime=_runtime(Wrapper, mode), clear_all_graphs=_clear_all_graphs
+        runtime=_runtime(Wrapper, mode),
+        clear_all_graphs=lambda: _clear_all_graphs(mode),
     )
 
 
@@ -682,9 +683,10 @@ def _track_capture_cells(
     """Record every cell the shared capture path prepares, holding nothing.
 
     Each record has the cell, weak references to its graph, arena, capture
-    callbacks and every tensor cloned while preparing it (page snapshots,
-    expected outputs and capture-input copies), and the shapes of the pools it
-    was prepared over. ``events`` receives ``("prepare", label)`` per cell.
+    callbacks and every tensor copied while preparing it (page snapshots,
+    expected outputs, capture-input copies and persistent buffers), and the
+    shapes of the pools it was prepared over. ``events`` receives
+    ``("prepare", label)`` per cell.
     """
     prepared: list[SimpleNamespace] = []
     capture_cell = tg.TransactionGraphBinding._capture_cell
@@ -715,36 +717,73 @@ def _track_capture_cells(
 
 @contextmanager
 def _tracking_clones(clones: list[weakref.ref[torch.Tensor]]) -> Iterator[None]:
-    """Append a weak reference to every tensor cloned in the scope."""
-    clone = torch.Tensor.clone
+    """Append a weak reference to every tensor copied in the scope.
 
-    def tracked(tensor: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
-        copy = clone(tensor, *args, **kwargs)
-        clones.append(weakref.ref(copy))
-        return copy
+    Covers ``Tensor.clone``, ``torch.clone`` and ``torch.empty_like``, the
+    allocation an ``empty_like(...).copy_(...)`` copy starts from.
+    """
+
+    def tracked(allocate: Callable[..., torch.Tensor]) -> Callable[..., Any]:
+        def call(*args: Any, **kwargs: Any) -> torch.Tensor:
+            copy = allocate(*args, **kwargs)
+            clones.append(weakref.ref(copy))
+            return copy
+
+        return call
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(torch.Tensor, "clone", tracked)
+        for owner, name in (
+            (torch.Tensor, "clone"),
+            (torch, "clone"),
+            (torch, "empty_like"),
+        ):
+            patch.setattr(owner, name, tracked(getattr(owner, name)))
         yield
 
 
-def _live_capture_clones(records: list[SimpleNamespace]) -> int:
-    """Count tensors cloned while preparing ``records`` that are still alive.
+#: Cell buffers that persist after verification besides the arena's: static
+#: inputs and owned outputs ("Inputs, outputs and signature").
+_PERSISTENT_CELL_BUFFERS = (
+    "static_ids",
+    "static_embeds",
+    "rows_out",
+    "status_out",
+    "progress_out",
+)
 
-    Storage a prepared graph or its arena owns as an attribute is persistent,
-    not a capture temporary, and is not counted.
+
+def _persistent_storage(graph: Any) -> set[int]:
+    """Storage addresses a published cell may own after verification.
+
+    These are its arena's device and host buffers, static inputs and owned
+    outputs; nothing else from capture may outlive it (Capture-lifetime rule).
+    """
+    arena = graph.arena
+    tensors = [getattr(graph, name) for name in _PERSISTENT_CELL_BUFFERS]
+    tensors += [*arena.views.values(), *getattr(arena, "_host", ())]
+    return {
+        tensor.untyped_storage().data_ptr()
+        for tensor in tensors
+        if tensor.untyped_storage().nbytes()
+    }
+
+
+def _live_capture_clones(records: list[SimpleNamespace]) -> int:
+    """Count live copies made while preparing ``records`` outside persistent storage.
+
+    A page snapshot, expected output or capture-input copy still alive counts
+    wherever it is kept, including on the graph or its arena.
     """
     gc.collect()
-    owned: set[int] = set()
+    persistent: set[int] = set()
     for record in records:
         graph = record.graph()
-        for owner in () if graph is None else (graph, graph.arena):
-            for value in vars(owner).values():
-                values = value if isinstance(value, list | tuple) else (value,)
-                owned.update(id(item) for item in values)
+        if graph is not None:
+            persistent |= _persistent_storage(graph)
         del graph
     return sum(
-        (tensor := reference()) is not None and id(tensor) not in owned
+        (tensor := reference()) is not None
+        and tensor.untyped_storage().data_ptr() not in persistent
         for record in records
         for reference in record.clones
     )
@@ -788,22 +827,25 @@ def _budget(released: int, admitted: int, served: int) -> Callable[[int], int]:
 
 
 @pytest.fixture
-def cpu_readings(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Deterministic admission readings for CPU lifecycle paths.
+def cpu_readings(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> Iterator[SimpleNamespace]:
+    """Deterministic admission readings for one CPU startup.
 
-    Every five readings ``N0, Na, N1, Ns0, Ns1`` release far more than any
-    stand-in and admit as many bytes as serving uses, so admission passes
-    without real device memory queries. Tests of the readings patch their own.
+    The readings ``N0, Na, N1, Ns0, Ns1`` release far more than any stand-in
+    and admit as many bytes as serving uses, so admission passes without real
+    device memory queries; later readings repeat ``Ns1``. A test whose sequence
+    is fixed sets ``expected``, checked at teardown when the test passed.
+    Tests of the readings patch their own.
     """
-    budget = _budget(1 << 30, 1 << 20, 1 << 20)
-    calls = [0]
-
-    def read(_device: torch.device) -> int:
-        gc.collect()
-        calls[0] += 1
-        return budget((calls[0] - 1) % 5)
-
-    monkeypatch.setattr(tg, "normalized_free_memory", read, raising=False)
+    readings = SimpleNamespace(
+        calls=_free_memory(monkeypatch, _budget(1 << 30, 1 << 20, 1 << 20)),
+        expected=None,
+    )
+    failed = request.session.testsfailed
+    yield readings
+    if readings.expected is not None and request.session.testsfailed == failed:
+        assert len(readings.calls) == readings.expected, readings.calls
 
 
 def _model_call(model: Any) -> tg.TransactionCallBindings:
@@ -2484,13 +2526,32 @@ def _changed_process_constant(
         yield
 
 
-#: Error-message pattern naming each process constant.
+#: Error-message pattern naming each process constant. The legacy setter
+#: also changes ``torch.backends.cuda.matmul.fp32_precision``, so either name
+#: identifies that change.
 _PROCESS_CONSTANTS = {
     "batch-invariant": r"(?i)batch.invariant",
     **dict.fromkeys(_TF32_SETTINGS, r"(?i)fp32_precision"),
-    "float32_matmul_precision": r"float32_matmul_precision",
+    "float32_matmul_precision": r"fp32_precision|float32_matmul_precision",
     "CUBLAS_WORKSPACE_CONFIG": r"CUBLAS_WORKSPACE_CONFIG",
 }
+
+
+def _legacy_precision_getters_raise(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every legacy TF32 and matmul-precision getter raise.
+
+    The per-operation ``fp32_precision`` settings stay readable.
+    """
+
+    def legacy(*_args: Any) -> Any:
+        raise AssertionError("a legacy precision getter was called")
+
+    monkeypatch.setattr(torch, "get_float32_matmul_precision", legacy)
+    monkeypatch.setattr(torch._C, "_get_cublas_allow_tf32", legacy)
+    monkeypatch.setattr(
+        type(torch.backends.cudnn), "allow_tf32", property(legacy, legacy)
+    )
+
 
 #: Calls on ``_binding``'s cells: the covered call and every fallback path,
 #: ``(decodes, prefills, fresh)``; ``signature`` runs over relocated pools.
@@ -2509,15 +2570,29 @@ def _path_pools(path: str, pools: Pools) -> Pools:
 
 
 @pytest.mark.cpu_test
-@pytest.mark.parametrize("path", list(_PATHS))
-@pytest.mark.parametrize("constant", list(_PROCESS_CONSTANTS))
+@pytest.mark.parametrize(
+    ("constant", "path"),
+    [(constant, path) for constant in _PROCESS_CONSTANTS for path in _PATHS]
+    + [("unchanged", "replay")],
+)
 def test_process_constant_change_is_fatal_on_every_path(
     monkeypatch: pytest.MonkeyPatch, constant: str, path: str
 ) -> None:
+    """A changed constant is fatal; the guard reads only per-operation settings.
+
+    The ``unchanged`` case makes every legacy getter raise from before capture,
+    so a guard that snapshots or checks through them fails a covered call.
+    """
+    if constant == "unchanged":
+        _legacy_precision_getters_raise(monkeypatch)
     core = _core()
     call = _call_bindings(core)
     pools = _endpoint_pools(4)
     binding = _binding(core, pools, call, _rerun_runtime())
+    if constant == "unchanged":
+        _advance(core, pools, call, _rows(*_PATHS[path]), binding, _CommitRecorder())
+        assert binding.counters()["replays:chunk-fresh:g0:b1"] == 1
+        return
     live = _path_pools(path, pools)
     before = _clone_pools(live)
     counts = binding.counters()
@@ -2851,10 +2926,11 @@ def test_abort_after_replay_does_not_roll_back_pages(cause: str) -> None:
 
 
 @pytest.mark.cpu_test
-@pytest.mark.usefixtures("cpu_readings")
 def test_collection_failure_after_replay_publishes_no_progress(
     monkeypatch: pytest.MonkeyPatch,
+    cpu_readings: SimpleNamespace,
 ) -> None:
+    cpu_readings.expected = 5
     model, state, slots = _verified_model(monkeypatch, num_blocks=4)
     binding = model._transaction_graph
     replays = binding.counters()["replays"]
@@ -3470,10 +3546,11 @@ def test_serving_capture_rejects_too_few_usable_slots() -> None:
 
 
 @pytest.mark.cpu_test
-@pytest.mark.usefixtures("cpu_readings")
 def test_serving_capture_runs_once_from_initialize_state_slots(
     monkeypatch: pytest.MonkeyPatch,
+    cpu_readings: SimpleNamespace,
 ) -> None:
+    cpu_readings.expected = 5
     model, config = _model(monkeypatch)
     model.prepare_execution_memory()
     binding = model._transaction_graph
@@ -3507,10 +3584,11 @@ def test_serving_capture_runs_once_from_initialize_state_slots(
 
 
 @pytest.mark.cpu_test
-@pytest.mark.usefixtures("cpu_readings")
 def test_identical_reinitialize_is_a_verified_no_op(
     monkeypatch: pytest.MonkeyPatch,
+    cpu_readings: SimpleNamespace,
 ) -> None:
+    cpu_readings.expected = 5
     model, config = _model(monkeypatch)
     model.prepare_execution_memory()
     state, slots = _model_state(model, config)
@@ -3620,6 +3698,18 @@ def test_published_cell_retains_no_capture_context(
     assert not _live([ref for record in prepared for ref in record.callbacks])
     assert _live_capture_clones(serving) == 0
     assert _live_capture_clones(admission) == 0
+
+    leaked = serving[0]
+    graph = leaked.graph()
+    page = resident.sequence()[0][1]
+    with _tracking_clones(leaked.clones):
+        graph.page_snapshots = (
+            page.clone(),
+            torch.clone(page),
+            torch.empty_like(page).copy_(page),
+        )
+    del graph
+    assert _live_capture_clones([leaked]) == 3, "a snapshot kept on a graph counts"
 
 
 @pytest.mark.cpu_test
@@ -3776,11 +3866,11 @@ def _verification_mismatch(model: Any, kind: str) -> Callable[[str], None]:
 
 
 @pytest.mark.cpu_test
-@pytest.mark.usefixtures("cpu_readings")
 @pytest.mark.parametrize("mismatch", _VERIFY_MISMATCHES)
 def test_post_warmup_verification_rejects_resized_external_buffer(
-    monkeypatch: pytest.MonkeyPatch, mismatch: str
+    monkeypatch: pytest.MonkeyPatch, cpu_readings: SimpleNamespace, mismatch: str
 ) -> None:
+    cpu_readings.expected = 5
     model, _state, _slots = _verified_model(monkeypatch)
     verify = _seam(model, "verify_transaction_graphs")
     verify()
@@ -3791,10 +3881,11 @@ def test_post_warmup_verification_rejects_resized_external_buffer(
 
 
 @pytest.mark.cpu_test
-@pytest.mark.usefixtures("cpu_readings")
 def test_first_real_step_verifies_once_before_pruning(
     monkeypatch: pytest.MonkeyPatch,
+    cpu_readings: SimpleNamespace,
 ) -> None:
+    cpu_readings.expected = 5
     model, state, slots = _verified_model(monkeypatch, num_blocks=4)
     events: list[str] = []
     verify = _seam(model, "verify_transaction_graphs")
@@ -3841,11 +3932,11 @@ def test_first_real_step_verifies_once_before_pruning(
 
 
 @pytest.mark.cpu_test
-@pytest.mark.usefixtures("cpu_readings")
 @pytest.mark.parametrize("mismatch", _VERIFY_MISMATCHES)
 def test_first_real_step_mismatch_is_fatal_before_any_state_change(
-    monkeypatch: pytest.MonkeyPatch, mismatch: str
+    monkeypatch: pytest.MonkeyPatch, cpu_readings: SimpleNamespace, mismatch: str
 ) -> None:
+    cpu_readings.expected = 5
     model, state, slots = _verified_model(monkeypatch)
     pruned: list[Any] = []
     monkeypatch.setattr(model._registry, "prune", pruned.append)
@@ -4372,16 +4463,52 @@ def _storage(tensor: torch.Tensor) -> int:
     return tensor.untyped_storage().data_ptr()
 
 
+class _MutationStreams(TorchDispatchMode):
+    """Log ``(name, current stream)`` for every op that writes a named tensor.
+
+    An op writes an argument when its schema marks that argument mutable
+    (in-place, ``out=`` or ``Tensor(a!)`` lists); the target is named by the
+    ``names`` storage it shares. The stream is read at dispatch, so work an
+    implementation moves to another stream is logged on that stream. Writes
+    to other storage, such as host staging, are not logged.
+    """
+
+    def __init__(self, names: dict[int, str], log: list[tuple[str, int]]) -> None:
+        super().__init__()
+        self._names = names
+        self._log = log
+
+    def __torch_dispatch__(
+        self,
+        func: Any,
+        types: Any,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        kwargs = kwargs or {}
+        for index, argument in enumerate(func._schema.arguments):
+            if argument.alias_info is None or not argument.alias_info.is_write:
+                continue
+            value = args[index] if index < len(args) else kwargs.get(argument.name)
+            for tensor in value if isinstance(value, list | tuple) else (value,):
+                if not isinstance(tensor, torch.Tensor):
+                    continue
+                name = self._names.get(_storage(tensor))
+                if name is not None:
+                    stream = torch.cuda.current_stream().cuda_stream
+                    self._log.append((name, stream))
+        return func(*args, **kwargs)
+
+
 @contextmanager
 def _stream_trace(
     monkeypatch: pytest.MonkeyPatch, targets: dict[str, list[torch.Tensor]]
 ) -> Iterator[list[tuple[str, int]]]:
-    """Log ``(name, current stream)`` inside every graph replay and ``copy_``.
+    """Log the current stream of every graph replay and every write to ``targets``.
 
-    The stream is read inside the innermost call, so work an implementation
-    moves to another stream is logged on that stream. A copy into storage
-    shared with a ``targets[name]`` tensor is logged as ``name``, any other
-    copy as ``"other"``.
+    A write into storage shared with a ``targets[name]`` tensor is logged as
+    ``name`` through ``_MutationStreams``; each ``CUDAGraph.replay`` as
+    ``"replay"``.
     """
     log: list[tuple[str, int]] = []
     names = {
@@ -4389,20 +4516,14 @@ def _stream_trace(
         for name, tensors in targets.items()
         for tensor in tensors
     }
-    replay, copy = torch.cuda.CUDAGraph.replay, torch.Tensor.copy_
+    replay = torch.cuda.CUDAGraph.replay
 
     def traced_replay(graph: Any, *args: Any, **kwargs: Any) -> Any:
         log.append(("replay", torch.cuda.current_stream().cuda_stream))
         return replay(graph, *args, **kwargs)
 
-    def traced_copy(tensor: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
-        name = names.get(_storage(tensor), "other")
-        log.append((name, torch.cuda.current_stream().cuda_stream))
-        return copy(tensor, *args, **kwargs)
-
-    with monkeypatch.context() as patch:
+    with monkeypatch.context() as patch, _MutationStreams(names, log):
         patch.setattr(torch.cuda.CUDAGraph, "replay", traced_replay)
-        patch.setattr(torch.Tensor, "copy_", traced_copy)
         yield log
 
 
@@ -4448,16 +4569,23 @@ def test_cuda_replay_runs_on_the_current_stream(
     _assert_on_stream(log, side.cuda_stream, required)
     assert binding.counters()["replays:chunk-fresh:g0:b1"] == 1
 
-    # The oracle fails on a resident write issued to another stream.
-    page = graph_pools["book_pool"][1:2]
-    saved = page.clone()
+    # The oracle fails on a resident write issued to another stream, whichever
+    # operation issues it.
+    pool = graph_pools["book_pool"]
+    block = torch.tensor([1], device=device)
+    saved = pool[1:2].clone()
     other = torch.cuda.Stream(device)
     other.wait_stream(side)
-    with _stream_trace(monkeypatch, targets) as stray, torch.cuda.stream(other):
-        page.copy_(saved)
-    other.synchronize()
-    with pytest.raises(AssertionError):
-        _assert_on_stream(stray, side.cuda_stream, {"resident"})
+    writes = {
+        "fill": lambda: pool[1:2].fill_(0),
+        "indexed-assignment": lambda: pool.__setitem__(block, saved),
+    }
+    for write in writes.values():
+        with _stream_trace(monkeypatch, targets) as stray, torch.cuda.stream(other):
+            write()
+        other.synchronize()
+        with pytest.raises(AssertionError):
+            _assert_on_stream(stray, side.cuda_stream, {"resident"})
 
 
 def _segment_pool(tensor: torch.Tensor) -> tuple[int, int]:
