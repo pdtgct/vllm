@@ -26,9 +26,6 @@ cadence (lookahead 1), which is the model's default.
 endpointing, a model capability, not to endpoint plugins (HTTP routes). The
 model's endpointing is independent of whether any endpoint plugin is loaded.
 
-"Current Implementation Divergences" lists where the code does not yet meet
-this design; all other sections describe target behavior.
-
 ## Context and Design Philosophy
 
 A Nemotron streaming step is one model-defined transaction over resident state
@@ -156,8 +153,8 @@ records their kernels directly rather than nested graph launches.
 
 `capture_scope.py` holds a `ContextVar`: while `outer_transaction_capture` is
 active, `nested_graph_mode` returns the eager mode (`capture_scope.py:37`), and
-every nested launch site consults it (`encoder_execution.py:1566`, `:1633`,
-`decode_graph.py:451`, `chunk_bucket_graph.py:253`). Host-to-device staging
+every nested launch site consults it (`encoder_execution.py:1560`, `:1627`,
+`decode_graph.py:442`, `chunk_bucket_graph.py:249`). Host-to-device staging
 inside the scope raises (`capture_scope.py:44`, `advance.py:1601`), because a
 captured copy would replay a frozen pinned source.
 
@@ -192,8 +189,8 @@ cell and signature the graph is data-independent.
 
 Nested host-side checks and counters run only while a cell is captured and
 are frozen under replay: `_validate_result_structure` (`advance.py:3541`), the
-guarded-transition invocation counters (`encoder_execution.py:830`, `:2180`)
-and the CHUNK binding's fallback counts (`chunk_bucket_graph.py:483`). For
+guarded-transition invocation counters (`encoder_execution.py:830`, `:2174`)
+and the CHUNK binding's fallback counts (`chunk_bucket_graph.py:479`). For
 replayed steps, encoder invocation counts and CHUNK-binding fallback counts
 do not advance; per-step batch stats still do, because the prologue stages
 them. The transaction counters are the per-replay record.
@@ -216,8 +213,8 @@ exactly as under eager.
 
 The signature compares decode and CHUNK callables by `id`. This is sound
 because the dense decode binding caches one callable per graph key for the
-binding's lifetime (`decode_graph.py:374-379`), and the CHUNK binding accepts
-only its sealed callables (`chunk_bucket_graph.py:468-476`). Ids are not reused
+binding's lifetime (`decode_graph.py:365-370`), and the CHUNK binding accepts
+only its sealed callables (`chunk_bucket_graph.py:464-469`). Ids are not reused
 while those objects are alive. A resolver that rebuilds closures per call would
 require a different identity mechanism in the signature.
 
@@ -303,7 +300,7 @@ access to unowned slots, outside the per-step access to scheduled handles that
 models otherwise get. The model reaches the pools for it only through
 `StateSlotBindings.startup_pool_access(layer).component_pools`, which core
 makes valid only inside the runner's `initialize_state_slots` call
-(`vllm/v1/worker/gpu/model_runner.py:874-876`). The access grants no slot
+(`vllm/v1/worker/gpu/model_runner.py:896-898`). The access grants no slot
 ownership and authorizes no store to any resident page, the null page
 included. Capture, its warm-ups and its self-check therefore run only rows the
 transaction rejects, on non-null free blocks, and store no page (Capture and
@@ -333,7 +330,7 @@ recaptured outside startup.
 Runner shutdown discards the binding's graphs, admission inventory, arenas and
 owned buffers. After a device synchronize, `GPUModelRunner.shutdown` calls
 `ModelState.shutdown()` before it releases the state bindings and the KV cache
-(`model_runner.py:2509-2520`). The model state's override calls
+(`model_runner.py:2531-2542`). The model state's override calls
 `TransactionGraphBinding.discard()` and tolerates a model state whose
 initialization did not complete and a binding that never captured. Core logs
 an exception from the hook and continues its cleanup, and never calls the
@@ -355,7 +352,7 @@ fallbacks. A change is worker-fatal, because
 an eager fallback would also run against nested graphs captured under the old
 settings. Sleep mode and the CuMem allocator are rejected for
 all persistent state (`vllm/v1/core/state_slot_manager.py:52-53`), as is weight
-reload after execution materialization (`nemotron_asr.py:639-643`).
+reload after execution materialization (`nemotron_asr.py:649-653`).
 
 ### Invariants
 
@@ -364,7 +361,7 @@ reload after execution materialization (`nemotron_asr.py:639-643`).
 - No slot is freed or reassigned between the commit reservation and the
   commit-sink collection in `postprocess_state`. Collection precedes the next
   replay because persistent state requires synchronous scheduling
-  (`vllm/v1/core/state_slot_manager.py:35`).
+  (`vllm/v1/core/state_slot_manager.py:47`).
 - A request abort is not commit-ticket cancellation. A launched transaction
   completes its normal stage, collection and fence path whatever happens to
   its requests; core suppresses an aborted request's output and controls the
@@ -383,29 +380,28 @@ reload after execution materialization (`nemotron_asr.py:639-643`).
 ### Budget mechanics
 
 - `determine_available_memory` wraps `profile_run` in `memory_profiling`
-  (`vllm/v1/worker/gpu_worker.py:698-714`). `non_kv_cache_memory` is the
+  (`vllm/v1/worker/gpu_worker.py:720-735`). `non_kv_cache_memory` is the
   free-memory drop since worker creation plus the transient peak headroom
-  (`vllm/utils/mem_utils.py:309-320`). Anything still alive when the window
+  (`vllm/utils/mem_utils.py:327-336`). Anything still alive when the window
   closes is charged at its driver-visible size.
 - `profile_run` calls the model's `prepare_execution_memory` inside that window
-  (`vllm/v1/worker/gpu/model_runner.py:1071-1073`). That hook retains the
+  (`vllm/v1/worker/gpu/model_runner.py:1117-1119`). That hook retains the
   nested inventory and runs eager profile transactions alongside it
-  (`nemotron_asr.py:892-959`).
+  (`nemotron_asr.py:902-969`).
 - The budget is the memory left after `non_kv_cache_memory`, or
   `kv_cache_memory_bytes` when that is set. Resident capacity for persistent
   state is `count = min(budget // page_size_bytes, max_num_seqs + 1)` pages.
   A set `num_gpu_blocks_override` replaces the count, not the budget: core
   budget validation must still accept `count * page_size_bytes <= budget`,
   and startup fails unless it does and `count >= 2`. Usable slots are `count -
-  1`, excluding the null block (on this branch
-  `vllm/v1/core/kv_cache_planning.py:1496-1515`; the RFC 1 PR performs the
-  same validation in its generic planner, rejecting an oversized override
-  before allocation). Admission therefore reduces usable slots only when
-  memory, not the `max_num_seqs` cap, binds.
+  1`, excluding the null block (`vllm/v1/core/kv_cache_planning.py:1645-1655`
+  rejects an oversized override and `:1681-1691` a budget too small for the
+  null page and one slot, both before allocation). Admission therefore reduces
+  usable slots only when memory, not the `max_num_seqs` cap, binds.
 - Resident pools exist only inside `initialize_kv_cache`. The KV allocation
   precedes `initialize_state_slots`, and the capture hook runs from
-  `initialize_state_slots` after the pools are allocated (on this branch
-  `model_runner.py:847`, `:874-876`; `model_state_v2.py:108-121`).
+  `initialize_state_slots` after the pools are allocated
+  (`model_runner.py:869`, `:896-898`; `model_state_v2.py:109-122`).
 
 Graphs bake in resident pool addresses, and those addresses do not exist until
 capacity is fixed. The inventory that serves therefore cannot be the inventory
@@ -447,7 +443,7 @@ makes the binding ready.
    after the nested inventory is ready and before the eager profile
    transactions: read `N0`; allocate stand-in storage of `max(populations) +
    1` slots with the real layout (`build_nemotron_persistent_state_spec`,
-   `allocate_state_scratch`, one raw allocation, `state_profile.py:233-255`);
+   `allocate_state_scratch`, one raw allocation, `state_profile.py:240-263`);
    capture the complete declared inventory over it into a dedicated graph pool
    through the same capture path, cell order, capture stream and verification
    as serving capture; clear every capture-only temporary (page snapshots,
@@ -489,7 +485,7 @@ superset.
 
 The two overrides fix different quantities. `kv_cache_memory_bytes` fixes
 the budget: it skips `memory_profiling` but still runs `profile_run`
-(`vllm/v1/worker/gpu_worker.py:670-695`), so `prepare_execution_memory`,
+(`vllm/v1/worker/gpu_worker.py:691-716`), so `prepare_execution_memory`,
 admission and the measurement of `A` still run, and the count follows from
 that budget by the formula above. `num_gpu_blocks_override` fixes the count,
 but only if core budget validation accepts it against the budget in force:
@@ -503,28 +499,34 @@ still measured and reported and `S <= A` still checked, but neither changes
 the count the overrides determine. If serving capture then raises or runs out
 of memory, the model reports an admission failure naming the option. A
 failure of the KV allocation itself happens before `initialize_state_slots`,
-outside any model hook, so naming the option there is a core obligation
-(Core Obligations).
+outside any model hook, so core names the option there from the state spec's
+memory contributors (Core Obligations, item 5).
 
 ### Failure modes and diagnostics
 
 Every case below is a startup failure. None degrades to eager serving. Each
-names the option, except the core-owned planner rejection and KV-allocation
-failure until their obligations land (Core Obligations).
+names the option. Core names it in the planner rejection and the KV-allocation
+failure, which no model call surrounds, because the model lists
+`transaction_graph_populations` in its state spec's `memory_contributors`
+while the option is on (Core Obligations, items 4 and 5).
 
 - Admission does not fit (capture failure or OOM in the window):
   `prepare_execution_memory` fails and latches `_execution_memory_failed`
-  (`nemotron_asr.py:954-958`).
+  (`nemotron_asr.py:964-968`).
 - Release not verified, or too few usable slots.
 - No capacity: core budget validation rejects the persistent-state budget,
   because fewer than two pages fit or a `num_gpu_blocks_override` exceeds the
-  remaining budget (on this branch `vllm/v1/core/kv_cache_planning.py:1496-1515`).
+  remaining budget (`vllm/v1/core/kv_cache_planning.py:1645-1655`, `:1681-1691`).
   It runs in the engine-core process from `EngineCore._initialize_kv_caches`
-  (`vllm/v1/engine/core.py:336`), after `determine_available_memory` returns
+  (`vllm/v1/engine/core.py:357`), after `determine_available_memory` returns
   and before any worker `initialize_kv_cache`, so no model call surrounds it
-  and the model cannot wrap it.
+  and the model cannot wrap it. The `ValueError` names the option.
 - KV allocation fails or runs out of memory in `initialize_kv_cache`, before
   `initialize_state_slots` and therefore outside the model's capture hook.
+  Core re-raises the same exception with a note naming the option
+  (`model_runner.py:207-220`, `:865-867`). The note is in the worker's logged
+  traceback, not in the exception's message; the multiprocess executor sends
+  the engine only the message.
 - Serving capture raises, or `S > A`: every graph is discarded and
   `initialize_kv_cache` raises.
 
@@ -598,8 +600,8 @@ and core finishes that request with an error, while a recoverable status
 step neither raises nor latches the binding.
 
 **Unchanged-state baseline.** "Unchanged" means the resident state after core
-slot initialization in `begin_step` (`model_runner.py:1845`,
-`vllm/v1/worker/gpu/state_slots.py:76-85`), which zeroes and initializes newly
+slot initialization in `begin_step` (`model_runner.py:1891`,
+`vllm/v1/worker/gpu/state_slots.py:77-86`), which zeroes and initializes newly
 bound slots before the model runs.
 
 **Before the boundary**, work touches only binding-owned buffers and host
@@ -617,10 +619,10 @@ although they occur before the boundary.
 **Wrapper entry.** Before replay, `execute` checks on the host that the cell's
 wrapper entry still holds its graph. A missing entry is worker-fatal and never
 leads to a capture. It can be emptied by `CUDAGraphWrapper.clear_all_graphs()`
-(`cudagraph_utils.py:1020`, `model_runner.py:2490`). The configuration
+(`cudagraph_utils.py:1081`, `model_runner.py:2546`). The configuration
 requirement `cudagraph_mode == NONE` keeps the runner's graph estimator
-(`cudagraph_utils.py:945`) and its minimal state-slot bootstrap
-(`cudagraph_utils.py:1057-1077`) from ever invoking the capture hook.
+(`cudagraph_utils.py:1006-1010`) and its minimal state-slot bootstrap
+(`cudagraph_utils.py:1110-1147`) from ever invoking the capture hook.
 
 **From the boundary on**, any failure is worker-fatal:
 
@@ -634,8 +636,8 @@ requirement `cudagraph_mode == NONE` keeps the runner's graph estimator
   stage, is irrelevant because the worker is never reused; later `execute` calls raise
   "a fresh worker is required".
 - In the engine, the exception leaves `execute_model`, is re-raised from
-  `step` (`vllm/v1/engine/core.py:728`, `:623`), and the busy loop signals the
-  engine dead (`core.py:1668-1674`).
+  `step` (`vllm/v1/engine/core.py:756`, `:773`), and the busy loop signals the
+  engine dead (`core.py:1794-1800`).
 - Asynchronous device faults surface at the next synchronizing call, normally
   the commit-sink collection (`commit_sink.py:270`, via
   `model_state_v2.py:324`), which fails before any progress is published and
@@ -648,7 +650,7 @@ requirement `cudagraph_mode == NONE` keeps the runner's graph estimator
 - Neither cancellation nor abort implies rollback. A reservation cancelled
   after a replay raised, or a request aborted after a replay wrote its pages,
   leaves those pages as the replay left them until core rebinds the slot for
-  a new generation, which zeroes and initializes it (`vllm/v1/worker/gpu/state_slots.py:65-87`),
+  a new generation, which zeroes and initializes it (`vllm/v1/worker/gpu/state_slots.py:66-88`),
   or a later authorized write changes them. Slot retirement and fencing stay
   with the core state-slot manager.
 
@@ -668,7 +670,7 @@ cell's next replay. The commit sink consumes them earlier in the step.
 - `vllm.models.nemotron_asr.transaction_graph:transaction_graph_counters` (its
   path on this branch) takes a model, runner, worker, executor or in-process
   EngineCore. It reaches the model by walking runner and worker attributes
-  (`_resolve_model`, `transaction_graph.py:1708-1724`), a harness convenience,
+  (`_resolve_model`, `transaction_graph.py:1707-1723`), a harness convenience,
   not a core contract. It returns
   host-only counts that never synchronize: captured cells, replays per cell,
   fallbacks per `(cell, reason)`, and prologue time. With the option off it
@@ -697,9 +699,8 @@ Non-state models are unchanged.
 
 This design places the obligations below on the core persistent-state design
 (`docs/design/persistent_state.md`, "Model hooks", "Profiling and serving
-bindings" and "Startup pool access", criteria M1 to M6). Core delivers
-obligations 1, 2, 3 and 6; obligations 4 and 5 are deferred, and so are
-TXG-MEM-011 and TXG-MEM-012. Core-side criteria name a model-supplied
+bindings", "Startup pool access" and "Memory contributors", criteria M1 to
+M8). Core delivers all six obligations. Core-side criteria name a model-supplied
 contributor label rather than this model's option, so core tests stay
 independent of the out-of-tree model.
 
@@ -708,26 +709,30 @@ independent of the out-of-tree model.
    (`vllm/v1/worker/gpu/warmup.py:157-162`; M1). TXG-CORE-001, TXG-CORE-002.
 2. **Post-warmup hook.** Delivered: `ModelState.post_warmup()`, called once
    through `GPUModelRunner.post_warmup` after every worker warmup and before
-   the worker serves (`gpu_worker.py:1207`, `model_runner.py:2505-2507`; M2).
+   the worker serves (`gpu_worker.py:1207`, `model_runner.py:2527-2529`; M2).
    The model verifies there (Post-Warmup Verification). TXG-VER-004.
 3. **Shutdown hook.** Delivered: `ModelState.shutdown()`, called first in
    `GPUModelRunner.shutdown`, while the state bindings and the KV cache exist
-   (`model_runner.py:2509-2520`; M3). The model discards there (Lifetime: one
+   (`model_runner.py:2531-2542`; M3). The model discards there (Lifetime: one
    serving capture per worker). TXG-LIFE-007.
-4. **Option-attributed capacity rejection.** Deferred. When core budget
-   validation rejects the persistent-state budget, including a
-   `num_gpu_blocks_override` that exceeds the remaining budget, the error names
-   the option that contributed admitted memory. How core learns the option is
-   core's choice. TXG-MEM-011.
-5. **Option-attributed KV-allocation failure.** Deferred. A KV allocation that
-   fails before `initialize_state_slots` reports the same attribution.
+4. **Option-attributed capacity rejection.** Delivered:
+   `PersistentStateSpec.memory_contributors` names the model options that
+   also consume device memory, and when core budget validation rejects the
+   persistent-state budget, including a `num_gpu_blocks_override` that exceeds
+   the remaining budget or a failed automatic fit of `max_model_len`, the
+   `ValueError` names them (`vllm/v1/kv_cache_interface.py:1586-1588`,
+   `vllm/v1/core/kv_cache_planning.py:84-104`; M7). The model lists
+   `transaction_graph_populations` there while the option is on. TXG-MEM-011.
+5. **Option-attributed KV-allocation failure.** Delivered: a KV allocation
+   that raises before `initialize_state_slots` is re-raised with a note naming
+   the same contributors (`model_runner.py:207-220`, `:865-867`; M8).
    TXG-MEM-012.
 6. **Startup pool access.** Delivered: `StateSlotBindings.startup_pool_access`
    (every page of each component pool, valid only inside the runner's
    `initialize_state_slots` call, authorizing no store),
    `StateSlotBindings.pool_layout` (plain-value layout, usable at any time) and
    `StateSlotBindings.is_profiling` (`vllm/v1/worker/gpu/state_slots.py:147-256`,
-   `model_runner.py:870-876`; M4 to M6). Capture uses the first, post-warmup
+   `model_runner.py:892-898`; M4 to M6). Capture uses the first, post-warmup
    verification the second, and the profiling guard the third. TXG-LIFE-008,
    TXG-LIFE-009.
 
@@ -747,16 +752,6 @@ accepted. It also requires:
 
 Covering the default cadence first requires validating g1 as an envelope
 extension.
-
-## Current Implementation Divergences
-
-Each item gives the current behavior on this branch, then the target. Every
-remaining item waits on a core obligation.
-
-1. **Option attribution in core errors.** The planner's persistent-state
-   capacity rejection and a KV allocation failure before
-   `initialize_state_slots` do not name the option. Target: Core Obligations,
-   items 4 and 5.
 
 ## Decisions & Alternatives
 
@@ -784,7 +779,7 @@ remaining item waits on a core obligation.
 1. **No cross-cell graph memory reuse.** Retained memory is the sum of
    per-cell growth. Likely cause, not yet confirmed:
    `GraphRuntime.capture_context` calls `graph_capture(device=device)` without
-   a stream (`decode_graph.py:96`), which creates a new stream per call
+   a stream (`decode_graph.py:94`), which creates a new stream per call
    (`vllm/distributed/parallel_state.py:1718`); the caching allocator reuses a
    freed block only on the stream that allocated it, and `graph_capture`
    documents that reusing one stream shares free graph-pool blocks
@@ -805,9 +800,8 @@ remaining item waits on a core obligation.
    `N()` after startup and after a sustained B63 run, to measure how much
    retained inventory the peak headroom counts twice.
 4. **Module globals across same-process engines.** `_batch_stats_slot`
-   (`advance.py:2514`), the capture-enabled flag
-   (`vllm/compilation/monitor.py:113`) and the class-level platform graph pool
-   (`vllm/platforms/interface.py:1329`) persist into a second engine in the
+   (`advance.py:2514`) and the class-level platform graph pool
+   (`vllm/platforms/interface.py:1330-1335`) persist into a second engine in the
    same process. **Probe:** start, shut down and restart an `EngineCore` in one
    process with the option on; check counters, receipts and pool use counts,
    and that no stale graph is replayed.
@@ -853,7 +847,7 @@ the body on the live call's inputs and cannot observe it.
 - **TXG-ENV-002**: When `transaction_graph_populations` is non-empty and native burst is enabled or the decode arm is neither `dense-graphed` nor `dense-eager`, the model shall raise a configuration error at construction.
   - Design: Supported Envelope
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_option_requires_native_burst_off_and_dense_decode` [CPU]
-- **TXG-ENV-003**: When `transaction_graph_populations` is non-empty and the configured `cudagraph_mode` is not `NONE` (including `PIECEWISE` and `FULL`) or `compilation_config.cudagraph_mm_encoder` is true, the model shall raise a configuration error at construction; the option's checks run before the model's other construction-time mode rejections, so every such rejection names the option. The runner's `needs_cudagraph_capture()` is not observable at model construction; under `NONE` with `cudagraph_mm_encoder` false the runner captures nothing for this model, because its graph manager builds no capture descriptors without a graph mode (`cudagraph_utils.py:263-264`) and no encoder graph manager exists without `cudagraph_mm_encoder` and `SupportsEncoderCudaGraph`, which this model does not implement (`model_states/interface.py:66-80`), so the estimator returns early (`cudagraph_utils.py:945`).
+- **TXG-ENV-003**: When `transaction_graph_populations` is non-empty and the configured `cudagraph_mode` is not `NONE` (including `PIECEWISE` and `FULL`) or `compilation_config.cudagraph_mm_encoder` is true, the model shall raise a configuration error at construction; the option's checks run before the model's other construction-time mode rejections, so every such rejection names the option. The runner's `needs_cudagraph_capture()` is not observable at model construction; under `NONE` with `cudagraph_mm_encoder` false the runner captures nothing for this model, because its graph manager builds no capture descriptors without a graph mode (`cudagraph_utils.py:291-292`) and no encoder graph manager exists without `cudagraph_mm_encoder` and `SupportsEncoderCudaGraph`, which this model does not implement (`model_states/interface.py:68-82`), so the estimator returns early (`cudagraph_utils.py:1006-1010`).
   - Design: Supported Envelope
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_option_rejects_every_outer_cudagraph_mode_but_none` [CPU]
 - **TXG-ENV-004**: When `transaction_graph_populations` is non-empty and `supported_num_lookahead_tokens` is not exactly `[0]` (g0, the 80 ms cadence), the model shall raise a configuration error at construction.
@@ -895,7 +889,7 @@ the body on the live call's inputs and cannot observe it.
 - **TXG-MEM-007**: When `transaction_graph_populations` is non-empty and neither `num_gpu_blocks_override` nor `kv_cache_memory_bytes` is set, `non_kv_cache_memory` from the memory-profiling window shall include the retained admission inventory and the admission preparation and capture peak, with the peak headroom left as the profiler's own measurement (the model resets no peak memory statistics during `prepare_execution_memory`) and no deduction for retained memory the peak headroom also counts, so resident capacity is fixed from the remaining budget; and the admission holder shall be alive when `prepare_execution_memory` returns, stay alive through the eager profile transactions and the window close, and be released only in `capture_transaction_graphs`.
   - Design: Budget mechanics; Ordering
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_admission_holder_lives_until_serving_capture` (event order of holder release against `prepare_execution_memory` return, eager profiles, window close and `capture_transaction_graphs`) [CPU]; `tests/v1/engine/test_nemotron_asr.py::test_nemotron_engine_transaction_graph_admission_is_charged` (option-on minus option-off, where the option-off arm runs twice before the option-on arm, takes admission's normalized readings at the admission point, and is represented by its second run because the first engine in a process also creates process-wide device memory that later engines start with; the spread between the two option-off runs is reported, with no tolerance below `A`: `total_consumed >= A` for retention; in every run, no peak-statistics reset inside `prepare_execution_memory` and a KV budget equal to requested memory less `total_consumed` and the profiler's `transient_peak_headroom`; the `non_kv_cache_memory` and `transient_peak_headroom` differences reported, not bounded, because the profiler may observe a smaller transient peak above the retained floor; and a memory-bound run whose block count equals the count core derives from the reduced budget) [engine-CUDA]
-- **TXG-MEM-008**: When `transaction_graph_populations` is non-empty and `num_gpu_blocks_override` or `kv_cache_memory_bytes` is set, the model shall still measure and report `A` and check `S <= A` under either override, and shall not itself change the resident block count, which core derives from the override once its budget validation accepts the configuration; and if serving capture then raises or runs out of memory, then startup shall fail with an admission-failure error naming `transaction_graph_populations`. Planner rejection of an oversized override is TXG-MEM-011 and KV-allocation failure is TXG-MEM-012, both core-owned.
+- **TXG-MEM-008**: When `transaction_graph_populations` is non-empty and `num_gpu_blocks_override` or `kv_cache_memory_bytes` is set, the model shall still measure and report `A` and check `S <= A` under either override, and shall not itself change the resident block count, which core derives from the override once its budget validation accepts the configuration; and if serving capture then raises or runs out of memory, then startup shall fail with an admission-failure error naming `transaction_graph_populations`. Planner rejection of an oversized override is TXG-MEM-011 and KV-allocation failure is TXG-MEM-012; core reports both.
   - Design: Capacity overrides
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_override_capacity_reports_admission_and_wraps_failures` (`A` and the `S <= A` check under each override, the model requesting no block-count change, and serving-capture failure) [CPU]
 - **TXG-MEM-009**: When `transaction_graph_populations` is non-empty, if admission capture raises or runs out of memory inside the profile window, then `prepare_execution_memory` shall raise an error naming `transaction_graph_populations` and latch `_execution_memory_failed`, and for an out-of-memory error the message shall report the normalized bytes admitted so far, the cells captured, the failing cell label and the device's free and total memory, and no projected total for the unfinished inventory.
@@ -904,12 +898,12 @@ the body on the live call's inputs and cannot observe it.
 - **TXG-MEM-010**: When `transaction_graph_populations` is non-empty, if serving capture raises, or the usable slot count after capacity is fixed is less than `max(populations)`, then the binding shall discard every graph and `initialize_kv_cache` shall raise an error naming `transaction_graph_populations`, and no step shall be served eager in its place.
   - Design: Lifetime: one serving capture per worker; Failure modes and diagnostics
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_failed_capture_publishes_nothing_and_fails_startup` (serving capture raises naming `transaction_graph_populations`, publishes nothing and latches the binding, so a later call raises instead of running eager) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_serving_capture_rejects_too_few_usable_slots` [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_serving_capture_requires_admission_on_cuda` (binding level: without admission, the CUDA serving-capture guard raises naming `transaction_graph_populations` and latches the binding) [CPU]
-- **TXG-MEM-011**: When `transaction_graph_populations` is non-empty, if core budget validation rejects the persistent-state budget after admission, because fewer than two pages fit or a set `num_gpu_blocks_override` exceeds the remaining budget, then startup shall fail with an error naming the model-supplied contributor label (for this model, `transaction_graph_populations`), and no step shall be served eager in its place. How the model supplies that label is the core persistent-state design's choice.
-  - Design: Failure modes and diagnostics; Core Obligations, item 4 (deferred until core lands it)
-  - Test: `tests/v1/core/test_kv_cache_planning.py::test_state_planner_rejection_names_the_contributor_label` (new; requires the core change; generic label; too-small budget and oversized override, parametrized) [CPU]
-- **TXG-MEM-012**: When `transaction_graph_populations` is non-empty, if the KV allocation in `initialize_kv_cache` raises or runs out of memory before `initialize_state_slots`, then startup shall fail with an error naming the model-supplied contributor label (for this model, `transaction_graph_populations`), and no step shall be served eager in its place.
-  - Design: Capacity overrides; Failure modes and diagnostics; Core Obligations, item 5 (deferred until core lands it)
-  - Test: `tests/v1/worker/test_gpu_model_runner_v2.py::test_state_kv_allocation_failure_names_the_contributor_label` (new; requires the core change; generic label; injected allocation failure) [CPU]
+- **TXG-MEM-011**: When `transaction_graph_populations` is non-empty, if core budget validation rejects the persistent-state budget after admission, because fewer than two pages fit, a set `num_gpu_blocks_override` exceeds the remaining budget, or automatically fitting `max_model_len` fails, then startup shall fail with a `ValueError` naming the model-supplied contributor label (for this model, `transaction_graph_populations`), and no step shall be served eager in its place. The model supplies the label as its state spec's `memory_contributors` while the option is on; when the option is off, the spec names no contributor.
+  - Design: Failure modes and diagnostics; Core Obligations, item 4 (delivered)
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_state_spec_names_the_option_as_a_memory_contributor` (option on and off; layout unchanged) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_planner_rejection_names_the_option` (the served state spec through core's planner: a one-page budget and an oversized override, option on and off) [CPU]; `tests/v1/core/test_kv_cache_utils.py::test_persistent_state_rejection_names_memory_contributors` (generic label; capacity, override and automatic-fit rejections, parametrized) [CPU]
+- **TXG-MEM-012**: When `transaction_graph_populations` is non-empty, if the KV allocation in `initialize_kv_cache` raises or runs out of memory before `initialize_state_slots`, then startup shall fail with the same exception, noted with the model-supplied contributor label (for this model, `transaction_graph_populations`) so that the worker's logged traceback names it, and no step shall be served eager in its place.
+  - Design: Capacity overrides; Failure modes and diagnostics; Core Obligations, item 5 (delivered)
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_state_spec_names_the_option_as_a_memory_contributor` (the label the served spec carries) [CPU]; `tests/v1/worker/test_gpu_model_runner_v2.py::test_state_kv_allocation_failure_names_memory_contributors` (generic label; injected allocation error and out-of-memory, profiling and serving pools, parametrized) [CPU]
 
 ### Capture lifetime (LIFE)
 
@@ -1066,9 +1060,9 @@ the body on the live call's inputs and cannot observe it.
 
 ### Consistency report
 
-- **Coverage.** Every target behaviour has a criterion except: the slot-reuse invariant between commit reservation and collection and replay serialization (Invariants), which rest on core synchronous scheduling for persistent state and are tested there; nested-scratch write-before-read, a model property whose behavioural coverage is TXG-REP-017; the sleep-mode, CuMem and weight-reload rejections, which are existing persistent-state contracts owned elsewhere; "a nonzero `signature` count is a defect", an operating judgement observed through TXG-REP-005's counter; and the client-level `EngineDeadError` after a fatal step, which is the core-owned `EngineCoreProc` busy-loop path (`core.py:1668-1674`), which stops later steps and is covered generically by `tests/v1/shutdown/test_forward_error.py`, with no existing harness driving a Nemotron streaming session through the multiprocess client (TXG-FAIL-005/006 observe propagation out of `EngineCore.step` instead). The Default-On Gate (including the `EngineCoreProc` counter reader; the counters are an in-process harness facility here), Open Questions probes, the startup-count proposal and the exploratory measurements carry no criteria by decision.
+- **Coverage.** Every target behaviour has a criterion except: the slot-reuse invariant between commit reservation and collection and replay serialization (Invariants), which rest on core synchronous scheduling for persistent state and are tested there; nested-scratch write-before-read, a model property whose behavioural coverage is TXG-REP-017; the sleep-mode, CuMem and weight-reload rejections, which are existing persistent-state contracts owned elsewhere; "a nonzero `signature` count is a defect", an operating judgement observed through TXG-REP-005's counter; and the client-level `EngineDeadError` after a fatal step, which is the core-owned `EngineCoreProc` busy-loop path (`core.py:1833-1841`, `:1794-1800`), which stops later steps and is covered generically by `tests/v1/shutdown/test_forward_error.py`, with no existing harness driving a Nemotron streaming session through the multiprocess client (TXG-FAIL-005/006 observe propagation out of `EngineCore.step` instead). The Default-On Gate (including the `EngineCoreProc` counter reader; the counters are an in-process harness facility here), Open Questions probes, the startup-count proposal and the exploratory measurements carry no criteria by decision.
 - **Observable proxies.** TXG-ENV-003 names the construction-observable options, because the runner's `needs_cudagraph_capture()` is not observable at model construction, and orders its checks before the model's other construction-time mode rejections; TXG-REP-014 reads the per-operation `fp32_precision` settings, because the legacy matmul-precision getter raises once those settings are used; TXG-REP-017 and TXG-OBS-005 exclude the CHUNK-bucket binding, which serves only g1 and is covered with g1.
-- **Core-owned.** Core Obligations lists every obligation on the core persistent-state design with its criteria. Core delivers obligations 1, 2, 3 and 6: TXG-CORE-001 and TXG-CORE-002 are tested in core; TXG-VER-004, TXG-LIFE-007 and TXG-LIFE-008 pair the core tests with model-level tests of the model state's `post_warmup`, `shutdown` and startup access, and TXG-LIFE-009 tests the model's `is_profiling` guard. TXG-MEM-011 and TXG-MEM-012 are deferred until core lands obligations 4 and 5; their tests need the core change and do not exist yet.
+- **Core-owned.** Core Obligations lists every obligation on the core persistent-state design with its criteria. Core delivers all six obligations: TXG-CORE-001 and TXG-CORE-002 are tested in core; TXG-VER-004, TXG-LIFE-007 and TXG-LIFE-008 pair the core tests with model-level tests of the model state's `post_warmup`, `shutdown` and startup access, and TXG-LIFE-009 tests the model's `is_profiling` guard. TXG-MEM-011 and TXG-MEM-012 pair core's generic-label tests with a model-level test that the served state spec names the option only while it is on, and TXG-MEM-011 also routes the served spec through core's planner.
 - **Conservative defaults.** TXG-MEM-006 fixes zero tolerance for `S <= A`, and TXG-MEM-008 keeps it under both capacity overrides; TXG-MEM-002 requires the complete inventory, so no cross-cell reuse is assumed; TXG-MEM-007 forbids deducting double-counted peak.
 - **Contradictions.** None between the criteria and the tests they name. `test_arena_rejects_vectors_outside_its_layout` is an arena-level guard beside the execution-level `signature` fallback (TXG-REP-005). `test_cuda_graph_replay_matches_eager_across_varied_plans` excludes park tokens and is not park-echo coverage (TXG-REP-011).
 - **Implicit scoping resolved.** Processor and `bind_rows` geometry enforcement (TXG-ENV-007, TXG-ENV-008) and the unreachable-model reader (TXG-OBS-003) are option-independent, because the design passes the configured set to the plan context unconditionally. "Worker-fatal" is read as the latch of TXG-FAIL-004 for every fatal check, including pre-boundary process-constant, wrapper-entry and post-warmup failures; only non-fatal pre-boundary failures follow the structural-failure contract (TXG-FAIL-001). Signature-fallback pool preservation applies only to captured storage distinct from the live pools (TXG-REP-005). Budget-derived capacity applies only without an override, and an override's count only once core budget validation accepts it (TXG-MEM-007, TXG-MEM-008). "Every CHUNK step replays" means zero CHUNK-step fallbacks in the homogeneous lockstep workload, with echo steps at undeclared populations counted `undeclared`; mixed and staggered steps keep eager equivalence and their fallback counts (TXG-REP-010, TXG-REP-013). Request abort is not ticket cancellation, and post-replay page preservation lasts until a rebind or authorized write (TXG-FAIL-002, TXG-FAIL-007). Per-row rejections are classified as eager classifies them, terminal ones as request failures, never step failures (TXG-REP-012). Processor geometry rejection is tested at the processor; the in-process engine tests bypass it (TXG-ENV-007).

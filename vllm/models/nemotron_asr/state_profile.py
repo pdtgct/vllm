@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -46,7 +46,9 @@ def _filled(value: int) -> Callable[..., torch.Tensor]:
     return initialize
 
 
-def build_nemotron_persistent_state_spec(config: Any) -> PersistentStateSpec:
+def build_nemotron_persistent_state_spec(
+    config: Any, *, memory_contributors: Sequence[str] = ()
+) -> PersistentStateSpec:
     """Build the one aggregate page directly from the published manifest.
 
     ``admitted_prompt`` and ``admitted_geometry`` start at zero in raw
@@ -54,6 +56,10 @@ def build_nemotron_persistent_state_spec(config: Any) -> PersistentStateSpec:
     admitted authority before any gather can observe them.  The checkpoint
     blank id is stable at construction and can therefore use a concrete
     initializer.
+
+    ``memory_contributors`` names the model options that also consume device
+    memory; core names them when the state pages do not fit. They do not
+    change the layout.
     """
     manifest = author_state_manifest(config)
     descriptors: list[PersistentStateDescriptor] = []
@@ -87,6 +93,7 @@ def build_nemotron_persistent_state_spec(config: Any) -> PersistentStateSpec:
         descriptors=descriptors,
         page_size_bytes=offset,
         state_name="nemotron.cache_aware_streaming",
+        memory_contributors=memory_contributors,
     )
 
 

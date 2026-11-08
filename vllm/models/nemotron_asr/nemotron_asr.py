@@ -506,8 +506,18 @@ class NemotronASRForRNNT(nn.Module):
         )
         if policy is not FP32_BRINGUP:
             apply_policy_dtypes(self.core)
+        # Captured transaction graphs take device memory before the state
+        # pages are budgeted, so core names the option when the pages do not
+        # fit.
         self._persistent_state_layer = PersistentStateLayerBase(
-            build_nemotron_persistent_state_spec(hf_config),
+            build_nemotron_persistent_state_spec(
+                hf_config,
+                memory_contributors=(
+                    ("transaction_graph_populations",)
+                    if transaction_populations
+                    else ()
+                ),
+            ),
             prefix=f"{prefix}.state" if prefix else "state",
             vllm_config=vllm_config,
         )
