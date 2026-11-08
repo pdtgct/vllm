@@ -395,8 +395,9 @@ reload after execution materialization (`nemotron_asr.py:649-653`).
   budget validation must still accept `count * page_size_bytes <= budget`,
   and startup fails unless it does and `count >= 2`. Usable slots are `count -
   1`, excluding the null block (`vllm/v1/core/kv_cache_planning.py:1645-1655`
-  rejects an oversized override and `:1681-1691` a budget too small for the
-  null page and one slot, both before allocation). Admission therefore reduces
+  rejects an oversized override, `:1681-1691` a budget too small for the null
+  page and one slot, and `:1676-1679` a failed automatic fit of
+  `max_model_len`, all before allocation). Admission therefore reduces
   usable slots only when memory, not the `max_num_seqs` cap, binds.
 - Resident pools exist only inside `initialize_kv_cache`. The KV allocation
   precedes `initialize_state_slots`, and the capture hook runs from
@@ -515,8 +516,9 @@ while the option is on (Core Obligations, items 4 and 5).
   (`nemotron_asr.py:964-968`).
 - Release not verified, or too few usable slots.
 - No capacity: core budget validation rejects the persistent-state budget,
-  because fewer than two pages fit or a `num_gpu_blocks_override` exceeds the
-  remaining budget (`vllm/v1/core/kv_cache_planning.py:1645-1655`, `:1681-1691`).
+  because fewer than two pages fit, a `num_gpu_blocks_override` exceeds the
+  remaining budget, or automatically fitting `max_model_len` fails
+  (`vllm/v1/core/kv_cache_planning.py:1645-1655`, `:1681-1691`, `:1676-1679`).
   It runs in the engine-core process from `EngineCore._initialize_kv_caches`
   (`vllm/v1/engine/core.py:357`), after `determine_available_memory` returns
   and before any worker `initialize_kv_cache`, so no model call surrounds it
@@ -903,7 +905,7 @@ the body on the live call's inputs and cannot observe it.
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_state_spec_names_the_option_as_a_memory_contributor` (option on and off; layout unchanged) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_planner_rejection_names_the_option` (the served state spec through core's planner: a one-page budget and an oversized override, option on and off) [CPU]; `tests/v1/core/test_kv_cache_utils.py::test_persistent_state_rejection_names_memory_contributors` (generic label; capacity, override and automatic-fit rejections, parametrized) [CPU]
 - **TXG-MEM-012**: When `transaction_graph_populations` is non-empty, if the KV allocation in `initialize_kv_cache` raises or runs out of memory before `initialize_state_slots`, then startup shall fail with the same exception, noted with the model-supplied contributor label (for this model, `transaction_graph_populations`) so that the worker's logged traceback names it, and no step shall be served eager in its place.
   - Design: Capacity overrides; Failure modes and diagnostics; Core Obligations, item 5 (delivered)
-  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_state_spec_names_the_option_as_a_memory_contributor` (the label the served spec carries) [CPU]; `tests/v1/worker/test_gpu_model_runner_v2.py::test_state_kv_allocation_failure_names_memory_contributors` (generic label; injected allocation error and out-of-memory, profiling and serving pools, parametrized) [CPU]
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_state_spec_names_the_option_as_a_memory_contributor` (the label the served spec carries) [CPU]; `tests/v1/worker/test_gpu_model_runner_v2.py::test_state_kv_allocation_failure_names_memory_contributors` (generic label; injected allocation error and out-of-memory, profiling and serving pools, parametrized) [CPU]; `tests/v1/core/test_kv_cache_utils.py::test_persistent_state_memory_contributors_are_diagnostic` (the label survives planning and the copy that rebuilds the spec as pickle does) [CPU]
 
 ### Capture lifetime (LIFE)
 
