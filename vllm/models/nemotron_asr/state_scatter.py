@@ -262,18 +262,18 @@ def warmup_masked_page_scatter(
     pool: torch.Tensor,
     scratch: torch.Tensor,
     *,
-    block_id: int = 0,
+    block_id: int,
 ) -> None:
     """Compile one CUDA specialization before any session is admitted.
 
     The warmup launches a one-row all-dirty descriptor that names
     ``block_id`` and synchronizes, proving both compilation and execution
     while the kernel's leading status predicate guarantees that no resident
-    address is loaded or stored. Callers warming resident pools pass a
-    non-null free block. Call this once for every distinct resident
-    pool/scratch layout after cache allocation. Runtime validation fails
-    closed on a specialization that was not warmed, preventing lazy JIT
-    compilation inside the commit window.
+    address is loaded or stored. Every caller names the block; callers
+    warming resident pools pass a non-null free block. Call this once for
+    every distinct resident pool/scratch layout after cache allocation.
+    Runtime validation fails closed on a specialization that was not warmed,
+    preventing lazy JIT compilation inside the commit window.
     """
     if pool.device.type != "cuda" or scratch.device.type != "cuda":
         raise ValueError("masked scatter warmup requires CUDA tensors")
