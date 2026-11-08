@@ -261,22 +261,28 @@ def _cuda_scatter(
 def warmup_masked_page_scatter(
     pool: torch.Tensor,
     scratch: torch.Tensor,
+    *,
+    block_id: int = 0,
 ) -> None:
     """Compile one CUDA specialization before any session is admitted.
 
-    The warmup launches a one-row all-dirty descriptor and synchronizes,
-    proving both compilation and execution while the kernel's leading status
-    predicate guarantees that no resident address is loaded or stored. Call
-    this once for every distinct resident pool/scratch layout after cache
-    allocation. Runtime validation fails closed on a specialization that was
-    not warmed, preventing lazy JIT compilation inside the commit window.
+    The warmup launches a one-row all-dirty descriptor that names
+    ``block_id`` and synchronizes, proving both compilation and execution
+    while the kernel's leading status predicate guarantees that no resident
+    address is loaded or stored. Callers warming resident pools pass a
+    non-null free block. Call this once for every distinct resident
+    pool/scratch layout after cache allocation. Runtime validation fails
+    closed on a specialization that was not warmed, preventing lazy JIT
+    compilation inside the commit window.
     """
     if pool.device.type != "cuda" or scratch.device.type != "cuda":
         raise ValueError("masked scatter warmup requires CUDA tensors")
     if int(scratch.shape[0]) < 1:
         raise ValueError("masked scatter warmup requires one scratch row")
+    if not 0 <= block_id < int(pool.shape[0]):
+        raise ValueError("masked scatter warmup block is outside the pool")
     one_scratch = scratch[:1]
-    block_ids = torch.zeros(1, dtype=torch.int64, device=pool.device)
+    block_ids = torch.full((1,), block_id, dtype=torch.int64, device=pool.device)
     row_status = torch.ones(1, dtype=torch.int32, device=pool.device)
     _validate_masked_page_scatter(
         pool,

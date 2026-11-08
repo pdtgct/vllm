@@ -2461,6 +2461,7 @@ def warmup_advance_model_rows_scatter(
     frontend_counter_pool: torch.Tensor,
     endpoint_history_pool: torch.Tensor | None = None,
     endpoint_book_pool: torch.Tensor | None = None,
+    block_id: int = 0,
 ) -> None:
     """Warm every fixed-shape commit specialization before admission.
 
@@ -2469,6 +2470,7 @@ def warmup_advance_model_rows_scatter(
     so each one-row scratch below reproduces the runtime source stride while
     preserving the destination pool's actual (possibly padded) block stride.
     Runtime validation then fails closed if a later pool/layout was omitted.
+    Each warm-up row names ``block_id`` with a rejected status.
     """
     pools = _resident_pool_sequence(
         channel_pools=channel_pools,
@@ -2492,7 +2494,7 @@ def warmup_advance_model_rows_scatter(
             dtype=pool.dtype,
             device=pool.device,
         )
-        warmup_masked_page_scatter(pool, scratch)
+        warmup_masked_page_scatter(pool, scratch, block_id=block_id)
 
 
 # ---- PORT-OBS-008 batch-size sub-stat: consume-once extraction hook ----

@@ -192,8 +192,12 @@ def _transaction_pools(pools: Any) -> TransactionPools:
     )
 
 
-def _warm_scatter(pools: TransactionPools) -> None:
-    """Warm every fixed-shape commit specialization of ``pools`` on CUDA."""
+def _warm_scatter(pools: TransactionPools, *, block_id: int) -> None:
+    """Warm every fixed-shape commit specialization of ``pools`` on CUDA.
+
+    Each warm-up row names ``block_id`` with a rejected status; callers pass a
+    non-null free block.
+    """
     if pools.queue.device.type != "cuda":
         return
     warmup_advance_model_rows_scatter(
@@ -209,6 +213,7 @@ def _warm_scatter(pools: TransactionPools) -> None:
         frontend_counter_pool=pools.frontend_counter,
         endpoint_history_pool=pools.endpoint_history,
         endpoint_book_pool=pools.endpoint_book,
+        block_id=block_id,
     )
 
 
@@ -956,6 +961,7 @@ class NemotronASRForRNNT(nn.Module):
     def _admission_storage(self, slots: int, device: torch.device) -> Any:
         """Stand-in storage of ``slots`` real-layout pages and its pools."""
         from vllm.models.nemotron_asr import state_profile
+        from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
         scratch = state_profile.allocate_state_scratch(
             build_nemotron_persistent_state_spec(self.config), slots, device
@@ -965,7 +971,7 @@ class NemotronASRForRNNT(nn.Module):
                 scratch, n_layers=int(self.config.n_layers)
             )
         )
-        _warm_scatter(pools)
+        _warm_scatter(pools, block_id=int(NULL_BLOCK_ID) + 1)
         return scratch.raw, pools
 
     def _transaction_call_bindings(self) -> Any:
@@ -1001,12 +1007,13 @@ class NemotronASRForRNNT(nn.Module):
         ``access`` is the aggregate state group's startup pool access: its
         ``spec`` and its ``component_pools``, every page of each component
         pool. It is valid only during ``initialize_state_slots`` and authorizes
-        no store, so capture runs only rows the transaction rejects, on
-        non-null free blocks. ``pool_layout`` is the same pools' plain-value
-        layout, recorded for post-warmup verification. Runs once the execution
-        inventory is ready and, on CUDA, after admission measured the
-        inventory. A repeated call over identical pools and call bindings is a
-        verified no-op; any change, or a failed capture, is worker-fatal.
+        no store, so capture and the commit-scatter warm-up run only rows the
+        transaction rejects, on non-null free blocks. ``pool_layout`` is the
+        same pools' plain-value layout, recorded for post-warmup verification.
+        Runs once the execution inventory is ready and, on CUDA, after
+        admission measured the inventory. A repeated call over identical pools
+        and call bindings is a verified no-op; any change, or a failed capture,
+        is worker-fatal.
         """
         binding = self._transaction_graph
         if binding is None:
@@ -1021,7 +1028,7 @@ class NemotronASRForRNNT(nn.Module):
             if not binding.serving_captured:
                 if resident.queue.device.type == "cuda":
                     binding.require_admission()
-                _warm_scatter(resident)
+                _warm_scatter(resident, block_id=int(NULL_BLOCK_ID) + 1)
             binding.capture(
                 self.core,
                 pools=resident,
@@ -1059,7 +1066,8 @@ class NemotronASRForRNNT(nn.Module):
         ``pool_layout`` is the live plain-value layout of the aggregate state
         group's component pools (``StateSlotBindings.pool_layout``), or
         ``None`` when no bindings exist. Every cell is checked against it, the
-        live call bindings and the nested bindings. Signatures are rebuilt over
+        device of the encoder parameters, the live call bindings and the nested
+        bindings. The projection and the signatures are rebuilt over
         storage-free meta tensors with the live layout, so no resident tensor
         is read or kept. The model state runs this from its post-warmup hook. A
         mismatch is worker-fatal.
@@ -1090,17 +1098,33 @@ class NemotronASRForRNNT(nn.Module):
         """Transaction pools with ``pool_layout``'s geometry and no storage.
 
         Each component is a meta-device tensor with the layout's shape,
-        element strides and dtype, projected as the resident pools are.
+        element strides and dtype, projected as the resident pools are. The
+        components share one meta storage, each at the layout's address, so
+        the projected pools carry the resident addresses.
         """
-        views = {
-            name: torch.empty_strided(
-                tuple(layout.shape),
-                tuple(layout.stride),
-                dtype=layout.dtype,
-                device="meta",
+
+        def end(layout: Any) -> int:
+            if not all(layout.shape):
+                return int(layout.data_ptr)
+            last = sum(
+                (size - 1) * stride
+                for size, stride in zip(layout.shape, layout.stride, strict=True)
             )
-            for name, layout in pool_layout.items()
-        }
+            return int(layout.data_ptr) + (last + 1) * layout.dtype.itemsize
+
+        storage = torch.empty(
+            max((end(layout) for layout in pool_layout.values()), default=0),
+            dtype=torch.uint8,
+            device="meta",
+        ).untyped_storage()
+        views = {}
+        for name, layout in pool_layout.items():
+            offset, misaligned = divmod(int(layout.data_ptr), layout.dtype.itemsize)
+            if misaligned:
+                raise ValueError(f"component pool {name} is not aligned to its dtype")
+            views[name] = torch.empty(0, dtype=layout.dtype, device="meta").set_(
+                storage, offset, tuple(layout.shape), tuple(layout.stride)
+            )
         return self._project_transaction_pools(
             SimpleNamespace(
                 spec=build_nemotron_persistent_state_spec(self.config), views=views
