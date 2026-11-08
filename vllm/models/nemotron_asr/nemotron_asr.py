@@ -17,7 +17,9 @@ by the replay-echo guard (PORT-DEC-005/007).
 """
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -991,14 +993,20 @@ class NemotronASRForRNNT(nn.Module):
         )
 
     @torch.inference_mode()
-    def capture_transaction_graphs(self, storage: Any) -> None:
+    def capture_transaction_graphs(
+        self, access: Any, pool_layout: Mapping[str, Any]
+    ) -> None:
         """Capture the declared transaction cells over allocated resident pools.
 
-        ``storage`` exposes the aggregate state group's ``spec`` and named
-        component ``views``. Runs once the execution inventory is ready and,
-        on CUDA, after admission measured the inventory. A repeated call over
-        identical pools and call bindings is a verified no-op; any change, or a
-        failed capture, is worker-fatal.
+        ``access`` is the aggregate state group's startup pool access: its
+        ``spec`` and its ``component_pools``, every page of each component
+        pool. It is valid only during ``initialize_state_slots`` and authorizes
+        no store, so capture runs only rows the transaction rejects, on
+        non-null free blocks. ``pool_layout`` is the same pools' plain-value
+        layout, recorded for post-warmup verification. Runs once the execution
+        inventory is ready and, on CUDA, after admission measured the
+        inventory. A repeated call over identical pools and call bindings is a
+        verified no-op; any change, or a failed capture, is worker-fatal.
         """
         binding = self._transaction_graph
         if binding is None:
@@ -1006,7 +1014,9 @@ class NemotronASRForRNNT(nn.Module):
         from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
         self._require_execution_inventory_ready()
-        resident = self._project_transaction_pools(storage)
+        resident = self._project_transaction_pools(
+            SimpleNamespace(spec=access.spec, views=access.component_pools)
+        )
         try:
             if not binding.serving_captured:
                 if resident.queue.device.type == "cuda":
@@ -1020,6 +1030,7 @@ class NemotronASRForRNNT(nn.Module):
                 device=resident.queue.device,
                 null_block_id=int(NULL_BLOCK_ID),
                 nested=self._nested_execution_bindings(),
+                pool_layout=pool_layout,
             )
         except Exception:
             binding.discard()
@@ -1042,15 +1053,15 @@ class NemotronASRForRNNT(nn.Module):
             if binding is not None
         )
 
-    def verify_transaction_graphs(self, storage: Any) -> None:
+    def verify_transaction_graphs(self, pool_layout: Mapping[str, Any] | None) -> None:
         """Verify every published transaction cell after the worker warmups.
 
-        ``storage`` is the live aggregate state group (``spec`` and component
-        ``views``) the model state reads from its current slots, or ``None``
-        when none are bound. Every cell is checked against the resident pools
-        projected from it, the live call bindings and the nested bindings;
-        nothing built from ``storage`` is kept. Until a core post-warmup hook
-        exists, the model state runs this once on the first non-dummy step. A
+        ``pool_layout`` is the live plain-value layout of the aggregate state
+        group's component pools (``StateSlotBindings.pool_layout``), or
+        ``None`` when no bindings exist. Every cell is checked against it, the
+        live call bindings and the nested bindings. Signatures are rebuilt over
+        storage-free meta tensors with the live layout, so no resident tensor
+        is read or kept. The model state runs this from its post-warmup hook. A
         mismatch is worker-fatal.
         """
         binding = getattr(self, "_transaction_graph", None)
@@ -1060,15 +1071,40 @@ class NemotronASRForRNNT(nn.Module):
 
         binding.verify_after_warmup(
             self.core,
-            resident_pools=(
+            pool_layout=pool_layout,
+            layout_pools=(
                 None
-                if storage is None
-                else lambda: self._project_transaction_pools(storage)
+                if pool_layout is None
+                else lambda: self._layout_transaction_pools(pool_layout)
             ),
             call=self._transaction_call_bindings(),
             hidden_size=int(self.config.hidden_size),
+            device=next(self.core.encoder.parameters()).device,
             null_block_id=int(NULL_BLOCK_ID),
             nested=self._nested_execution_bindings(),
+        )
+
+    def _layout_transaction_pools(
+        self, pool_layout: Mapping[str, Any]
+    ) -> TransactionPools:
+        """Transaction pools with ``pool_layout``'s geometry and no storage.
+
+        Each component is a meta-device tensor with the layout's shape,
+        element strides and dtype, projected as the resident pools are.
+        """
+        views = {
+            name: torch.empty_strided(
+                tuple(layout.shape),
+                tuple(layout.stride),
+                dtype=layout.dtype,
+                device="meta",
+            )
+            for name, layout in pool_layout.items()
+        }
+        return self._project_transaction_pools(
+            SimpleNamespace(
+                spec=build_nemotron_persistent_state_spec(self.config), views=views
+            )
         )
 
     def execution_profile_receipt(self) -> dict[str, Any]:

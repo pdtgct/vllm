@@ -371,21 +371,45 @@ def _run_g0_stream(hf_overrides, num_chunks, sessions=1, inject=None):
 
 
 @create_new_process_for_each_test(method="spawn")
-def test_nemotron_engine_transaction_graph_matches_eager():
+def test_nemotron_engine_transaction_graph_matches_eager(monkeypatch):
     """A fresh g0 B1 session replays its whole transactions bitwise exactly.
 
     The eager arm runs first, then the replay arm adds only the transaction
     graph option. Tokens, echo counts and the resident storage after every
     park must match, and every transaction must replay a captured cell.
+    Startup verifies the published cells once, before the first step, and
+    ``EngineCore.shutdown`` discards them once.
     """
+    from vllm.models.nemotron_asr.transaction_graph import TransactionGraphBinding
+
+    events = []
+    verify = TransactionGraphBinding.verify_after_warmup
+    discard = TransactionGraphBinding.discard
+
+    def verified(self, *args, **kwargs):
+        events.append("verify")
+        return verify(self, *args, **kwargs)
+
+    def discarded(self):
+        events.append("discard")
+        return discard(self)
+
+    monkeypatch.setattr(TransactionGraphBinding, "verify_after_warmup", verified)
+    monkeypatch.setattr(TransactionGraphBinding, "discard", discarded)
     num_chunks = 12
     eager_tokens, eager_pages, eager_counters, eager_echoes = _run_g0_stream(
         dict(_G0_BASE_OVERRIDES), num_chunks
     )
     assert eager_counters == {}
+    assert events == []
+    before_first_step = []
     tokens, pages, counters, echoes = _run_g0_stream(
-        {**_G0_BASE_OVERRIDES, "transaction_graph_populations": [1]}, num_chunks
+        {**_G0_BASE_OVERRIDES, "transaction_graph_populations": [1]},
+        num_chunks,
+        inject=lambda _model: before_first_step.extend(events),
     )
+    assert before_first_step == ["verify"]
+    assert events == ["verify", "discard"]
     assert tokens == eager_tokens
     assert echoes == eager_echoes
     for actual, expected in zip(pages, eager_pages, strict=True):

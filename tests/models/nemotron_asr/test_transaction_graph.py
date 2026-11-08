@@ -535,6 +535,12 @@ def _model_state(
     return NemotronASRModelState(config, model, None, device), slots
 
 
+def _initialize(state: NemotronASRModelState, slots: StateSlotBindings) -> None:
+    """``initialize_state_slots`` inside a startup access window, as the runner."""
+    with slots.startup_access_window():
+        state.initialize_state_slots(slots)
+
+
 def _transaction_view(storage: Any) -> advance.TransactionPools:
     """Project component views (``spec`` and ``views``) as transaction pools."""
     pools = project_nemotron_state_pools(storage, n_layers=N_LAYERS)
@@ -2770,7 +2776,7 @@ def test_every_fatal_source_latches_before_classification(
     model, config = _model(monkeypatch, runtime=lambda: platform.runtime)
     model.prepare_execution_memory()
     state, slots = _model_state(model, config, num_blocks=4)
-    state.initialize_state_slots(slots)
+    _initialize(state, slots)
     binding = model._transaction_graph
     assert binding.ready
     pools = _pool_arguments(_resident(model, slots))
@@ -2797,14 +2803,13 @@ def test_every_fatal_source_latches_before_classification(
         with pytest.raises(RuntimeError, match=r"(?i)wrapper entry"):
             _advance(model.core, pools, call, rows, binding, _CommitRecorder())
     elif source == "post-warmup":
-        verify = _seam(model, "verify_transaction_graphs")
         _resize_positional_buffer(model)
         with pytest.raises(RuntimeError, match="transaction_graph_populations"):
-            verify(_live_storage(model, slots))
+            state.post_warmup()
     else:
         _other, moved = _model_state(model, config, num_blocks=4)
         with pytest.raises(RuntimeError, match=r"(?i)pool layout|call binding"):
-            state.initialize_state_slots(moved)
+            _initialize(state, moved)
     path = "replay" if later == "covered" else "uncovered"
     _assert_latched(binding, model.core, call, pools, monkeypatch, (path,))
     with pytest.raises(RuntimeError, match="a fresh worker is required"):
@@ -3122,7 +3127,7 @@ def test_option_off_constructs_no_binding(
     monkeypatch.setattr(advance, "advance_model_rows", record)
     model.prepare_execution_memory()
     state, slots = _model_state(model, config)
-    state.initialize_state_slots(slots)
+    _initialize(state, slots)
     emitted = _serve_session(model, state, slots)
     assert len(graphs) == len(emitted) > 1
     assert all(graph is None for graph in graphs)
@@ -3495,7 +3500,7 @@ def test_admission_holder_lives_until_serving_capture(
     # The profile window closes and capacity is fixed outside the model.
     state, slots = _model_state(model, config)
     assert len(_live(arenas)) == count, "released before serving capture"
-    state.initialize_state_slots(slots)
+    _initialize(state, slots)
     assert not _live(arenas), "admission outlived serving capture"
 
 
@@ -3531,14 +3536,14 @@ def test_override_capacity_reports_admission_and_wraps_failures(
     state, slots = _model_state(model, config)
     binding = model._transaction_graph
     if outcome == "fits":
-        state.initialize_state_slots(slots)
+        _initialize(state, slots)
         assert binding.ready
         receipt = model.execution_profile_receipt()["transaction"]
         assert receipt["serving_bytes"] == admitted
     else:
         armed["value"] = outcome == "capture-fails"
         with pytest.raises(RuntimeError, match="transaction_graph_populations"):
-            state.initialize_state_slots(slots)
+            _initialize(state, slots)
         assert not binding.ready
     assert vars(config.cache_config) == cache
 
@@ -3645,7 +3650,7 @@ def test_serving_capture_runs_once_from_initialize_state_slots(
     monkeypatch.setattr(tg.TransactionGraphBinding, "_capture_cell", cell)
     state, slots = _model_state(model, config)
     resident = slots.views[model._persistent_state_layer.prefix]._tensor
-    state.initialize_state_slots(slots)
+    _initialize(state, slots)
     assert len(captures) == 1
     start = resident.data_ptr()
     assert start <= captures[0] < start + resident.nbytes
@@ -3666,13 +3671,13 @@ def test_identical_reinitialize_is_a_verified_no_op(
     model, config = _model(monkeypatch)
     model.prepare_execution_memory()
     state, slots = _model_state(model, config)
-    state.initialize_state_slots(slots)
+    _initialize(state, slots)
     binding = model._transaction_graph
     graphs = dict(binding._graphs)
     captured = binding.counters()["captured_cells"]
     order = {e["cell"]: e["capture_index"] for e in binding.receipt()["cells"]}
     prepared = _track_capture_cells(monkeypatch)
-    state.initialize_state_slots(slots)
+    _initialize(state, slots)
     assert not prepared
     assert binding._graphs.keys() == graphs.keys()
     assert all(binding._graphs[cell] is graph for cell, graph in graphs.items())
@@ -3700,7 +3705,7 @@ def test_changed_pool_layout_on_reinitialize_is_fatal(
     model, config = _model(monkeypatch)
     model.prepare_execution_memory()
     state, slots = _model_state(model, config, num_blocks=4)
-    state.initialize_state_slots(slots)
+    _initialize(state, slots)
     binding = model._transaction_graph
     again = slots
     if change == "pool-layout":
@@ -3712,7 +3717,7 @@ def test_changed_pool_layout_on_reinitialize_is_fatal(
         monkeypatch.setattr(execution, "transition", _rebound(execution.transition))
     prepared = _track_capture_cells(monkeypatch)
     with pytest.raises(RuntimeError, match=r"(?i)pool layout|call binding"):
-        state.initialize_state_slots(again)
+        _initialize(state, again)
     assert not prepared
     with pytest.raises(RuntimeError, match="a fresh worker is required"):
         _first_step(
@@ -3853,13 +3858,63 @@ def test_discard_leaves_no_published_cell_or_arena() -> None:
     assert binding.counters()["captured_cells"] == 0
     assert not any(entry["captured"] for entry in binding.receipt()["cells"])
     assert not _live(owned)
+    binding.discard()
+    assert not binding.ready
+    assert binding.counters()["captured_cells"] == 0
 
 
 @pytest.mark.cpu_test
-@pytest.mark.xfail(
-    strict=True,
-    reason="Deferred: core persistent-state obligation 6 (design: Core Obligations)",
+@pytest.mark.usefixtures("cpu_readings")
+@pytest.mark.parametrize(
+    "case", ["served", "admitted-only", "option-off", "uninitialized"]
 )
+def test_model_state_shutdown_discards_the_binding(
+    monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    if case == "uninitialized":
+        # A model state whose construction did not complete.
+        NemotronASRModelState.__new__(NemotronASRModelState).shutdown()
+        return
+    hf: dict[str, Any] = {}
+    if case == "option-off":
+        hf["transaction_graph_populations"] = []
+    model, config = _model(monkeypatch, **hf)
+    model.prepare_execution_memory()
+    state, slots = _model_state(model, config)
+    if case == "served":
+        _initialize(state, slots)
+    binding = model._transaction_graph
+    if binding is None:
+        state.shutdown()
+        return
+    if case == "served":
+        inventory = binding._graphs
+    else:
+        inventory = binding._admission.inventory.graphs
+    owned = [
+        weakref.ref(value)
+        for graph in inventory.values()
+        for value in (graph, graph.arena, graph.rows_out)
+    ]
+    assert owned
+    del inventory
+    discards: list[bool] = []
+    discard = binding.discard
+
+    def counted() -> None:
+        discards.append(True)
+        discard()
+
+    monkeypatch.setattr(binding, "discard", counted)
+    state.shutdown()
+    assert discards == [True]
+    assert not binding.ready
+    assert binding._admission is None
+    assert binding.counters()["captured_cells"] == 0
+    assert not _live(owned)
+
+
+@pytest.mark.cpu_test
 @pytest.mark.usefixtures("cpu_readings")
 def test_capture_reaches_pools_only_through_the_startup_accessor(
     monkeypatch: pytest.MonkeyPatch,
@@ -3867,6 +3922,18 @@ def test_capture_reaches_pools_only_through_the_startup_accessor(
     model, config = _model(monkeypatch)
     model.prepare_execution_memory()
     state, slots = _model_state(model, config)
+    resident = slots.views[model._persistent_state_layer.prefix]._tensor
+    before = resident.clone()
+    with pytest.raises(ValueError, match="initialize_state_slots"):
+        state.initialize_state_slots(slots)
+    assert not model._transaction_graph.ready
+    accesses: list[weakref.ref[Any]] = []
+    access = StateSlotBindings.startup_pool_access
+
+    def recorded(self: StateSlotBindings, layer: str) -> Any:
+        granted = access(self, layer)
+        accesses.append(weakref.ref(granted))
+        return granted
 
     def private_views(self: StateSlotViews) -> dict[str, torch.Tensor]:
         caller = sys._getframe(1).f_globals.get("__name__", "")
@@ -3875,11 +3942,55 @@ def test_capture_reaches_pools_only_through_the_startup_accessor(
         )
         return self.__dict__["_views"]
 
+    monkeypatch.setattr(StateSlotBindings, "startup_pool_access", recorded)
     monkeypatch.setattr(
         StateSlotViews, "_views", property(private_views), raising=False
     )
-    state.initialize_state_slots(slots)
+    _initialize(state, slots)
     assert model._transaction_graph.ready
+    assert len(accesses) == 1
+    assert not _live(accesses), "the model kept its startup pool access"
+    state.post_warmup()
+    assert torch.equal(resident, before), "startup access stored a resident page"
+
+
+@pytest.mark.cpu_test
+@pytest.mark.usefixtures("cpu_readings")
+def test_profiling_bindings_capture_and_retain_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model, config = _model(monkeypatch)
+    model.prepare_execution_memory()
+    binding = model._transaction_graph
+    admission = binding._admission
+    assert admission is not None
+    state, serving = _model_state(model, config, num_blocks=4)
+    spec = build_nemotron_persistent_state_spec(model.config)
+    layer = model._persistent_state_layer.prefix
+    pool = torch.zeros(3 * spec.page_size_bytes, dtype=torch.uint8)
+    profiling = StateSlotBindings(
+        [KVCacheGroupSpec([layer], spec)], {layer: pool}, is_profiling=True
+    )
+
+    def refuse(*_args: Any, **_kwargs: Any) -> None:
+        pytest.fail("profiling bindings reached startup pool access")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(StateSlotBindings, "startup_pool_access", refuse)
+        prepared = _track_capture_cells(patch)
+        _initialize(state, profiling)
+    assert not prepared
+    assert not binding.ready and not binding.serving_captured
+    assert binding._admission is admission
+    retained = [weakref.ref(pool), weakref.ref(profiling)]
+    del pool, profiling
+    _initialize(state, serving)
+    assert binding.ready
+    assert binding._admission is None
+    assert not _live(retained), "the profiling pools outlived serving capture"
+    _other, moved = _model_state(model, config, num_blocks=4)
+    with pytest.raises(RuntimeError, match=r"(?i)pool layout"):
+        _initialize(state, moved)
 
 
 # ---- CPU: post-warmup verification -----------------------------------------
@@ -3906,7 +4017,7 @@ def _verified_model(
     model, config = _model(monkeypatch, **hf)
     model.prepare_execution_memory()
     state, slots = _model_state(model, config, num_blocks=num_blocks)
-    state.initialize_state_slots(slots)
+    _initialize(state, slots)
     assert model._transaction_graph.ready
     return model, state, slots
 
@@ -3977,12 +4088,12 @@ def _verification_mismatch(
         views = slots.views[model._persistent_state_layer.prefix]._views
         name = "encoder.layers.0.window.channel"
         views[name] = views[name].clone()
-        return names("resident pool channel.0")
+        return names(f"resident pool {name}")
     if kind == "replaced-mapping":
         owner = slots.views[model._persistent_state_layer.prefix]
         name = "encoder.layers.0.window.channel"
         owner._views = {**owner._views, name: owner._views[name].clone()}
-        return names("resident pool channel.0")
+        return names(f"resident pool {name}")
     if kind == "lazy-projection":
         assert encoder._stream_relative_position_lengths == ()
         with torch.inference_mode():
@@ -4015,10 +4126,11 @@ def test_post_warmup_verification_rejects_resized_external_buffer(
         monkeypatch, graphed=mismatch in _NESTED_MISMATCHES
     )
     verify = _seam(model, "verify_transaction_graphs")
-    verify(_live_storage(model, slots))
+    layer = model._persistent_state_layer.prefix
+    verify(slots.pool_layout(layer))
     check = _verification_mismatch(model, slots, mismatch)
     with pytest.raises(RuntimeError, match="transaction_graph_populations") as raised:
-        verify(_live_storage(model, slots))
+        verify(slots.pool_layout(layer))
     check(str(raised.value))
 
 
@@ -4026,12 +4138,12 @@ def test_post_warmup_verification_rejects_resized_external_buffer(
 def test_verification_keeps_no_resident_view(
     monkeypatch: pytest.MonkeyPatch, cpu_readings: SimpleNamespace
 ) -> None:
-    """No resident view outlives ``discard()`` and the model state's slots."""
+    """No resident view outlives ``post_warmup``, ``discard()`` and the slots."""
     cpu_readings.expected = 5
     model, state, slots = _verified_model(monkeypatch)
     views = slots.views[model._persistent_state_layer.prefix]._views
     resident = [weakref.ref(view) for view in views.values()]
-    state.prepare_step(SchedulerOutput.make_empty(), dummy_run=False, is_profile=False)
+    state.post_warmup()
     model._transaction_graph.discard()
     state.state_slots = None
     del views, slots
@@ -4039,7 +4151,7 @@ def test_verification_keeps_no_resident_view(
 
 
 @pytest.mark.cpu_test
-def test_first_real_step_verifies_once_before_pruning(
+def test_post_warmup_verifies_once_and_real_steps_check_the_latch(
     monkeypatch: pytest.MonkeyPatch,
     cpu_readings: SimpleNamespace,
 ) -> None:
@@ -4049,11 +4161,12 @@ def test_first_real_step_verifies_once_before_pruning(
     verify = _seam(model, "verify_transaction_graphs")
     prune = model._registry.prune
 
-    def verified(storage: Any) -> None:
+    def verified(layout: Any) -> None:
         events.append("verify")
-        live = slots.views[model._persistent_state_layer.prefix]
-        assert storage.spec is live.spec and storage.views is live._views
-        verify(storage)
+        live = slots.pool_layout(model._persistent_state_layer.prefix)
+        assert dict(layout) == dict(live)
+        assert not any(isinstance(entry, torch.Tensor) for entry in layout.values())
+        verify(layout)
 
     def pruned(live: Any) -> Any:
         events.append("prune")
@@ -4061,8 +4174,10 @@ def test_first_real_step_verifies_once_before_pruning(
 
     monkeypatch.setattr(model, "verify_transaction_graphs", verified)
     monkeypatch.setattr(model._registry, "prune", pruned)
+    state.post_warmup()
+    assert events == ["verify"]
     state.prepare_step(SchedulerOutput.make_empty(), dummy_run=True, is_profile=False)
-    assert events == []
+    assert events == ["verify"]
     state.prepare_step(SchedulerOutput.make_empty(), dummy_run=False, is_profile=False)
     assert events == ["verify", "prune"]
     state.prepare_step(SchedulerOutput.make_empty(), dummy_run=False, is_profile=False)
@@ -4093,7 +4208,7 @@ def test_first_real_step_verifies_once_before_pruning(
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("mismatch", _VERIFY_MISMATCHES)
-def test_first_real_step_mismatch_is_fatal_before_any_state_change(
+def test_post_warmup_mismatch_is_fatal_before_any_state_change(
     monkeypatch: pytest.MonkeyPatch, cpu_readings: SimpleNamespace, mismatch: str
 ) -> None:
     cpu_readings.expected = 5
@@ -4106,9 +4221,7 @@ def test_first_real_step_mismatch_is_fatal_before_any_state_change(
     before = resident.clone()
     check = _verification_mismatch(model, slots, mismatch)
     with pytest.raises(RuntimeError, match="transaction_graph_populations") as raised:
-        state.prepare_step(
-            SchedulerOutput.make_empty(), dummy_run=False, is_profile=False
-        )
+        state.post_warmup()
     check(str(raised.value))
     assert not pruned
     assert torch.equal(resident, before)
@@ -4509,7 +4622,7 @@ def test_cuda_replay_freezes_nested_counters_and_counts_once(
     )
     model.prepare_execution_memory()
     state, slots = _model_state(model, config, num_blocks=4)
-    state.initialize_state_slots(slots)
+    _initialize(state, slots)
     binding = model._transaction_graph
     assert binding.ready
     execution = model._encoder_execution
@@ -4932,7 +5045,7 @@ def test_cuda_interleaved_fallbacks_and_replays_match_eager(
     )
     model.prepare_execution_memory()
     state, slots = _model_state(model, config, num_blocks=5)
-    state.initialize_state_slots(slots)
+    _initialize(state, slots)
     _interleaved_parity(model, slots)
 
 
