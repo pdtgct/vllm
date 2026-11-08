@@ -3995,9 +3995,10 @@ class _ResidentWrites(TorchDispatchMode):
     changed bytes; this log also sees a store of the values a page already
     holds.
 
-    The log sees only writes that pass through the dispatcher. A host export
-    (``Tensor.numpy`` or ``Tensor.__dlpack__``) of resident storage would let
-    a later write bypass it, so every such export is logged as well. Stores
+    The log sees only writes that pass through the dispatcher. A
+    ``Tensor.numpy`` or ``Tensor.__dlpack__`` export of resident storage would
+    let a later write bypass it, so each such export is logged as well; other
+    export paths, such as ``torch.utils.dlpack.to_dlpack``, are not observed. Stores
     issued by compiled or Triton kernels bypass both; the CUDA test covers the
     scatter kernel by observing its launches.
     """
@@ -4110,9 +4111,10 @@ def test_capture_reaches_pools_only_through_the_startup_accessor(
     """Capture reaches the pools only through startup access and stores nothing.
 
     Every page holds sentinels, which a changed byte disturbs, and every
-    dispatched op and host export from the out-of-window call through
-    ``post_warmup`` is observed, so a write into resident storage is caught
-    even when it stores the bytes a page holds.
+    dispatched op and every ``Tensor.numpy`` or ``Tensor.__dlpack__`` export
+    from the out-of-window call through ``post_warmup`` is observed, so such a
+    write into resident storage is caught even when it stores the bytes a
+    page holds.
     """
     model, config = _model(monkeypatch)
     model.prepare_execution_memory()
