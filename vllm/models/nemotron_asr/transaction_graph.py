@@ -1391,13 +1391,12 @@ class TransactionGraphBinding:
             )
             arena.upload(captured)
             runtime.synchronize(device)
-            with _automatic_gc_paused():
-                runtime.set_capture_enabled(True)
-                try:
-                    with runtime.capture_context(device), _on_stream(capture_stream):
-                        launch(runtime.graph_mode)
-                finally:
-                    runtime.set_capture_enabled(False)
+            with (
+                _automatic_gc_paused(),
+                runtime.capture_context(device),
+                _on_stream(capture_stream),
+            ):
+                launch(runtime.graph_mode)
             if reserved is not None:
                 graph.retained_bytes = torch.cuda.memory_reserved(device) - reserved
             graph.capture_seconds = time.perf_counter() - started

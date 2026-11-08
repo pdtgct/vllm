@@ -236,7 +236,6 @@ def _graph_runtime(
         eager_mode="none",
         graph_mode="graph",
         synchronize=lambda _device: None,
-        set_capture_enabled=lambda _enabled: None,
     )
 
 

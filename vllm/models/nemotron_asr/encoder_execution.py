@@ -1450,21 +1450,15 @@ class ResolvedEncoderExecution:
 
             stage = "capture"
             cell = None
-            runtime.set_capture_enabled(True)
-            try:
-                with torch.inference_mode(), runtime.capture_context(device):
-                    for cell in cells:
-                        entry = self._pending_graph_entries[
-                            self.graph_key("cuda", cell)
-                        ]
-                        self._capture_graph_entry(entry)
-                        self._record_memory_diagnostic(
-                            device, stage="after-capture", key=cell
-                        )
-                    cell = None
-                    runtime.synchronize(device)
-            finally:
-                runtime.set_capture_enabled(False)
+            with torch.inference_mode(), runtime.capture_context(device):
+                for cell in cells:
+                    entry = self._pending_graph_entries[self.graph_key("cuda", cell)]
+                    self._capture_graph_entry(entry)
+                    self._record_memory_diagnostic(
+                        device, stage="after-capture", key=cell
+                    )
+                cell = None
+                runtime.synchronize(device)
             self._assert_model_state()
             self._graph_entries = dict(self._pending_graph_entries)
             self._pending_graph_entries.clear()
