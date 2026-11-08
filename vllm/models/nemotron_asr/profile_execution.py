@@ -246,6 +246,8 @@ def run_persistent_state_profile(
         pools = invocation.pools
         native_handoff = getattr(model, "_native_burst_handoff", None)
         if device.type == "cuda":
+            from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
             warmup_advance_model_rows_scatter(
                 channel_pools=list(pools.channel),
                 time_pools=list(pools.convolution),
@@ -259,6 +261,8 @@ def run_persistent_state_profile(
                 frontend_counter_pool=pools.frontend_counters,
                 endpoint_history_pool=pools.endpoint_history,
                 endpoint_book_pool=pools.endpoint_book,
+                # The first profile row's page; no warm-up names the null page.
+                block_id=int(NULL_BLOCK_ID) + 1,
             )
 
         def invoke() -> torch.Tensor:

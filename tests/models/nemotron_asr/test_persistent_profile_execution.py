@@ -218,6 +218,8 @@ def test_profile_execution_invokes_the_canonical_transaction_and_drains_stats(
     assert warmup_kwargs["channel_pools"] == []
     assert warmup_kwargs["h_pool"] is invocation.pools.predictor_h
     assert warmup_kwargs["endpoint_book_pool"] is invocation.pools.endpoint_book
+    # The warm-up names the first profile row's page, never the null page.
+    assert warmup_kwargs["block_id"] == 1
     # The patched transaction records its positional tuple and keyword dict.
     advance_args, advance_kwargs = cast(
         tuple[tuple[object, ...], dict[str, object]], events[3][1]

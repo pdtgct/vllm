@@ -23,6 +23,7 @@ from typing import Any
 
 import pytest
 import torch
+from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from tests.models.nemotron_asr import test_encoder_execution as encoder_tests
@@ -95,6 +96,9 @@ pytestmark = [pytest.mark.core_model]
 EOU = VOCAB + 3
 CPU = torch.device("cpu")
 Pools = dict[str, Any]
+#: The page every synthetic pool's scatter warm-up names: not the null page,
+#: and inside each of these pools, which all hold at least two pages.
+WARM_BLOCK = 1
 
 
 # ---- runtimes --------------------------------------------------------------
@@ -374,7 +378,7 @@ def _binding(
         runtime=runtime,
     )
     if device.type == "cuda":
-        advance.warmup_advance_model_rows_scatter(**pools)
+        advance.warmup_advance_model_rows_scatter(**pools, block_id=WARM_BLOCK)
     binding.capture(
         core,
         pools=_transaction_pools(pools),
@@ -605,7 +609,9 @@ class _StandIn:
         scratch = _scratch(slots, self.device)
         pools = _transaction_view(scratch)
         if self.device.type == "cuda":
-            advance.warmup_advance_model_rows_scatter(**_pool_arguments(pools))
+            advance.warmup_advance_model_rows_scatter(
+                **_pool_arguments(pools), block_id=WARM_BLOCK
+            )
         self.slots.append(slots)
         self.nbytes.append(scratch.raw.nbytes)
         self.storage.append(weakref.ref(scratch.raw))
@@ -1540,7 +1546,7 @@ def _population_parity(
         runtime=runtime,
     )
     if device.type == "cuda":
-        advance.warmup_advance_model_rows_scatter(**graph_pools)
+        advance.warmup_advance_model_rows_scatter(**graph_pools, block_id=WARM_BLOCK)
     binding.capture(
         core,
         pools=_transaction_pools(graph_pools),
@@ -1927,7 +1933,7 @@ def _corrupt_row_in_population(
         runtime=runtime,
     )
     if device.type == "cuda":
-        advance.warmup_advance_model_rows_scatter(**graph_pools)
+        advance.warmup_advance_model_rows_scatter(**graph_pools, block_id=WARM_BLOCK)
     binding.capture(
         core,
         pools=_transaction_pools(graph_pools),
@@ -3945,6 +3951,67 @@ def _seed_sentinels(model: Any, slots: StateSlotBindings) -> torch.Tensor:
     return views._tensor
 
 
+def _written_tensors(
+    func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> Iterator[torch.Tensor]:
+    """Yield every tensor argument the schema of ``func`` marks written.
+
+    An argument is written when the schema marks it mutable (in-place,
+    ``Tensor(a!)`` lists) or it is an ``out=`` argument.
+    """
+    for index, argument in enumerate(func._schema.arguments):
+        alias = argument.alias_info
+        if not argument.is_out and (alias is None or not alias.is_write):
+            continue
+        value = args[index] if index < len(args) else kwargs.get(argument.name)
+        for tensor in value if isinstance(value, list | tuple) else (value,):
+            if isinstance(tensor, torch.Tensor):
+                yield tensor
+
+
+def _storage_range(tensor: torch.Tensor) -> tuple[torch.device, int, int]:
+    """The device and byte range ``[start, end)`` of the storage of ``tensor``."""
+    storage = tensor.untyped_storage()
+    start = storage.data_ptr()
+    return tensor.device, start, start + storage.nbytes()
+
+
+class _ResidentWrites(TorchDispatchMode):
+    """Log every op that writes a tensor whose storage overlaps resident storage.
+
+    A tensor is written when ``_written_tensors`` yields it. It is logged when
+    its storage's byte range overlaps the byte range of a ``resident`` tensor's
+    storage on the same device, whatever values it stores; a write of no
+    element stores no byte and is not logged. Sentinel comparison sees only
+    changed bytes; this log also sees a store of the values a page already
+    holds.
+    """
+
+    def __init__(self, resident: list[torch.Tensor]) -> None:
+        super().__init__()
+        self._ranges = {_storage_range(tensor) for tensor in resident}
+        self.writes: list[str] = []
+
+    def __torch_dispatch__(
+        self,
+        func: Any,
+        types: Any,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        kwargs = kwargs or {}
+        for tensor in _written_tensors(func, args, kwargs):
+            if tensor.numel() == 0:
+                continue
+            device, start, end = _storage_range(tensor)
+            if any(
+                device == owner and start < stop and first < end
+                for owner, first, stop in self._ranges
+            ):
+                self.writes.append(str(func))
+        return func(*args, **kwargs)
+
+
 @pytest.mark.cpu_test
 def test_serving_capture_requires_the_pool_layout() -> None:
     """Serving capture records the pool layout post-warmup verification reads."""
@@ -3994,39 +4061,51 @@ def test_scatter_warmup_names_a_non_null_free_block(
 def test_capture_reaches_pools_only_through_the_startup_accessor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Capture reaches the pools only through startup access and stores nothing.
+
+    Every page holds sentinels, which a changed byte disturbs, and every op from
+    the out-of-window call through ``post_warmup`` is observed, so a write into
+    resident storage is caught even when it stores the bytes a page holds.
+    """
     model, config = _model(monkeypatch)
     model.prepare_execution_memory()
     state, slots = _model_state(model, config)
     resident = _seed_sentinels(model, slots)
     before = resident.clone()
-    with pytest.raises(ValueError, match="initialize_state_slots"):
-        state.initialize_state_slots(slots)
-    assert not model._transaction_graph.ready
-    accesses: list[weakref.ref[Any]] = []
-    access = StateSlotBindings.startup_pool_access
+    views = slots.views[model._persistent_state_layer.prefix]._views
+    observed = _ResidentWrites([resident, *views.values()])
+    with observed:
+        with pytest.raises(ValueError, match="initialize_state_slots"):
+            state.initialize_state_slots(slots)
+        assert not model._transaction_graph.ready
+        accesses: list[weakref.ref[Any]] = []
+        access = StateSlotBindings.startup_pool_access
 
-    def recorded(self: StateSlotBindings, layer: str) -> Any:
-        granted = access(self, layer)
-        accesses.append(weakref.ref(granted))
-        return granted
+        def recorded(self: StateSlotBindings, layer: str) -> Any:
+            granted = access(self, layer)
+            accesses.append(weakref.ref(granted))
+            return granted
 
-    def private_views(self: StateSlotViews) -> dict[str, torch.Tensor]:
-        caller = sys._getframe(1).f_globals.get("__name__", "")
-        assert not caller.startswith("vllm.models.nemotron_asr"), (
-            f"{caller} read the private views._views"
+        def private_views(self: StateSlotViews) -> dict[str, torch.Tensor]:
+            caller = sys._getframe(1).f_globals.get("__name__", "")
+            assert not caller.startswith("vllm.models.nemotron_asr"), (
+                f"{caller} read the private views._views"
+            )
+            return self.__dict__["_views"]
+
+        monkeypatch.setattr(StateSlotBindings, "startup_pool_access", recorded)
+        monkeypatch.setattr(
+            StateSlotViews, "_views", property(private_views), raising=False
         )
-        return self.__dict__["_views"]
-
-    monkeypatch.setattr(StateSlotBindings, "startup_pool_access", recorded)
-    monkeypatch.setattr(
-        StateSlotViews, "_views", property(private_views), raising=False
-    )
-    _initialize(state, slots)
-    assert model._transaction_graph.ready
-    assert len(accesses) == 1
-    assert not _live(accesses), "the model kept its startup pool access"
-    state.post_warmup()
+        _initialize(state, slots)
+        assert model._transaction_graph.ready
+        assert len(accesses) == 1
+        assert not _live(accesses), "the model kept its startup pool access"
+        state.post_warmup()
     assert torch.equal(resident, before), "startup access stored a resident page"
+    assert not observed.writes, (
+        f"startup access wrote resident storage: {sorted(set(observed.writes))}"
+    )
 
 
 @pytest.mark.cpu_test
@@ -4181,7 +4260,7 @@ def _verification_mismatch(
         return names(f"resident pool {name}")
     if kind == "moved-device":
         encoder.to("meta")
-        return names("device")
+        return names("captured on device")
     if kind in ("swapped-projection", "projected-stride"):
         from vllm.models.nemotron_asr import nemotron_asr
 
@@ -4245,19 +4324,27 @@ def test_verification_keeps_no_resident_view(
 
     The test releases its own slots and views and the model state's bindings;
     the resident views and their storage must then be dead while the binding
-    is still published and verified. ``discard()`` runs only afterwards.
+    is still published and verified. Storage is tracked by storage weak
+    references, so an alias the views do not reach, such as a detached
+    tensor, keeps it alive and is caught. ``discard()`` runs only afterwards.
     """
     cpu_readings.expected = 5
     model, state, slots = _verified_model(monkeypatch)
     owner = slots.views[model._persistent_state_layer.prefix]
     resident = [weakref.ref(view) for view in owner._views.values()]
     resident.append(weakref.ref(owner._tensor))
+    storages = [
+        StorageWeakRef(tensor.untyped_storage())
+        for tensor in (owner._tensor, *owner._views.values())
+    ]
     state.post_warmup()
     binding = model._transaction_graph
     state.state_slots = None
     del owner, slots
     assert binding.ready and binding.serving_captured
     assert not _live(resident), "the published binding retains a resident view"
+    alive = sum(not storage.expired() for storage in storages)
+    assert not alive, f"the published binding retains resident storage ({alive})"
     binding.check_latch()
     binding.discard()
 
@@ -4578,7 +4665,9 @@ def _cuda_inventories(
     phase["value"] = "admission"
     _admit(binding, core, call, _StandIn(device), device)
     resident = _transaction_view(_scratch(4, device))
-    advance.warmup_advance_model_rows_scatter(**_pool_arguments(resident))
+    advance.warmup_advance_model_rows_scatter(
+        **_pool_arguments(resident), block_id=WARM_BLOCK
+    )
     phase["value"] = "serving"
     _serve(binding, core, call, resident, device)
     phase["value"] = None
@@ -4898,17 +4987,11 @@ class _MutationStreams(TorchDispatchMode):
         kwargs: dict[str, Any] | None = None,
     ) -> Any:
         kwargs = kwargs or {}
-        for index, argument in enumerate(func._schema.arguments):
-            if argument.alias_info is None or not argument.alias_info.is_write:
-                continue
-            value = args[index] if index < len(args) else kwargs.get(argument.name)
-            for tensor in value if isinstance(value, list | tuple) else (value,):
-                if not isinstance(tensor, torch.Tensor):
-                    continue
-                name = self._names.get(_storage(tensor))
-                if name is not None:
-                    stream = torch.cuda.current_stream().cuda_stream
-                    self._log.append((name, stream))
+        for tensor in _written_tensors(func, args, kwargs):
+            name = self._names.get(_storage(tensor))
+            if name is not None:
+                stream = torch.cuda.current_stream().cuda_stream
+                self._log.append((name, stream))
         return func(*args, **kwargs)
 
 
@@ -5115,7 +5198,7 @@ def _interleaved_parity(model: Any, slots: StateSlotBindings) -> None:
     call = _model_call(model)
     graph_pools = _pool_arguments(_resident(model, slots))
     eager_pools = _clone_pools(graph_pools)
-    advance.warmup_advance_model_rows_scatter(**eager_pools)
+    advance.warmup_advance_model_rows_scatter(**eager_pools, block_id=WARM_BLOCK)
     decoder = model._decode_graph_binding
 
     def tier(rows: int) -> int:
@@ -5252,6 +5335,42 @@ def test_cuda_status_and_progress_survive_another_cells_replay() -> None:
     assert counts["replays:chunk-fresh:g0:b2"] == 1
 
 
+class _ScatterLaunches:
+    """Record every masked-scatter kernel launch with the descriptor it passes.
+
+    Stands in for the jitted kernel: ``kernel[grid](...)`` records the current
+    ``phase`` and, outside a CUDA graph capture, the block ids and row statuses
+    the launch passes, then launches the kernel. A capture cannot read device
+    values, so a captured launch records ``None`` for both.
+    """
+
+    def __init__(self, kernel: Any) -> None:
+        self._kernel = kernel
+        self.phase = "startup"
+        self.launches: list[tuple[str, list[int] | None, list[int] | None]] = []
+
+    def __getitem__(self, grid: Any) -> Callable[..., Any]:
+        launch = self._kernel[grid]
+
+        def recorded(
+            pool: torch.Tensor,
+            scratch: torch.Tensor,
+            block_ids: torch.Tensor,
+            row_status: torch.Tensor,
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            if torch.cuda.is_current_stream_capturing():
+                self.launches.append((self.phase, None, None))
+            else:
+                self.launches.append(
+                    (self.phase, block_ids.tolist(), row_status.tolist())
+                )
+            return launch(pool, scratch, block_ids, row_status, *args, **kwargs)
+
+        return recorded
+
+
 @pytest.mark.nemotron_gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.usefixtures("exact_fp32")
@@ -5262,11 +5381,12 @@ def test_cuda_startup_access_stores_no_resident_page(
     """The scatter warm-up, serving capture and ``post_warmup`` store no page.
 
     Every page, the null page included, holds distinct finite nonzero
-    sentinels before ``initialize_state_slots``. The warmed scatter
-    specializations are reset so the warm-up launches over the resident pools,
-    and every warm-up descriptor must be a rejected row on a non-null block.
+    sentinels before ``initialize_state_slots``. The scatter kernel's launches
+    are observed: the serving warm-up must launch, and every launch outside a
+    capture, the warm-up's included, must pass rejected rows on non-null
+    blocks.
     """
-    from vllm.models.nemotron_asr import state_scatter
+    from vllm.models.nemotron_asr import nemotron_asr, state_scatter
     from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
     device = torch.device("cuda")
@@ -5276,24 +5396,34 @@ def test_cuda_startup_access_stores_no_resident_page(
     resident = _seed_sentinels(model, slots)
     torch.cuda.synchronize()
     before = resident.clone()
-    descriptors: list[tuple[int, int]] = []
-    validate = state_scatter._validate_masked_page_scatter
-
-    def recorded(*args: Any, require_cuda_warmup: bool) -> None:
-        if not require_cuda_warmup:  # only the warm-up skips that check
-            _pool, _scratch, block_ids, row_status = args
-            descriptors.append((int(block_ids[0]), int(row_status[0])))
-        validate(*args, require_cuda_warmup=require_cuda_warmup)
-
+    # Admission warmed every specialization over its stand-in pools; an empty
+    # cache makes the serving warm-up launch over the resident pools.
     monkeypatch.setattr(state_scatter, "_WARMED_SPECIALIZATIONS", set())
-    monkeypatch.setattr(state_scatter, "_validate_masked_page_scatter", recorded)
+    kernel = _ScatterLaunches(state_scatter._masked_page_scatter_kernel)
+    monkeypatch.setattr(state_scatter, "_masked_page_scatter_kernel", kernel)
+    warm = nemotron_asr._warm_scatter
+
+    def warming(*args: Any, **kwargs: Any) -> None:
+        kernel.phase = "warm-up"
+        try:
+            warm(*args, **kwargs)
+        finally:
+            kernel.phase = "startup"
+
+    monkeypatch.setattr(nemotron_asr, "_warm_scatter", warming)
     _initialize(state, slots)
     state.post_warmup()
     torch.cuda.synchronize()
     assert model._transaction_graph.ready
-    assert descriptors, "the serving scatter warm-up did not run"
-    assert all(
-        block != NULL_BLOCK_ID and 0 <= block < 4 and status != 0
-        for block, status in descriptors
-    ), descriptors
+    launches = kernel.launches
+    warm_ups = [launch for launch in launches if launch[0] == "warm-up"]
+    assert warm_ups, "the serving scatter warm-up launched no kernel"
+    assert all(blocks is not None for _phase, blocks, _status in warm_ups), launches
+    for _phase, blocks, status in launches:
+        if blocks is None or status is None:
+            continue  # a captured launch's values cannot be read
+        assert blocks and all(
+            block != NULL_BLOCK_ID and 0 <= block < 4 for block in blocks
+        ), launches
+        assert all(row != 0 for row in status), launches
     assert torch.equal(resident, before), "startup stored a resident page"
