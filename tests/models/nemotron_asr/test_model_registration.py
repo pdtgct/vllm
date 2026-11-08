@@ -109,7 +109,6 @@ def test_cpu_constructor_declares_one_core_state_layer(monkeypatch):
         decode_dispatch_arm="dense-eager",
     )
     runtime = SimpleNamespace(
-        use_v2_model_runner=True,
         model_config=SimpleNamespace(
             hf_config=config, dtype=torch.float32, max_model_len=143
         ),

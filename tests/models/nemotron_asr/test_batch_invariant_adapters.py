@@ -102,8 +102,8 @@ def test_prec018_schema_installation_lifetime(monkeypatch):
 
     source = kernels()
     source.mm_batch_invariant = lambda a, b: (a.unsqueeze(-1) * b.unsqueeze(0)).sum(1)
-    source.addmm_batch_invariant = (
-        lambda bias, a, b: source.mm_batch_invariant(a, b) + bias
+    source.addmm_batch_invariant = lambda bias, a, b: (
+        source.mm_batch_invariant(a, b) + bias
     )
     source.bmm_batch_invariant = lambda a, b: (a.unsqueeze(-1) * b.unsqueeze(1)).sum(2)
     source._batch_invariant_MODE = False

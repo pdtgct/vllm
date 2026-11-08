@@ -453,7 +453,6 @@ def _engine_config(
 ) -> SimpleNamespace:
     """The engine configuration fields the model and its state consumer read."""
     return SimpleNamespace(
-        use_v2_model_runner=True,
         model_config=SimpleNamespace(
             hf_config=hf_config,
             dtype=torch.float32,

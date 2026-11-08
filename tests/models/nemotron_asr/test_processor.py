@@ -91,10 +91,11 @@ def _registry_processor(tmp_path, monkeypatch, hf_overrides=None):
         tokenizer_object=Tokenizer(WordLevel({"<unk>": 0}, unk_token="<unk>")),
         unk_token="<unk>",
     ).save_pretrained(tmp_path)
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     # Validate the smoke config on CPU; only device/Triton availability is stubbed.
     monkeypatch.setattr(current_platform, "device_type", "cpu")
-    monkeypatch.setattr("vllm.config.vllm.HAS_TRITON", True)
+    monkeypatch.setattr(
+        current_platform, "uses_standalone_cpu_model_runner", lambda: False
+    )
     args = replace(_engine_args(str(tmp_path)), hf_overrides=hf_overrides or {})
     config = args.create_engine_config()
     return config, MULTIMODAL_REGISTRY.create_processor(config.model_config)
@@ -109,7 +110,6 @@ def test_core_profiling_constructs_raw_audio_carriers(
     from vllm.multimodal.encoder_budget import MultiModalBudget
 
     config, processor = _registry_processor(tmp_path, monkeypatch)
-    assert config.use_v2_model_runner
     assert not config.model_config.skip_tokenizer_init
     assert isinstance(processor, NemotronASRMultiModalProcessor)
 

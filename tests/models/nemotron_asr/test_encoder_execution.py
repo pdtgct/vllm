@@ -2039,10 +2039,8 @@ def test_dense_graphed_review_population_one_rejects_noop_graph_replay(
 
     def no_replay_factory(*args: Any, **kwargs: Any) -> Any:
         wrapper = original_factory(*args, **kwargs)
-        return (
-            lambda: wrapper.output
-            if wrapper.graph_mode() and wrapper.captured
-            else wrapper()
+        return lambda: (
+            wrapper.output if wrapper.graph_mode() and wrapper.captured else wrapper()
         )
 
     execution = build_encoder_execution(

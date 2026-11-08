@@ -51,7 +51,7 @@ pytestmark = [
 
 
 @create_new_process_for_each_test(method="spawn")
-def test_nemotron_engine_stream_lifecycle(monkeypatch):
+def test_nemotron_engine_stream_lifecycle():
     from transformers import BatchFeature
 
     from vllm import SamplingParams
@@ -70,7 +70,6 @@ def test_nemotron_engine_stream_lifecycle(monkeypatch):
     from vllm.v1.engine import (
         EngineCoreRequest,
         StreamAdmissionContext,
-        StreamAdmissionId,
     )
     from vllm.v1.engine.core import EngineCore
     from vllm.v1.executor.uniproc_executor import UniProcExecutor
@@ -78,9 +77,7 @@ def test_nemotron_engine_stream_lifecycle(monkeypatch):
     from vllm.v1.request import RequestStatus
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     config = _engine_args().create_engine_config()
-    assert config.use_v2_model_runner
     core = EngineCore(config, UniProcExecutor, log_stats=False)
     try:
         runner = core.model_executor.driver_worker.worker.model_runner
@@ -99,8 +96,6 @@ def test_nemotron_engine_stream_lifecycle(monkeypatch):
         )
         assert manager.num_free_slots == 2
         hf = config.model_config.hf_config
-        owner = "cuda-smoke"
-        epoch = core.get_stream_admission_epoch(owner)
 
         def request(request_id):
             params = SamplingParams(temperature=0, max_tokens=142, detokenize=False)
@@ -118,16 +113,14 @@ def test_nemotron_engine_stream_lifecycle(monkeypatch):
                 resumable=True,
             )
 
-        def admit(request_id, sequence):
-            return core.admit_stream(
-                owner, StreamAdmissionId(epoch, sequence), request(request_id)
-            )
+        def admit(request_id):
+            return core.admit_stream(request(request_id))
 
-        assert admit("audio", 0).accepted
-        assert admit("peer", 1).accepted
+        assert admit("audio").accepted
+        assert admit("peer").accepted
         original = manager.get("audio")
         peer = manager.get("peer")
-        refused = admit("overflow", 2)
+        refused = admit("overflow")
         assert not refused.accepted and refused.reason == "capacity"
         assert set(scheduler.requests) == {"audio", "peer"}
 
@@ -170,9 +163,8 @@ def test_nemotron_engine_stream_lifecycle(monkeypatch):
                     mm_position=PlaceholderRange(0, 1),
                 )
             ]
-            payload.stream_admission = StreamAdmissionContext(
-                owner, StreamAdmissionId(epoch, 0), final
-            )
+            # Inputs are numbered from 1; the terminal close below closes input.
+            payload.stream_admission = StreamAdmissionContext(update_seq=sequence + 1)
             core.add_request(*core.preprocess_add_request(payload))
             received = []
             for _ in range(144):
@@ -205,17 +197,17 @@ def test_nemotron_engine_stream_lifecycle(monkeypatch):
         terminal = request("audio")
         terminal.resumable = False
         terminal.stream_admission = StreamAdmissionContext(
-            owner, StreamAdmissionId(epoch, 0), True
+            input_closed=True, update_seq=3
         )
         core.add_request(*core.preprocess_add_request(terminal))
-        assert not admit("replacement", 3).accepted
+        assert not admit("replacement").accepted
         for _ in range(4):
             tick()
             if manager.num_free_slots == 1:
                 break
         assert manager.num_free_slots == 1
         assert "audio" not in scheduler.requests
-        assert admit("replacement", 4).accepted
+        assert admit("replacement").accepted
         replacement = manager.get("replacement")
         assert replacement.slot == original.slot
         assert replacement.generation > original.generation
@@ -270,7 +262,6 @@ def _run_g0_stream(hf_overrides, num_chunks, sessions=1, inject=None):
     from vllm.v1.engine import (
         EngineCoreRequest,
         StreamAdmissionContext,
-        StreamAdmissionId,
     )
     from vllm.v1.engine.core import EngineCore
     from vllm.v1.executor.uniproc_executor import UniProcExecutor
@@ -289,8 +280,6 @@ def _run_g0_stream(hf_overrides, num_chunks, sessions=1, inject=None):
         runner = core.model_executor.driver_worker.worker.model_runner
         view = next(iter(runner.state_slots.views.values()))
         hf = config.model_config.hf_config
-        owner = "transaction-graph"
-        epoch = core.get_stream_admission_epoch(owner)
         names = ["audio"] if sessions == 1 else [f"audio-{i}" for i in range(sessions)]
 
         def request(name):
@@ -309,10 +298,8 @@ def _run_g0_stream(hf_overrides, num_chunks, sessions=1, inject=None):
                 resumable=True,
             )
 
-        for index, name in enumerate(names):
-            assert core.admit_stream(
-                owner, StreamAdmissionId(epoch, index), request(name)
-            ).accepted
+        for name in names:
+            assert core.admit_stream(request(name)).accepted
         if inject is not None:
             inject(_resolve_model(core))
         size = RAW_SAMPLES_PER_CHUNK["80ms"]
@@ -347,7 +334,7 @@ def _run_g0_stream(hf_overrides, num_chunks, sessions=1, inject=None):
                     )
                 ]
                 payload.stream_admission = StreamAdmissionContext(
-                    owner, StreamAdmissionId(epoch, index), False
+                    update_seq=sequence + 1
                 )
                 core.add_request(*core.preprocess_add_request(payload))
             received = {name: [] for name in names}
@@ -384,14 +371,13 @@ def _run_g0_stream(hf_overrides, num_chunks, sessions=1, inject=None):
 
 
 @create_new_process_for_each_test(method="spawn")
-def test_nemotron_engine_transaction_graph_matches_eager(monkeypatch):
+def test_nemotron_engine_transaction_graph_matches_eager():
     """A fresh g0 B1 session replays its whole transactions bitwise exactly.
 
     The eager arm runs first, then the replay arm adds only the transaction
     graph option. Tokens, echo counts and the resident storage after every
     park must match, and every transaction must replay a captured cell.
     """
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     num_chunks = 12
     eager_tokens, eager_pages, eager_counters, eager_echoes = _run_g0_stream(
         dict(_G0_BASE_OVERRIDES), num_chunks
@@ -413,7 +399,7 @@ def test_nemotron_engine_transaction_graph_matches_eager(monkeypatch):
 
 
 @create_new_process_for_each_test(method="spawn")
-def test_nemotron_engine_transaction_graph_b31_lockstep_matches_eager(monkeypatch):
+def test_nemotron_engine_transaction_graph_b31_lockstep_matches_eager():
     """31 lockstep g0 sessions replay every CHUNK step bitwise exactly.
 
     Every CHUNK step holds all 31 rows (fresh once, then continuing) and must
@@ -422,7 +408,6 @@ def test_nemotron_engine_transaction_graph_b31_lockstep_matches_eager(monkeypatc
     eager path, counted. Tokens and the resident storage after every park
     match the eager arm.
     """
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     num_chunks, sessions = 6, 31
     eager_tokens, eager_pages, eager_counters, eager_echoes = _run_g0_stream(
         dict(_G0_BASE_OVERRIDES), num_chunks, sessions
@@ -454,13 +439,12 @@ def test_nemotron_engine_transaction_graph_b31_lockstep_matches_eager(monkeypatc
     )
 
 
-def _fail_first_replayed_step(monkeypatch, inject_failure):
+def _fail_first_replayed_step(inject_failure):
     """Run one option-on B1 CHUNK whose replayed step fails as injected.
 
     Returns the exception ``EngineCore.step`` raised, the committed progress
     the model holds afterwards and its counters.
     """
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     seen = {}
 
     def inject(model):
@@ -491,7 +475,7 @@ def test_nemotron_engine_transaction_graph_replay_failure_propagates_from_step(
         for graph in model._transaction_graph._graphs.values():
             monkeypatch.setattr(graph, "replay", replay)
 
-    error, progress, _ = _fail_first_replayed_step(monkeypatch, fail_replay)
+    error, progress, _ = _fail_first_replayed_step(fail_replay)
     assert str(error) == "injected replay failure"
     assert progress == {}
 
@@ -512,7 +496,7 @@ def test_nemotron_engine_transaction_graph_collection_failure_propagates_from_st
         sink = model._ensure_commit_sink(next(model.parameters()).device)
         monkeypatch.setattr(sink, "collect", collect)
 
-    error, progress, model = _fail_first_replayed_step(monkeypatch, fail_collection)
+    error, progress, model = _fail_first_replayed_step(fail_collection)
     assert str(error) == "injected collection failure"
     assert progress == {}
     assert transaction_graph_counters(model)["replays:chunk-fresh:g0:b1"] == 1
@@ -646,7 +630,6 @@ def test_nemotron_engine_transaction_graph_admission_is_charged(monkeypatch):
     memory-bound run sized from the option-on figures must hold exactly the
     pages core derives from its reduced budget.
     """
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     # Zero cudagraph estimate: peak_activation_memory is then the peak headroom.
     monkeypatch.setenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "0")
     # Room above the target page count so memory, not max_num_seqs + 1, binds
