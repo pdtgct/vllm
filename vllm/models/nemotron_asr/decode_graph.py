@@ -44,7 +44,6 @@ class GraphRuntime:
     eager_mode: Any
     graph_mode: Any
     synchronize: Callable[[torch.device], None]
-    set_capture_enabled: Callable[[bool], None]
 
 
 @dataclass
@@ -81,7 +80,6 @@ class _GraphEntry:
 
 def platform_graph_runtime() -> GraphRuntime:
     """Build the installed accelerator's vLLM graph runtime."""
-    from vllm.compilation.monitor import set_cudagraph_capturing_enabled
     from vllm.config import CUDAGraphMode
     from vllm.distributed.parallel_state import graph_capture
     from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -102,7 +100,6 @@ def platform_graph_runtime() -> GraphRuntime:
         eager_mode=CUDAGraphMode.NONE,
         graph_mode=CUDAGraphMode.PIECEWISE,
         synchronize=lambda device: torch.accelerator.synchronize(device),
-        set_capture_enabled=set_cudagraph_capturing_enabled,
     )
 
 
@@ -349,28 +346,22 @@ class DenseGraphBinding:
             if frames is not None
             for tier in self._tiers
         }
-        runtime.set_capture_enabled(True)
-        try:
-            with torch.inference_mode(), runtime.capture_context(device):
-                for entry in pending.values():
-                    eager = self._snapshot(
-                        self._call(entry, runtime, runtime.eager_mode)
-                    )
-                    captured = self._call(
-                        entry,
-                        runtime,
-                        runtime.graph_mode,
-                    )
-                    self._assert_equal(eager, captured)
-                    replayed = self._call(
-                        entry,
-                        runtime,
-                        runtime.graph_mode,
-                    )
-                    self._assert_equal(eager, replayed)
-                runtime.synchronize(device)
-        finally:
-            runtime.set_capture_enabled(False)
+        with torch.inference_mode(), runtime.capture_context(device):
+            for entry in pending.values():
+                eager = self._snapshot(self._call(entry, runtime, runtime.eager_mode))
+                captured = self._call(
+                    entry,
+                    runtime,
+                    runtime.graph_mode,
+                )
+                self._assert_equal(eager, captured)
+                replayed = self._call(
+                    entry,
+                    runtime,
+                    runtime.graph_mode,
+                )
+                self._assert_equal(eager, replayed)
+            runtime.synchronize(device)
         decode_fns = {
             key: self._bind_decode(entry, runtime) for key, entry in pending.items()
         }

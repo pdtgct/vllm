@@ -169,7 +169,6 @@ def _runtime(wrapper_factory: Callable[..., Any], mode: dict[str, Any]) -> Graph
         synchronize=lambda device: (
             torch.cuda.synchronize(device) if device.type == "cuda" else None
         ),
-        set_capture_enabled=lambda _enabled: None,
     )
 
 
