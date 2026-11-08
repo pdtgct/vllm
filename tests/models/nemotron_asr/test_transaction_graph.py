@@ -3563,6 +3563,75 @@ def test_override_capacity_reports_admission_and_wraps_failures(
     assert vars(config.cache_config) == cache
 
 
+_OPTION_STATES = pytest.mark.parametrize(
+    ("populations", "contributors"),
+    [([1, 2], ("transaction_graph_populations",)), ([], ())],
+    ids=["option-on", "option-off"],
+)
+
+
+@pytest.mark.cpu_test
+@_OPTION_STATES
+def test_state_spec_names_the_option_as_a_memory_contributor(
+    monkeypatch: pytest.MonkeyPatch,
+    populations: list[int],
+    contributors: tuple[str, ...],
+) -> None:
+    """The served state spec names the option only while the option is on.
+
+    Core reads the spec's memory contributors in the planner's capacity
+    rejection and in the runner's KV allocation failure, neither of which a
+    model hook surrounds. The names leave the layout unchanged.
+    """
+    model, config = _model(monkeypatch, transaction_graph_populations=populations)
+    spec = model._persistent_state_layer.get_kv_cache_spec(config)
+    assert spec.memory_contributors == contributors
+    layout = build_nemotron_persistent_state_spec(model.config)
+    assert spec.schema_id == layout.schema_id
+    assert spec.page_size_bytes == layout.page_size_bytes
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("budget_pages", "override", "kind"),
+    [(1, None, "No available memory"), (3, 4, "exceeds the KV budget")],
+    ids=["one-page", "override"],
+)
+@_OPTION_STATES
+def test_planner_rejection_names_the_option(
+    monkeypatch: pytest.MonkeyPatch,
+    populations: list[int],
+    contributors: tuple[str, ...],
+    budget_pages: int,
+    override: int | None,
+    kind: str,
+) -> None:
+    """Core's budget rejection of the served state spec names the option.
+
+    One page cannot hold the null page and one slot, and an override of four
+    pages exceeds a three-page budget. Without the option the message names
+    no option.
+    """
+    from tests.v1.core.utils import create_scheduler, get_kv_cache_configs
+
+    model, config = _model(monkeypatch, transaction_graph_populations=populations)
+    layer = model._persistent_state_layer
+    spec = layer.get_kv_cache_spec(config)
+    engine = create_scheduler(max_num_seqs=2, max_model_len=32).vllm_config
+    engine.cache_config.kv_cache_layout = "LBNHC"
+    # The executor turns the extensible KV cache off for persistent state
+    # before planning; the config defaults it on for a CUDA host.
+    engine.cache_config.enable_extensible_kv_cache = False
+    engine.cache_config.num_gpu_blocks_override = override
+    with pytest.raises(ValueError) as rejected:
+        get_kv_cache_configs(
+            engine, [{layer.prefix: spec}], [budget_pages * spec.page_size_bytes]
+        )
+    message = str(rejected.value)
+    assert kind in message
+    assert ("transaction_graph_populations" in message) == bool(contributors)
+
+
 @pytest.mark.cpu_test
 def test_admission_oom_latches_and_reports_progress(
     monkeypatch: pytest.MonkeyPatch,
