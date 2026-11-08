@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -92,15 +91,6 @@ class StateBatch:
         return _ResidentCommitSink(sink, self.access)
 
 
-def _resident_storage(bindings: StateSlotBindings, layer: str) -> SimpleNamespace:
-    """The aggregate state group's ``spec`` and current component ``views``.
-
-    Read from the live bindings each time it is needed; no caller keeps it.
-    """
-    views = bindings.views[layer]
-    return SimpleNamespace(spec=views.spec, views=views._views)
-
-
 class NemotronASRModelState(ModelState):
     """Model-local projection with no slot allocation or retirement authority."""
 
@@ -115,7 +105,6 @@ class NemotronASRModelState(ModelState):
         self._scheduled_encoder_inputs: dict[str, list[int]] = {}
         self._features: torch.Tensor | None = None
         self._scheduled_tokens: dict[str, tuple[int, ...]] = {}
-        self._transaction_graphs_verified = False
 
     def initialize_state_slots(self, bindings: StateSlotBindings) -> None:
         super().initialize_state_slots(bindings)
@@ -123,13 +112,42 @@ class NemotronASRModelState(ModelState):
         if set(bindings.views) != {layer}:
             raise ValueError("Nemotron requires exactly its aggregate state group")
         capture = getattr(self.model, "capture_transaction_graphs", None)
+        # Graphs captured over the temporary pools of CUDA graph memory
+        # profiling would never serve, so profiling bindings capture nothing.
         if (
             capture is not None
             and getattr(self.model, "_transaction_graph", None) is not None
+            and not bindings.is_profiling
         ):
-            capture(_resident_storage(bindings, layer))
+            capture(bindings.startup_pool_access(layer), bindings.pool_layout(layer))
         # All resident writes run on the runner stream. Inner graphs also replay
         # there; no auxiliary state-writing stream is created by this consumer.
+
+    def post_warmup(self) -> None:
+        """Verify the transaction graphs once every worker warmup has run.
+
+        Verification reads only the bindings' plain-value pool layout. A
+        mismatch is worker-fatal and fails startup.
+        """
+        super().post_warmup()
+        if getattr(self.model, "_transaction_graph", None) is None:
+            return
+        slots = self.state_slots
+        layer = self.model._persistent_state_layer.prefix
+        self.model.verify_transaction_graphs(
+            None if slots is None else slots.pool_layout(layer)
+        )
+
+    def shutdown(self) -> None:
+        """Discard the transaction graphs before core releases the state pools.
+
+        Tolerates a model state whose initialization did not complete.
+        """
+        super().shutdown()
+        model = getattr(self, "model", None)
+        binding = getattr(model, "_transaction_graph", None)
+        if binding is not None:
+            binding.discard()
 
     def prepare_step(
         self, scheduler_output: SchedulerOutput, *, dummy_run: bool, is_profile: bool
@@ -145,20 +163,11 @@ class NemotronASRModelState(ModelState):
             raise ValueError("profile execution requires a dummy run")
         if dummy_run:
             return
-        # The first real step stands in for a post-warmup hook: it verifies the
-        # transaction graphs once over the live resident layout, and every real
-        # step honours their latch, before any registry, slot or request state
-        # changes.
+        # Every real step honours the transaction graphs' latch before any
+        # registry, slot or request state changes; post_warmup verified them.
         transaction_graph = getattr(self.model, "_transaction_graph", None)
         if transaction_graph is not None:
             transaction_graph.check_latch()
-            if not self._transaction_graphs_verified:
-                slots = self.state_slots
-                layer = self.model._persistent_state_layer.prefix
-                self.model.verify_transaction_graphs(
-                    None if slots is None else _resident_storage(slots, layer)
-                )
-                self._transaction_graphs_verified = True
         cached = scheduler_output.scheduled_cached_reqs
         if len(cached.req_ids) != len(cached.new_token_ids):
             raise ValueError("state step omitted cached host token slices")
