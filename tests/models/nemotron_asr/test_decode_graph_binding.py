@@ -61,7 +61,6 @@ def _runtime(*, fail_capture: bool = False) -> GraphRuntime:
         eager_mode="none",
         graph_mode="graph",
         synchronize=lambda _device: None,
-        set_capture_enabled=lambda _enabled: None,
     )
 
 

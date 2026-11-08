@@ -195,22 +195,18 @@ def capture_chunk_bucket(
     expected_outputs = tuple(tensor.clone() for tensor in call(runtime.eager_mode))
     expected_state = tuple(tensor.clone() for tensor in _state_tensors(static_state))
     runtime.synchronize(env.device)
-    runtime.set_capture_enabled(True)
-    try:
-        with runtime.capture_context(env.device):
-            stage(sources)
-            call(runtime.graph_mode)
+    with runtime.capture_context(env.device):
         stage(sources)
-        actual = call(runtime.graph_mode)
-        for actual_tensor, expected in zip(
-            (*actual, *_state_tensors(static_state)),
-            (*expected_outputs, *expected_state),
-            strict=True,
-        ):
-            torch.testing.assert_close(actual_tensor, expected, atol=0, rtol=0)
-        runtime.synchronize(env.device)
-    finally:
-        runtime.set_capture_enabled(False)
+        call(runtime.graph_mode)
+    stage(sources)
+    actual = call(runtime.graph_mode)
+    for actual_tensor, expected in zip(
+        (*actual, *_state_tensors(static_state)),
+        (*expected_outputs, *expected_state),
+        strict=True,
+    ):
+        torch.testing.assert_close(actual_tensor, expected, atol=0, rtol=0)
+    runtime.synchronize(env.device)
 
     @torch.inference_mode()
     def transition(
