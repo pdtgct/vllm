@@ -2461,7 +2461,7 @@ def warmup_advance_model_rows_scatter(
     frontend_counter_pool: torch.Tensor,
     endpoint_history_pool: torch.Tensor | None = None,
     endpoint_book_pool: torch.Tensor | None = None,
-    block_id: int = 0,
+    block_id: int,
 ) -> None:
     """Warm every fixed-shape commit specialization before admission.
 
