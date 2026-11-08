@@ -202,7 +202,8 @@ _SIGNATURE_FIELDS = (
 
 #: The signature entries that name a resident address or the device. Post-warmup
 #: verification rebuilds signatures over storage-free pools and checks these
-#: through the recorded pool layout and call bindings instead.
+#: through the recorded pool layout, projection, device and call bindings
+#: instead.
 _LAYOUT_BOUND_FIELDS = ("resident pools", "input ids", "input embeddings")
 
 #: The names of a startup key's call-binding entries, in order.
@@ -217,7 +218,6 @@ _CALL_FIELDS = (
     "eou_token_id",
     "graph_covers_decode",
     "hidden_size",
-    "device",
     "null_block_id",
 )
 
@@ -243,14 +243,65 @@ def _pool_names(pools: TransactionPools) -> tuple[str, ...]:
     return tuple(names)
 
 
+@dataclass(frozen=True)
+class _ProjectedRole:
+    """Plain-value layout of one transaction role over the component pools.
+
+    ``component`` names the component pool the role starts in and ``offset``
+    is the role's byte offset from that component's address.
+    """
+
+    component: str | None
+    data_ptr: int
+    offset: int
+    shape: tuple[int, ...]
+    stride: tuple[int, ...]
+    dtype: torch.dtype
+
+
+def _projected_layout(
+    pools: TransactionPools, pool_layout: Mapping[str, Any]
+) -> dict[str, _ProjectedRole]:
+    """The layout of every role of ``pools``, keyed by ``_pool_names``.
+
+    ``pool_layout`` maps each component pool's name to its plain-value layout.
+    A role starts in the component whose address is the greatest not above
+    the role's own; a role below every component names none.
+    """
+    starts = sorted(
+        (int(layout.data_ptr), name) for name, layout in pool_layout.items()
+    )
+    projection = {}
+    for role, tensor in zip(_pool_names(pools), pools.sequence(), strict=True):
+        address = int(tensor.data_ptr())
+        below = [entry for entry in starts if entry[0] <= address]
+        start, component = below[-1] if below else (address, None)
+        projection[role] = _ProjectedRole(
+            component=component,
+            data_ptr=address,
+            offset=address - start,
+            shape=tuple(tensor.shape),
+            stride=tuple(tensor.stride()),
+            dtype=tensor.dtype,
+        )
+    return projection
+
+
 def _first_change(
-    names: Sequence[str], captured: Sequence[Any], live: Sequence[Any]
+    names: Sequence[str],
+    captured: Sequence[Any],
+    live: Sequence[Any],
+    *,
+    skip: Collection[str] = (),
 ) -> str | None:
-    """The name of the first entry that differs, or ``None`` if none does."""
+    """The name of the first entry that differs, or ``None`` if none does.
+
+    Entries named in ``skip`` are not compared.
+    """
     if len(captured) != len(live):
         return "inventory"
     for name, old, new in zip(names, captured, live, strict=True):
-        if old != new:
+        if name not in skip and old != new:
             return name
     return None
 
@@ -258,7 +309,6 @@ def _first_change(
 def _signature_change(
     captured: tuple[Any, ...],
     live: tuple[Any, ...],
-    pools: TransactionPools,
     *,
     skip: Collection[str] = (),
 ) -> str | None:
@@ -266,18 +316,7 @@ def _signature_change(
 
     Entries named in ``skip`` are not compared.
     """
-    if len(captured) != len(live):
-        return "inventory"
-    kept = [index for index, name in enumerate(_SIGNATURE_FIELDS) if name not in skip]
-    field = _first_change(
-        [_SIGNATURE_FIELDS[index] for index in kept],
-        [captured[index] for index in kept],
-        [live[index] for index in kept],
-    )
-    if field == "resident pools":
-        index = _SIGNATURE_FIELDS.index(field)
-        pool = _first_change(_pool_names(pools), captured[index], live[index])
-        return f"resident pool {pool}"
+    field = _first_change(_SIGNATURE_FIELDS, captured, live, skip=skip)
     if field == "lazily bound encoder buffers":
         index = _SIGNATURE_FIELDS.index(field)
         names = [name for name, _ in live[index]]
@@ -650,15 +689,12 @@ def _startup_key(
     call: TransactionCallBindings,
     *,
     hidden_size: int,
-    device: torch.device,
     null_block_id: int,
 ) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
     """The pool layout and the call bindings one serving capture is valid for."""
     return (
         tuple(_tensor_layout(pool) for pool in pools.sequence()),
-        _call_key(
-            call, hidden_size=hidden_size, device=device, null_block_id=null_block_id
-        ),
+        _call_key(call, hidden_size=hidden_size, null_block_id=null_block_id),
     )
 
 
@@ -666,7 +702,6 @@ def _call_key(
     call: TransactionCallBindings,
     *,
     hidden_size: int,
-    device: torch.device,
     null_block_id: int,
 ) -> tuple[Any, ...]:
     """The call-binding half of a startup key, named by ``_CALL_FIELDS``."""
@@ -686,7 +721,6 @@ def _call_key(
         call.eou_token_id,
         call.graph_covers_decode,
         hidden_size,
-        device,
         null_block_id,
     )
 
@@ -725,16 +759,20 @@ class _AdmissionHolder:
 
 @dataclass(frozen=True)
 class _Startup:
-    """The startup key, binding-external buffers and resident pool layout
+    """The startup key, binding-external buffers and resident pool layouts
     recorded at publication.
 
     Each cell's own signature is recorded on its graph. ``pool_layout`` holds
-    plain values keyed by component pool name, never a tensor.
+    plain values keyed by component pool name, never a tensor;
+    ``projection`` holds plain values keyed by transaction role, and
+    ``device`` is the device the resident pools were captured on.
     """
 
     key: tuple[tuple[Any, ...], tuple[Any, ...]]
     external: Mapping[str, Any]
-    pool_layout: Mapping[str, Any] | None = None
+    pool_layout: Mapping[str, Any]
+    projection: Mapping[str, _ProjectedRole]
+    device: torch.device
 
 
 class TransactionGraphBinding:
@@ -955,7 +993,7 @@ class TransactionGraphBinding:
         device: torch.device,
         null_block_id: int = 0,
         nested: Sequence[Any] = (),
-        pool_layout: Mapping[str, Any] | None = None,
+        pool_layout: Mapping[str, Any],
     ) -> None:
         """Capture every declared cell over the allocated resident pools.
 
@@ -968,7 +1006,10 @@ class TransactionGraphBinding:
         binding-external buffer: the core's, and the scratch of each nested
         binding in ``nested`` the outer body runs eagerly. It also records
         ``pool_layout``, the plain-value layout of the component pools behind
-        ``pools``, which post-warmup verification compares with the live one.
+        ``pools``, the projection of ``pools`` over those components and the
+        pools' device, which post-warmup verification compares with their
+        live values. ``pool_layout`` is required; a binding that is never
+        verified may pass an empty mapping.
 
         Capture inputs use real free block ids and rows the transaction rejects
         (a non-envelope CHUNK payload, or a placeholder id on a non-CHUNK row),
@@ -977,11 +1018,7 @@ class TransactionGraphBinding:
         """
         self.check_latch()
         key = _startup_key(
-            pools,
-            call,
-            hidden_size=hidden_size,
-            device=device,
-            null_block_id=null_block_id,
+            pools, call, hidden_size=hidden_size, null_block_id=null_block_id
         )
         if self._startup is not None:
             if key == self._startup.key:
@@ -1030,7 +1067,9 @@ class TransactionGraphBinding:
         self._startup = _Startup(
             key=key,
             external=_external_buffers(core, nested),
-            pool_layout=None if pool_layout is None else dict(pool_layout),
+            pool_layout=dict(pool_layout),
+            projection=_projected_layout(pools, pool_layout),
+            device=pools.queue.device,
         )
         self._retained_bytes_total = inventory.retained_bytes
         self._serving_bytes = serving
@@ -1392,15 +1431,18 @@ class TransactionGraphBinding:
         """Check every published cell against live state, holding no resident tensor.
 
         ``pool_layout`` is the live plain-value layout of the component pools,
-        compared with the one recorded at publication. ``layout_pools``
-        projects storage-free pools with the live shapes, strides and dtypes;
-        each cell's signature is rebuilt over them as at capture and compared
-        with the one recorded at publication, except the entries that name a
-        resident address or the device. ``call`` and ``nested`` are the live
-        call bindings and nested bindings; the call bindings and every
-        binding-external buffer's address and size are compared too. Nothing
-        built here is retained. A mismatch is worker-fatal and latches the
-        binding.
+        compared with the one recorded at publication. ``device`` is the live
+        device of the core's encoder parameters, compared with the device the
+        resident pools were captured on. ``layout_pools`` projects
+        storage-free pools at the live addresses with the live shapes, strides
+        and dtypes; their projected layout is compared with the one recorded
+        at publication, and each cell's signature is rebuilt over them as at
+        capture and compared with the one recorded at publication, except the
+        entries that name a resident address or the device. ``call`` and
+        ``nested`` are the live call bindings and nested bindings; the call
+        bindings and every binding-external buffer's address and size are
+        compared too. Nothing built here is retained. A mismatch is
+        worker-fatal and latches the binding.
         """
         self.check_latch()
         startup = self._startup
@@ -1418,16 +1460,31 @@ class TransactionGraphBinding:
                 f"{OPTION}: post-warmup verification failed for {cells}: {change}"
             )
 
-        recorded = startup.pool_layout or {}
+        recorded = startup.pool_layout
         for name in sorted({*recorded, *pool_layout}):
             if recorded.get(name) != pool_layout.get(name):
                 raise failed(f"cells {labels}", f"resident pool {name} changed")
+        if device != startup.device:
+            raise failed(
+                f"cells {labels}",
+                f"the resident pools were captured on device {startup.device}, "
+                f"but the core's encoder parameters are on device {device}",
+            )
         try:
             pools = layout_pools()
         except Exception as error:
             raise failed(
                 f"cells {labels}", f"the resident pools no longer project: {error}"
             ) from error
+        projection = _projected_layout(pools, pool_layout)
+        for role in {**startup.projection, **projection}:
+            captured, live_role = startup.projection.get(role), projection.get(role)
+            if captured != live_role:
+                raise failed(
+                    f"cells {labels}",
+                    f"projected resident pool {role} changed from {captured} "
+                    f"to {live_role}",
+                )
         layout_device = pools.queue.device
         num_pool_blocks = int(pools.queue.shape[0])
         free = _free_blocks(num_pool_blocks, null_block_id)
@@ -1469,10 +1526,7 @@ class TransactionGraphBinding:
                 )
                 del inputs
                 change = _signature_change(
-                    self._graphs[cell].signature,
-                    live,
-                    pools,
-                    skip=_LAYOUT_BOUND_FIELDS,
+                    self._graphs[cell].signature, live, skip=_LAYOUT_BOUND_FIELDS
                 )
                 if change is not None:
                     raise failed(
@@ -1481,9 +1535,7 @@ class TransactionGraphBinding:
                     )
         finally:
             consume_batch_stats()
-        key = _call_key(
-            call, hidden_size=hidden_size, device=device, null_block_id=null_block_id
-        )
+        key = _call_key(call, hidden_size=hidden_size, null_block_id=null_block_id)
         binding = _first_change(_CALL_FIELDS, startup.key[1], key)
         if binding is not None:
             raise failed(f"cells {labels}", f"call binding {binding} changed")

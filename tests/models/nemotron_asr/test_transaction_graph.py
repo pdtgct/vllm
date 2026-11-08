@@ -381,6 +381,7 @@ def _binding(
         call=call,
         hidden_size=CARRIER_HIDDEN,
         device=device,
+        pool_layout={},
     )
     return binding
 
@@ -700,7 +701,12 @@ def _serve(
 ) -> None:
     """Serving capture over resident pools, as ``capture_transaction_graphs``."""
     binding.capture(
-        core, pools=pools, call=call, hidden_size=CARRIER_HIDDEN, device=device
+        core,
+        pools=pools,
+        call=call,
+        hidden_size=CARRIER_HIDDEN,
+        device=device,
+        pool_layout={},
     )
 
 
@@ -1541,6 +1547,7 @@ def _population_parity(
         call=call,
         hidden_size=CARRIER_HIDDEN,
         device=device,
+        pool_layout={},
     )
     _assert_pools_equal(graph_pools, eager_pools)
     assert binding.ready
@@ -1927,6 +1934,7 @@ def _corrupt_row_in_population(
         call=call,
         hidden_size=CARRIER_HIDDEN,
         device=device,
+        pool_layout={},
     )
     blocks = list(range(1, population + 1))
     bad = population // 2
@@ -2140,6 +2148,7 @@ def test_receipt_captures_largest_population_first_and_reports_cost(
         call=call,
         hidden_size=CARRIER_HIDDEN,
         device=CPU,
+        pool_layout={},
     )
     receipt = binding.receipt()
     cells = {entry["cell"]: entry for entry in receipt["cells"]}
@@ -3003,7 +3012,7 @@ def test_collection_failure_after_replay_publishes_no_progress(
 
 
 @pytest.mark.cpu_test
-def test_failed_capture_publishes_nothing_and_every_call_runs_eager() -> None:
+def test_failed_capture_publishes_nothing_and_fails_startup() -> None:
     core = _core()
     call = _call_bindings(core)
 
@@ -3026,6 +3035,7 @@ def test_failed_capture_publishes_nothing_and_every_call_runs_eager() -> None:
             call=broken_call,
             hidden_size=CARRIER_HIDDEN,
             device=CPU,
+            pool_layout={},
         )
     assert not binding.ready and binding.counters()["captured_cells"] == 0
     before = _clone_pools(pools)
@@ -3914,6 +3924,71 @@ def test_model_state_shutdown_discards_the_binding(
     assert not _live(owned)
 
 
+def _seed_sentinels(model: Any, slots: StateSlotBindings) -> torch.Tensor:
+    """Fill every page, the null page included, with distinct finite nonzero values.
+
+    Each component pool receives the next run of integers from 1, in its own
+    dtype, so a store of any value, zero included, changes some page. Returns
+    the raw resident storage.
+    """
+    views = slots.views[model._persistent_state_layer.prefix]
+    start = 1
+    for view in views._views.values():
+        values = torch.arange(
+            start, start + view.numel(), dtype=torch.float64, device=view.device
+        )
+        view.copy_(values.reshape(view.shape).to(view.dtype))
+        start += view.numel()
+    assert start < 1 << 24, "float32 sentinels must stay exact and distinct"
+    for view in views._views.values():
+        assert bool(view.ne(0).all()) and bool(torch.isfinite(view.double()).all())
+    return views._tensor
+
+
+@pytest.mark.cpu_test
+def test_serving_capture_requires_the_pool_layout() -> None:
+    """Serving capture records the pool layout post-warmup verification reads."""
+    core = _core()
+    call = _call_bindings(core)
+    binding = _admission_binding()
+    pools = _transaction_pools(_endpoint_pools(4))
+    with pytest.raises(TypeError, match="pool_layout"):
+        binding.capture(
+            core, pools=pools, call=call, hidden_size=CARRIER_HIDDEN, device=CPU
+        )
+    assert not binding.serving_captured and not binding.ready
+
+
+@pytest.mark.cpu_test
+@pytest.mark.usefixtures("cpu_readings")
+def test_scatter_warmup_names_a_non_null_free_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The admission and serving scatter warm-ups name a non-null block.
+
+    ``_warm_scatter`` launches only on CUDA, so the CPU check records the
+    block each call site passes, with the pools' page count.
+    """
+    from vllm.models.nemotron_asr import nemotron_asr
+    from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
+    named: list[tuple[int, Any]] = []
+
+    def record(pools: Any, **kwargs: Any) -> None:
+        named.append((int(pools.queue.shape[0]), kwargs.get("block_id")))
+
+    monkeypatch.setattr(nemotron_asr, "_warm_scatter", record)
+    model, config = _model(monkeypatch)
+    model.prepare_execution_memory()
+    state, slots = _model_state(model, config)
+    _initialize(state, slots)
+    assert model._transaction_graph.ready
+    assert len(named) == 2, "admission and serving each warm the scatter once"
+    for pages, block in named:
+        assert block is not None and block != NULL_BLOCK_ID, named
+        assert 0 <= block < pages, named
+
+
 @pytest.mark.cpu_test
 @pytest.mark.usefixtures("cpu_readings")
 def test_capture_reaches_pools_only_through_the_startup_accessor(
@@ -3922,7 +3997,7 @@ def test_capture_reaches_pools_only_through_the_startup_accessor(
     model, config = _model(monkeypatch)
     model.prepare_execution_memory()
     state, slots = _model_state(model, config)
-    resident = slots.views[model._persistent_state_layer.prefix]._tensor
+    resident = _seed_sentinels(model, slots)
     before = resident.clone()
     with pytest.raises(ValueError, match="initialize_state_slots"):
         state.initialize_state_slots(slots)
@@ -4039,6 +4114,9 @@ _VERIFY_MISMATCHES = (
     "rebound-encoder-transition",
     "relocated-pool-view",
     "replaced-mapping",
+    "moved-device",
+    "swapped-projection",
+    "projected-stride",
     "lazy-projection",
     "relocated-encoder-entry",
     "relocated-decoder-entry",
@@ -4048,7 +4126,10 @@ _NESTED_MISMATCHES = ("relocated-encoder-entry", "relocated-decoder-entry")
 
 
 def _verification_mismatch(
-    model: Any, slots: StateSlotBindings, kind: str
+    model: Any,
+    slots: StateSlotBindings,
+    kind: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> Callable[[str], None]:
     """Change one live input after capture; return a check of the error message.
 
@@ -4056,7 +4137,11 @@ def _verification_mismatch(
     only its address changes. ``rebound-encoder-transition`` rebinds the
     encoder transition every call binds; ``relocated-pool-view`` moves one
     resident pool view; ``replaced-mapping`` swaps the live views mapping for a
-    new one whose channel view is relocated; ``lazy-projection`` binds the
+    new one whose channel view is relocated; ``moved-device`` moves the
+    encoder off the pools' device; ``swapped-projection`` projects the
+    predictor ``h`` and ``c`` pools into each other's roles, and
+    ``projected-stride`` halves the page stride of the projected ``h`` role,
+    both with every component pool unchanged; ``lazy-projection`` binds the
     encoder's lazily prepared positional projections. The nested cases move one
     encoder graph entry's mel storage or one decode graph entry's frame input.
     """
@@ -4094,6 +4179,24 @@ def _verification_mismatch(
         name = "encoder.layers.0.window.channel"
         owner._views = {**owner._views, name: owner._views[name].clone()}
         return names(f"resident pool {name}")
+    if kind == "moved-device":
+        encoder.to("meta")
+        return names("device")
+    if kind in ("swapped-projection", "projected-stride"):
+        from vllm.models.nemotron_asr import nemotron_asr
+
+        project = nemotron_asr._transaction_pools
+
+        def changed(pools: Any) -> advance.TransactionPools:
+            view = project(pools)
+            if kind == "swapped-projection":
+                return replace(view, h=view.c, c=view.h)
+            h = view.h
+            stride = (h.stride(0) // 2, *h.stride()[1:])
+            return replace(view, h=torch.as_strided(h, tuple(h.shape), stride))
+
+        monkeypatch.setattr(nemotron_asr, "_transaction_pools", changed)
+        return names("projected resident pool h")
     if kind == "lazy-projection":
         assert encoder._stream_relative_position_lengths == ()
         with torch.inference_mode():
@@ -4128,7 +4231,7 @@ def test_post_warmup_verification_rejects_resized_external_buffer(
     verify = _seam(model, "verify_transaction_graphs")
     layer = model._persistent_state_layer.prefix
     verify(slots.pool_layout(layer))
-    check = _verification_mismatch(model, slots, mismatch)
+    check = _verification_mismatch(model, slots, mismatch, monkeypatch)
     with pytest.raises(RuntimeError, match="transaction_graph_populations") as raised:
         verify(slots.pool_layout(layer))
     check(str(raised.value))
@@ -4138,16 +4241,25 @@ def test_post_warmup_verification_rejects_resized_external_buffer(
 def test_verification_keeps_no_resident_view(
     monkeypatch: pytest.MonkeyPatch, cpu_readings: SimpleNamespace
 ) -> None:
-    """No resident view outlives ``post_warmup``, ``discard()`` and the slots."""
+    """No resident view outlives ``post_warmup`` and the slots while published.
+
+    The test releases its own slots and views and the model state's bindings;
+    the resident views and their storage must then be dead while the binding
+    is still published and verified. ``discard()`` runs only afterwards.
+    """
     cpu_readings.expected = 5
     model, state, slots = _verified_model(monkeypatch)
-    views = slots.views[model._persistent_state_layer.prefix]._views
-    resident = [weakref.ref(view) for view in views.values()]
+    owner = slots.views[model._persistent_state_layer.prefix]
+    resident = [weakref.ref(view) for view in owner._views.values()]
+    resident.append(weakref.ref(owner._tensor))
     state.post_warmup()
-    model._transaction_graph.discard()
+    binding = model._transaction_graph
     state.state_slots = None
-    del views, slots
-    assert not _live(resident)
+    del owner, slots
+    assert binding.ready and binding.serving_captured
+    assert not _live(resident), "the published binding retains a resident view"
+    binding.check_latch()
+    binding.discard()
 
 
 @pytest.mark.cpu_test
@@ -4219,7 +4331,7 @@ def test_post_warmup_mismatch_is_fatal_before_any_state_change(
     monkeypatch.setattr(model._registry, "prune", pruned.append)
     resident = slots.views[model._persistent_state_layer.prefix]._tensor
     before = resident.clone()
-    check = _verification_mismatch(model, slots, mismatch)
+    check = _verification_mismatch(model, slots, mismatch, monkeypatch)
     with pytest.raises(RuntimeError, match="transaction_graph_populations") as raised:
         state.post_warmup()
     check(str(raised.value))
@@ -5138,3 +5250,50 @@ def test_cuda_status_and_progress_survive_another_cells_replay() -> None:
     counts = binding.counters()
     assert counts["replays:chunk-fresh:g0:b1"] == 1
     assert counts["replays:chunk-fresh:g0:b2"] == 1
+
+
+@pytest.mark.nemotron_gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("exact_fp32")
+@torch.inference_mode()
+def test_cuda_startup_access_stores_no_resident_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The scatter warm-up, serving capture and ``post_warmup`` store no page.
+
+    Every page, the null page included, holds distinct finite nonzero
+    sentinels before ``initialize_state_slots``. The warmed scatter
+    specializations are reset so the warm-up launches over the resident pools,
+    and every warm-up descriptor must be a rejected row on a non-null block.
+    """
+    from vllm.models.nemotron_asr import state_scatter
+    from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
+    device = torch.device("cuda")
+    model, config = _model(monkeypatch, runtime=_cuda_runtime, device=device)
+    model.prepare_execution_memory()
+    state, slots = _model_state(model, config, num_blocks=4)
+    resident = _seed_sentinels(model, slots)
+    torch.cuda.synchronize()
+    before = resident.clone()
+    descriptors: list[tuple[int, int]] = []
+    validate = state_scatter._validate_masked_page_scatter
+
+    def recorded(*args: Any, require_cuda_warmup: bool) -> None:
+        if not require_cuda_warmup:  # only the warm-up skips that check
+            _pool, _scratch, block_ids, row_status = args
+            descriptors.append((int(block_ids[0]), int(row_status[0])))
+        validate(*args, require_cuda_warmup=require_cuda_warmup)
+
+    monkeypatch.setattr(state_scatter, "_WARMED_SPECIALIZATIONS", set())
+    monkeypatch.setattr(state_scatter, "_validate_masked_page_scatter", recorded)
+    _initialize(state, slots)
+    state.post_warmup()
+    torch.cuda.synchronize()
+    assert model._transaction_graph.ready
+    assert descriptors, "the serving scatter warm-up did not run"
+    assert all(
+        block != NULL_BLOCK_ID and 0 <= block < 4 and status != 0
+        for block, status in descriptors
+    ), descriptors
+    assert torch.equal(resident, before), "startup stored a resident page"
