@@ -1078,8 +1078,10 @@ def format_cases(cases: Sequence[CaseResult]) -> str:
 
 def format_timings(timings: Sequence[TimingResult]) -> str:
     lines = [
-        f"{'mode':5} {'policy':12} {'B':>4} {'median ms':>10} {'p10 ms':>8} "
-        f"{'p90 ms':>8} {'iters':>6}"
+        (
+            f"{'mode':5} {'policy':12} {'B':>4} {'median ms':>10} {'p10 ms':>8} "
+            f"{'p90 ms':>8} {'iters':>6}"
+        )
     ]
     for t in sorted(
         timings,
