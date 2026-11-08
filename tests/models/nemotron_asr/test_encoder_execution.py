@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Feature-gated static encoder execution contracts."""
 
-from contextlib import contextmanager, nullcontext
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
@@ -1179,9 +1180,30 @@ def test_compiled_static_seals_observed_signatures_and_rejects_lazy_compile(
     assert compiled_calls == [(1, 3), (2, 3), (1, 3)]
 
 
+@pytest.fixture
+def dynamo_limits() -> Iterator[Callable[[int, int], None]]:
+    """Set Dynamo's recompile limits for one test through torch's config API.
+
+    ``monkeypatch.setattr`` cannot restore them: since pytest 9.2 it restores a
+    module attribute missing from ``__dict__`` by deleting it, and deleting a
+    ``torch._dynamo.config`` entry hides it for the rest of the process.
+    """
+    with ExitStack() as stack:
+
+        def set_limits(cache: int, accumulated: int) -> None:
+            stack.enter_context(
+                torch._dynamo.config.patch(
+                    cache_size_limit=cache, accumulated_cache_size_limit=accumulated
+                )
+            )
+
+        yield set_limits
+
+
 @pytest.mark.cpu_test
 def test_compiled_static_warmup_scopes_cache_budget_to_declared_domain(
     monkeypatch: pytest.MonkeyPatch,
+    dynamo_limits: Callable[[int, int], None],
 ) -> None:
     # @spec PORT-PERF-009
     observed_limits: list[tuple[int, int]] = []
@@ -1199,12 +1221,7 @@ def test_compiled_static_warmup_scopes_cache_budget_to_declared_domain(
         return compiled
 
     monkeypatch.setattr(torch, "compile", fake_compile)
-    monkeypatch.setattr(torch._dynamo.config, "cache_size_limit", 8)
-    monkeypatch.setattr(
-        torch._dynamo.config,
-        "accumulated_cache_size_limit",
-        12,
-    )
+    dynamo_limits(8, 12)
     monkeypatch.setattr(
         encoder_execution_module,
         "execute_encoder_transition",
@@ -1308,6 +1325,7 @@ def test_compiled_static_preseal_invocation_requires_declared_cell_authority(
 @pytest.mark.cpu_test
 def test_compiled_static_failure_restores_budget_and_discards_authority(
     monkeypatch: pytest.MonkeyPatch,
+    dynamo_limits: Callable[[int, int], None],
 ) -> None:
     # @spec PORT-PERF-009
     compile_instances: list[dict[str, Any]] = []
@@ -1328,12 +1346,7 @@ def test_compiled_static_failure_restores_budget_and_discards_authority(
         return compiled
 
     monkeypatch.setattr(torch, "compile", fake_compile)
-    monkeypatch.setattr(torch._dynamo.config, "cache_size_limit", 1)
-    monkeypatch.setattr(
-        torch._dynamo.config,
-        "accumulated_cache_size_limit",
-        1,
-    )
+    dynamo_limits(1, 1)
     execution = build_encoder_execution(
         _compiled_core(),
         _compiled_config(),
