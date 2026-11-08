@@ -3957,9 +3957,18 @@ def _written_tensors(
     """Yield every tensor argument the schema of ``func`` marks written.
 
     An argument is written when the schema marks it mutable (in-place,
-    ``Tensor(a!)`` lists) or it is an ``out=`` argument.
+    ``Tensor(a!)`` lists) or it is an ``out=`` argument. An operator without a
+    schema, such as a higher-order operator, may write any tensor argument, so
+    every one is yielded.
     """
-    for index, argument in enumerate(func._schema.arguments):
+    schema = getattr(func, "_schema", None)
+    if schema is None:
+        for value in (*args, *kwargs.values()):
+            for tensor in value if isinstance(value, list | tuple) else (value,):
+                if isinstance(tensor, torch.Tensor):
+                    yield tensor
+        return
+    for index, argument in enumerate(schema.arguments):
         alias = argument.alias_info
         if not argument.is_out and (alias is None or not alias.is_write):
             continue
@@ -3985,12 +3994,56 @@ class _ResidentWrites(TorchDispatchMode):
     element stores no byte and is not logged. Sentinel comparison sees only
     changed bytes; this log also sees a store of the values a page already
     holds.
+
+    The log sees only writes that pass through the dispatcher. A host export
+    (``Tensor.numpy`` or ``Tensor.__dlpack__``) of resident storage would let
+    a later write bypass it, so every such export is logged as well. Stores
+    issued by compiled or Triton kernels bypass both; the CUDA test covers the
+    scatter kernel by observing its launches.
     """
+
+    _EXPORTS = ("numpy", "__dlpack__")
 
     def __init__(self, resident: list[torch.Tensor]) -> None:
         super().__init__()
         self._ranges = {_storage_range(tensor) for tensor in resident}
         self.writes: list[str] = []
+        self._saved: list[tuple[str, Any]] = []
+
+    def _overlaps(self, tensor: torch.Tensor) -> bool:
+        if tensor.numel() == 0:
+            return False
+        device, start, end = _storage_range(tensor)
+        return any(
+            device == owner and start < stop and first < end
+            for owner, first, stop in self._ranges
+        )
+
+    def __enter__(self) -> _ResidentWrites:
+        for name in self._EXPORTS:
+            self._saved.append((name, vars(torch.Tensor).get(name)))
+            export = getattr(torch.Tensor, name)
+
+            def logged(
+                tensor: torch.Tensor, *args: Any, _name=name, _export=export, **kw: Any
+            ) -> Any:
+                if self._overlaps(tensor):
+                    self.writes.append(f"Tensor.{_name} export")
+                return _export(tensor, *args, **kw)
+
+            setattr(torch.Tensor, name, logged)
+        return super().__enter__()
+
+    def __exit__(self, *exc: Any) -> None:
+        try:
+            super().__exit__(*exc)
+        finally:
+            for name, saved in reversed(self._saved):
+                if saved is None:
+                    delattr(torch.Tensor, name)
+                else:
+                    setattr(torch.Tensor, name, saved)
+            self._saved.clear()
 
     def __torch_dispatch__(
         self,
@@ -4000,15 +4053,8 @@ class _ResidentWrites(TorchDispatchMode):
         kwargs: dict[str, Any] | None = None,
     ) -> Any:
         kwargs = kwargs or {}
-        for tensor in _written_tensors(func, args, kwargs):
-            if tensor.numel() == 0:
-                continue
-            device, start, end = _storage_range(tensor)
-            if any(
-                device == owner and start < stop and first < end
-                for owner, first, stop in self._ranges
-            ):
-                self.writes.append(str(func))
+        if any(self._overlaps(t) for t in _written_tensors(func, args, kwargs)):
+            self.writes.append(str(func))
         return func(*args, **kwargs)
 
 
@@ -4063,9 +4109,10 @@ def test_capture_reaches_pools_only_through_the_startup_accessor(
 ) -> None:
     """Capture reaches the pools only through startup access and stores nothing.
 
-    Every page holds sentinels, which a changed byte disturbs, and every op from
-    the out-of-window call through ``post_warmup`` is observed, so a write into
-    resident storage is caught even when it stores the bytes a page holds.
+    Every page holds sentinels, which a changed byte disturbs, and every
+    dispatched op and host export from the out-of-window call through
+    ``post_warmup`` is observed, so a write into resident storage is caught
+    even when it stores the bytes a page holds.
     """
     model, config = _model(monkeypatch)
     model.prepare_execution_memory()
