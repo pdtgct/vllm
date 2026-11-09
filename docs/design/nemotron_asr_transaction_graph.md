@@ -548,10 +548,11 @@ reload after execution materialization (`nemotron_asr.py:649-653`).
   free-memory drop since worker creation plus the transient peak headroom
   (`vllm/utils/mem_utils.py:327-336`). Anything still alive when the window
   closes is charged at its driver-visible size.
-- `profile_run` calls the model's `prepare_execution_memory` inside that window
-  (`vllm/v1/worker/gpu/model_runner.py:1117-1119`). That hook retains the
-  nested inventory and runs eager profile transactions alongside it
-  (`nemotron_asr.py:902-969`).
+- The worker calls the model's `prepare_execution_memory` once inside that
+  window, before it enters the allocator split scope that covers the dummy
+  run (`GPUModelRunner.prepare_execution_memory`; `profile_run` then skips it).
+  That hook retains the nested inventory and runs eager profile transactions
+  alongside it (`nemotron_asr.py:902-969`).
 - The budget is the memory left after `non_kv_cache_memory`, or
   `kv_cache_memory_bytes` when that is set. Resident capacity for persistent
   state is `count = min(budget // page_size_bytes, max_num_seqs + 1)` pages.
