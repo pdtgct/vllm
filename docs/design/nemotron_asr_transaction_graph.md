@@ -269,7 +269,12 @@ bitwise equal to eager in outputs, statuses, progress and pages:
 The signature compares decode and CHUNK callables by `id`. This is sound
 because the dense decode binding caches one callable per graph key for the
 binding's lifetime (`decode_graph.py:365-370`), and the CHUNK binding accepts
-only its sealed callables (`chunk_bucket_graph.py:464-469`). Ids are not reused
+only its sealed callables (`chunk_bucket_graph.py:464-469`). The comparison
+uses a normalized identity, `(id(__self__), id(__func__))` for a bound method
+and the object's own `id` otherwise (`transaction_graph.py:104-106`,
+`:166-167`): a sealed callable is the same object on every resolution, while
+the CHUNK binding's eager path is a bound method that is a new object on each
+attribute read but has a constant normalized identity. Ids are not reused
 while those objects are alive. A resolver that rebuilds closures per call would
 require a different identity mechanism in the signature.
 
@@ -322,7 +327,11 @@ model's configuration check and the binding's guard accept exactly the served
 sets `(0,)` and `(1,)`; an unsupported singleton such as `(3,)` and any set of
 another size raise a `ValueError` that names `transaction_graph_populations`,
 the permitted values (`[0]` or `[1]`) and the rejected declaration. The
-binding receives the served set from the model and declares its CHUNK cells at
+binding receives the served set from the model as `served_geometry_ids`
+(`manifests.py:160-175`): `CADENCES` indices, the same function the processor
+and `bind_rows` use. An index equals its lookahead only for g0 and g1 (index 2
+is lookahead 3), so the configuration check reads lookahead values and the
+binding guard reads indices. The binding declares its CHUNK cells at
 that geometry; it captures
 each `replay` cell with rows of the same geometry. The cell count per
 population and the inventory's one dedicated graph pool are the same at either
@@ -363,11 +372,24 @@ At g1 the option runs with or without the CHUNK-bucket binding
 (`chunk_bucket_graph_populations`). That binding serves only g1 populations 1,
 31 and 63 and has its own construction requirements: the `eager-graphed`
 encoder arm, the `dense-graphed` decoder, native burst off, synchronous,
-non-speculative single-device execution, and `supported_num_lookahead_tokens`
-`[1]` (`chunk_bucket_graph.py:113`, `:299-309`,
-`encoder_execution.py:765-787`, `native_burst.py:221-249`). The bucket binding
-owns those errors, and they do not name `transaction_graph_populations`; with
-`[0]` and the bucket on, the bucket binding rejects the configuration, so the
+non-speculative single-device execution, `supported_num_lookahead_tokens`
+`[1]`, expert parallelism off and no logits processors, and, per declared
+bucket population, decoder tier 1 for population 1, 32 for 31 and 64 for 63
+(`chunk_bucket_graph.py:113`, `:299-317`, `encoder_execution.py:765-787`,
+`native_burst.py:221-249`). Decoder tiers are the powers of two below
+`max_num_seqs` plus `max_num_seqs` itself (`decode_graph.py:23-33`), and the
+encoder's maximum population is `max_num_seqs` (`nemotron_asr.py:552`).
+Population 1 therefore holds at any `max_num_seqs`, population 31 needs
+`max_num_seqs >= 32` and population 63 needs `max_num_seqs >= 64`. Below the
+population, tier resolution raises "decode population N exceeds captured
+maximum M" (`decode_graph.py:186-192`); at exactly 31 (for 31) or 63 (for 63),
+the tier equals the population and the bucket binding raises "CHUNK pilot
+requires unchanged physical decoder tiers 1/32/64" (`chunk_bucket_graph.py:310-317`).
+The bucket binding's construction owns those errors, including the ones its
+reused native-burst guard raises, and they do not name
+`transaction_graph_populations`; with `[0]` and the bucket on, that guard
+rejects the configuration ("native burst requires the declared 160-ms
+lookahead profile", `native_burst.py:243-249`), so the
 two never meet at g0. The option's own validation runs first
 (`nemotron_asr.py:482`, before the bucket's construction at `:584-608`), and
 that precedence is kept, so a served set the option rejects always fails with
@@ -385,8 +407,8 @@ the option's error. When both are on:
   the transition it resolves for a CHUNK bucket is in the signature. At a
   bucket population it resolves the sealed transition; at any other
   population, its bound eager path (`chunk_bucket_graph.py:461-462`,
-  `:474-480`), whose identity is stable for the binding's lifetime (Callable
-  identity). Transaction populations need not equal bucket populations.
+  `:474-480`), a bound method read afresh on each resolution, whose normalized
+  identity is stable for the binding's lifetime (Callable identity). Transaction populations need not equal bucket populations.
 - **Replayed and eager steps.** Flat capture runs the resolved transition
   eagerly inside the outer capture (`chunk_bucket_graph.py:249`), so a
   replayed step executes the bucket's eager body (`chunk_bucket_graph.py:150-163`)
@@ -415,6 +437,11 @@ the option's error. When both are on:
   which pass the bucket binding (`nemotron_asr.py:945-962`,
   `profile_execution.py:311`). `replay` cells invoke no bucket. Serving
   measurements of these counts are deltas from a baseline read after startup.
+  An eager step whose bucket resolves a sealed transition runs the bucket
+  graph, whose body calls the native encoder directly
+  (`chunk_bucket_graph.py:151-161`, `advance.py:1310-1314`), so the guarded
+  encoder transition's invocation counters do not advance; an eager step whose
+  bucket resolves the eager path passes the guarded transition, and they do.
 
 ### Echo eligibility, mixed steps and signature mismatch
 
@@ -726,8 +753,18 @@ dtype, and projected as the resident pools are. It checks, in order:
    transitions (`chunk_bucket_graph.py:135-180`), outside both
    `EncoderExecution.external_tensors` (`encoder_execution.py:1636-1665`) and
    the model's nested-binding list (`nemotron_asr.py:1065-1071`), so the bucket
-   binding must provide that inventory before the option serves with it on. A
-   changed address or size is worker-fatal like every other mismatch here.
+   binding must provide that inventory before the option serves with it on
+   (Decisions & Alternatives, "Bucket scratch inventory"). A changed address or
+   size is worker-fatal like every other mismatch here. The comparison covers
+   only recorded entries (`transaction_graph.py:1541-1547`), so verification
+   also checks completeness against a schema derived from the binding, not from
+   what it reports. The bucket is on when the call bindings'
+   `bucket_transition` is not `None`; the expected entries are then
+   `encoder.bucket.<g>.<n>.<field>` for each sealed cell `(g, n)` of the binding, with fields `env`, `prompt` and `status` (staged inputs); `state.raw_tail`, `state.mel_tail`, `state.frontend_counters`, `state.channel.<i>`, `state.window_valid.<i>` and `state.time.<i>` for each encoder layer `i`, `state.h`, `state.c` and `state.last_label` (state copy); and `out.token_ids`, `out.token_lengths`, `out.row_status`, `out.frame_emission_counts`, `out.frame_final_labels`, `out.frame_valid_lengths`, `out.valid_samples`, `out.geometry_id`, `out.final_tail`, `out.prompt_index`, `out.chunk_sequence`, `out.counter_invariant_bad` and `out.counter_delta_bad` (owned outputs). Verification fails if the recorded or the live inventory lacks any
+   expected entry; an empty or incomplete bucket inventory while the bucket is
+   on is therefore a mismatch, never a pass. Publication records the inventory
+   it finds and does not check it; verification is the one failure point, and
+   its failure latches the binding as worker-fatal.
 
 A mismatch is worker-fatal: it latches the binding and fails startup.
 Verification does not run again at serving time. Every non-dummy
@@ -923,6 +960,7 @@ Serving g0 and g1 in one engine is not a prerequisite.
 | Failure boundary | All step allocations before replay; any failure from the launch on is worker-fatal with a latch | Roll back pages; fall back to eager after a replay error | Body and scatters are one launch, so partial mutation is unknowable; rollback needs hot-path snapshots |
 | Signature mismatch | Count and run eager; no serving-time recapture | Recapture on demand; raise | Recapture needs unadmitted memory and stalls; eager is the exact reference |
 | Process constants | Assert at `execute`, worker-fatal on change | Include them in the signature | The nested inventories and every captured cell were built under the same settings, so a change invalidates the whole process, not one cell; a signature fallback would silently run eager against stale nested graphs |
+| Bucket scratch inventory | The CHUNK-bucket binding owns its sealed transitions' scratch (staged inputs, state copy, owned outputs) and reports it through its own `external_tensors()`; the model adds the bucket binding to its nested execution bindings; post-warmup check 6 compares it and, at verification under the worker-fatal latch, requires every entry of the schema derived from the binding's sealed cells | The transaction binding reads the bucket's closures; the encoder execution reports the bucket entries; exclude the bucket scratch on the ground that no warmup rebinds it | The buffers are closure locals of the bucket's capture (`chunk_bucket_graph.py:135-180`), so only the bucket binding can name them; the encoder execution publishes and discards the sealed callables (`encoder_execution.py:789-807`, `:950`) but treats them as opaque callables; an exclusion would leave addresses the transaction graph replays unverified; check 6 compares only recorded entries, so completeness is checked against the derived schema, and an incomplete inventory fails rather than passes |
 | Post-warmup check | Core `ModelState.post_warmup()` hook, over `pool_layout`, the recorded projected layout and device, and layout-only pools | Re-verify on every call; verify on the first real step; compare only the component pool layout; skip | Per-call signature checks miss binding-external buffers; a first-step check lets the engine report ready before a mismatch is found; a projection that swaps same-shaped roles or changes their strides leaves every component unchanged; startup access ends with `initialize_state_slots`, so verification reads plain-value layouts |
 | Resident pool access | Core startup pool access inside `initialize_state_slots`; capture rows rejected, so no page is stored | Private resident views; a model-owned copy of the pools | Startup access is the authorized source of every page; a copy would need unadmitted memory and its addresses would not serve |
 | Scatter warm-up row | A rejected row on the first non-null free block | A rejected row on the null page | The kernel's predicate stores nothing either way; a non-null free block keeps every startup launch inside the rule that capture rows use non-null free blocks |
@@ -988,11 +1026,17 @@ Serving g0 and g1 in one engine is not a prerequisite.
    layout unchanged; the probe must check this on long g1 streams.
 8. **Rejection reason of g1 capture rows.** Capture inputs are zero
    embeddings, whose envelope header names geometry 0, while the capture plan
-   names the served geometry (`transaction_graph.py:626-666`). At g1 the rows
-   therefore also carry `ROW_STATUS_GEOMETRY`. The self-check requires only
-   that every capture row is rejected and no page is stored, which holds
-   either way. Open: whether capture rows should carry a header naming the
-   served geometry, so the rejected-row path is the same at g0 and g1.
+   names the served geometry (`transaction_graph.py:626-666`). Rejection rests
+   on terminal bits that hold at every geometry: a CHUNK capture row's zero
+   header has version 0, not `ENVELOPE_VERSION`, so it carries
+   `ROW_STATUS_ENVELOPE` (`advance.py:2282`, `:2295`), and a `replay` capture
+   row is a non-CHUNK row with the placeholder id, so it carries
+   `ROW_STATUS_ROLE_MISMATCH` (`advance.py:3401-3403`). Capture headers stay
+   zero. At g1 CHUNK capture rows also carry the recoverable
+   `ROW_STATUS_GEOMETRY`. The self-check requires only that every capture row is
+   rejected and no page is stored. Open: whether capture rows should carry a
+   header naming the served geometry, so the rejected-row path is the same at
+   g0 and g1.
 9. **`multi-geometry` under one served geometry.** Unreachable: the served set
    is a singleton, and `bind_rows` rejects any other geometry before the
    registry mutates. Mixed geometry stays under Open Question 6.
@@ -1026,7 +1070,24 @@ CHUNK-bucket state holds with the binding off and, at g1, with it on; a
 criterion whose behaviour depends on either names the configurations it
 covers. **M** is the set of three test configurations: g0; g1 with the
 CHUNK-bucket binding off; and g1 with `chunk_bucket_graph_populations`
-`[1, 31, 63]`. Every criterion's "Configurations" entry names the configurations its
+`[1, 31, 63]`. Unless a criterion's test explicitly overrides them, the bucket-on
+configurations of M and the other bucket-on test configurations use the following
+defaults. They use `max_num_seqs` 64, a test choice that meets every
+bucket population's tier condition (TXG-ENV-009): decoder tiers
+`execution_tiers(64)`, which are 1, 2, 4, 8, 16, 32 and 64, and an encoder
+maximum population of 64, at least the largest bucket population 63. Engine
+tests with fewer sessions than 64 keep `max_num_seqs` 64 and size
+`num_gpu_blocks_override` to the session count plus one. At the binding-test
+level, "CHUNK-bucket binding on" means the call bindings' `bucket_transition`
+is not `None`: it is a warmed `ExactChunkGraphBinding`, built over a sealed
+`eager-graphed` encoder execution of maximum population at least 63 with the
+bucket cells reserved (`reserve_chunk_graph_cells`) and a `DenseGraphBinding`
+with tiers `execution_tiers(64)`, with `graph_covers_decode` true and the
+model's decode resolver (`build_decode_resolver`) over that decode binding.
+`[CPU]` tests of routing, identity, validation and counters may use stand-in
+encoder executions and stand-in sealed callables, as the existing signature
+tests do (`test_transaction_graph.py:2484-2496`); `[CUDA]` and `[engine-CUDA]`
+tests use the real stack. Every criterion's "Configurations" entry names the configurations its
 tests run in. A criterion whose behaviour can be exercised under a g1 engine,
 with or without the CHUNK-bucket binding, is tested over M; an entry narrower
 than M states why the behaviour does not apply in the omitted
@@ -1066,19 +1127,19 @@ configurations.
   - Design: One served geometry: configuration and row admission
   - Test: `tests/models/nemotron_asr/test_plan_local.py::test_bind_rows_rejects_geometry_outside_served_set` (parametrized as its Configurations entry states) [CPU]
   - Configurations: option off and on × served `[0]` (a header naming geometry 1 rejected), served `[1]` (a header naming geometry 0 rejected), and served `[1]` with `chunk_bucket_graph_populations` `[1, 31, 63]` (geometry 0 rejected)
-- **TXG-ENV-009**: When `transaction_graph_populations` is non-empty, `supported_num_lookahead_tokens` is `[1]` (g1), `chunk_bucket_graph_populations` is a non-empty list of distinct populations drawn from 1, 31 and 63, the encoder arm is `eager-graphed`, the decoder arm is `dense-graphed`, native burst is disabled, execution is synchronous, non-speculative and single-device, and the configuration passes every check of TXG-ENV-002 to TXG-ENV-006, the model shall construct both the CHUNK-bucket binding and `TransactionGraphBinding`, whether or not the transaction populations equal the bucket populations, and shall set the `bucket_transition` of its transaction call bindings to that CHUNK-bucket binding, so that every transaction call, both captures and post-warmup verification resolve CHUNK buckets through it.
+- **TXG-ENV-009**: When `transaction_graph_populations` is non-empty, `supported_num_lookahead_tokens` is `[1]` (g1), `chunk_bucket_graph_populations` is a non-empty list of distinct populations drawn from 1, 31 and 63, the encoder arm is `eager-graphed`, the decoder arm is `dense-graphed`, native burst is disabled, execution is synchronous, non-speculative and single-device with expert parallelism off and no logits processors (`model_config.logits_processors` empty), `max_num_seqs` meets each declared bucket population's tier condition (any value for population 1, at least 32 for population 31, at least 64 for population 63), and the configuration passes every check of TXG-ENV-002 to TXG-ENV-006, the model shall construct both the CHUNK-bucket binding and `TransactionGraphBinding`, whether or not the transaction populations equal the bucket populations, and shall set the `bucket_transition` of its transaction call bindings to that CHUNK-bucket binding, so that every transaction call, both captures and post-warmup verification resolve CHUNK buckets through it; and `_nested_execution_bindings()` shall include the CHUNK-bucket binding while it is on and omit it while it is off.
   - Design: g1 and the CHUNK-bucket binding; Supported Envelope
-  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_option_composes_with_the_chunk_bucket_binding_at_g1` (new; bucket `[1, 31, 63]` with transaction `[1, 2, 31]`, and bucket `[1, 63]` with transaction `[31]`; asserts `TransactionCallBindings.bucket_transition` is the model's CHUNK-bucket binding) [CPU]
-  - Configurations: g1 with `chunk_bucket_graph_populations` `[1, 31, 63]` and `[1, 63]`; not g0 or bucket off, because the criterion is the composition of the two bindings, which exists only at g1 with the bucket on
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_option_composes_with_the_chunk_bucket_binding_at_g1` (new; bucket `[1, 31, 63]` with transaction `[1, 2, 31]`, and bucket `[1, 63]` with transaction `[31]`; bucket `[1]` with `max_num_seqs` 1, and bucket `[1, 31]` with `max_num_seqs` 32; asserts `TransactionCallBindings.bucket_transition` is the model's CHUNK-bucket binding and that `_nested_execution_bindings()` includes it, and with the bucket off that it omits it) [CPU]
+  - Configurations: g1 with `chunk_bucket_graph_populations` `[1, 31, 63]` and `[1, 63]` at the default `max_num_seqs` 64, `[1]` with `max_num_seqs` 1 and `[1, 31]` with `max_num_seqs` 32 (each overriding the shared default), and g1 with the bucket off as the control for the nested-binding omission; not g0, because the composition exists only at g1
 - **TXG-ENV-010**: When `transaction_graph_populations` and `chunk_bucket_graph_populations` are both non-empty, if the configuration fails any check of TXG-ENV-002 to TXG-ENV-006 (for example `supported_num_lookahead_tokens` `[0, 1]`, or native burst enabled), then the model shall raise the option's configuration error before it constructs the CHUNK-bucket binding.
   - Design: g1 and the CHUNK-bucket binding
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_option_checks_precede_chunk_bucket_construction` (new; `[0, 1]` and native burst enabled, each with the bucket on; the bucket binding is never constructed) [CPU]
   - Configurations: the CHUNK-bucket binding on, with each failing check stated; not bucket off, because precedence over the bucket's construction requires the bucket to be configured
-- **TXG-ENV-011**: When `transaction_graph_populations` is non-empty and passes TXG-ENV-002 to TXG-ENV-006, and `chunk_bucket_graph_populations` is non-empty, if `supported_num_lookahead_tokens` is `[0]`, the encoder arm is not `eager-graphed`, the decoder arm is `dense-eager`, scheduling is asynchronous, a speculative configuration is set, or any parallel size is other than 1, then model construction shall fail with the CHUNK-bucket binding's own `ValueError`, which need not name `transaction_graph_populations`, and no `TransactionGraphBinding` shall serve.
+- **TXG-ENV-011**: When `transaction_graph_populations` is non-empty and passes TXG-ENV-002 to TXG-ENV-006, and `chunk_bucket_graph_populations` is non-empty, if `supported_num_lookahead_tokens` is `[0]` (raising "native burst requires the declared 160-ms lookahead profile"); scheduling is asynchronous, a speculative configuration is set, any parallel size is other than 1, expert parallelism is on, or `model_config.logits_processors` is non-empty (each raising "native burst requires synchronous non-speculative single-device execution"); the decoder arm is `dense-eager` (raising "CHUNK serving pilot requires distinct populations 1/31/63 and a dense graph decoder"); `max_num_seqs` is below a declared bucket population (31 or 63; raising "decode population N exceeds captured maximum M"); `max_num_seqs` is exactly 31 with population 31 declared or exactly 63 with population 63 declared (raising "CHUNK pilot requires unchanged physical decoder tiers 1/32/64"); or the encoder arm is not `eager-graphed` (raising "CHUNK ownership requires an untouched native encoder domain"), then model construction shall fail with the CHUNK-bucket binding's own `ValueError`, which need not name `transaction_graph_populations`, and no `TransactionGraphBinding` shall serve.
   - Design: g1 and the CHUNK-bucket binding
-  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_chunk_bucket_requirements_raise_the_bucket_error` (new; each failing requirement parametrized; the error is the bucket binding's) [CPU]
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_chunk_bucket_requirements_raise_the_bucket_error` (new; each failing requirement parametrized with its message, including expert parallelism on, a non-empty `logits_processors`, `max_num_seqs` 16 with bucket `[31]`, 48 with bucket `[63]`, 31 with bucket `[31]` and 63 with bucket `[63]`; the error is the bucket binding's, and the `[0]` case asserts the native-burst message, not a CHUNK message) [CPU]
   - Configurations: the CHUNK-bucket binding on, with each failing requirement stated (including `[0]`, the only g0 case); not bucket off, because the errors belong to the bucket binding
-- **TXG-ENV-012**: When `TransactionGraphBinding` is constructed with a served geometry set (`CADENCES` indices), it shall accept exactly `(0,)` and `(1,)`, and if the set is any other, for example `()`, `(2,)` or `(0, 1)`, then it shall raise a configuration error whose message names the permitted sets `(0,)` and `(1,)` and the rejected set.
+- **TXG-ENV-012**: When `TransactionGraphBinding` is constructed with a served geometry set, which the model passes as `served_geometry_ids(hf_config)`, the `CADENCES` indices that the processor and `bind_rows` also use (an index equals its lookahead only for g0 and g1; TXG-ENV-004 validates lookahead values), it shall accept exactly `(0,)` and `(1,)`, and if the set is any other, for example `()`, `(2,)` or `(0, 1)`, then it shall raise a configuration error whose message names the permitted sets `(0,)` and `(1,)` and the rejected set.
   - Design: One served geometry: configuration and row admission
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_binding_rejects_served_sets_other_than_g0_or_g1` (new; `(0,)` and `(1,)` accepted; `()`, `(2,)`, `(0, 1)` rejected with the message contents) [CPU]
   - Configurations: the served sets `(0,)` (g0) and `(1,)` (g1) accepted and each enumerated set rejected; the bucket binding is not an input to this constructor (it reaches the transaction only as a call binding, TXG-ENV-009), so bucket state does not apply
@@ -1191,13 +1252,13 @@ configurations.
   - Design: Inputs, outputs and signature; Host control flow inside the body
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_signature_covers_every_structural_input` [CPU]
   - Configurations: M
-- **TXG-REP-005**: When `transaction_graph_populations` is non-empty and a call matches a declared cell whose captured signature, including arena layout, differs from the call's, `execute` shall detect the mismatch before any arena upload (both pinned host buffers and the device arena byte-identical), run eager over the live pools with results, including committed pages, bitwise equal to eager, leave captured storage that is distinct from the live pools untouched, and increment `fallbacks:<cell label>:signature` by one.
+- **TXG-REP-005**: When `transaction_graph_populations` is non-empty and a call matches a declared cell whose captured signature, including arena layout, differs from the call's, `execute` shall detect the mismatch before any arena upload (both pinned host buffers and the device arena byte-identical), run eager over the live pools with results, including committed pages, bitwise equal to eager (and where eager raises for that input, for example the CHUNK-bucket binding's sealed transition rejecting an invocation that differs from its captured cell, `chunk_bucket_graph.py:232-242`, propagate that exception after the counter increments, without latching the binding, so a later call is classified normally), leave captured storage that is distinct from the live pools untouched, and increment `fallbacks:<cell label>:signature` by one.
   - Design: Inputs, outputs and signature; Echo eligibility, mixed steps and signature mismatch; Execute order
-  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_relocated_pools_fall_back_instead_of_replaying` [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_arena_layout_mismatch_is_a_signature_fallback` (execution-level, live-pool commit bitwise equal to eager) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_arena_rejects_vectors_outside_its_layout` (arena-level guard) [CPU]
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_relocated_pools_fall_back_instead_of_replaying` [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_arena_layout_mismatch_is_a_signature_fallback` (execution-level, live-pool commit bitwise equal to eager; with the bucket on at population 31, a call whose `inputs_embeds` is one column wider than captured, which changes the signature's input-embeddings entry and the bucket's captured envelope signature, raises the bucket's `ValueError` after `fallbacks:<cell label>:signature` increments, the binding unlatched and a following valid call replayed) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_arena_rejects_vectors_outside_its_layout` (arena-level guard) [CPU]
   - Configurations: M
-- **TXG-REP-006**: When `transaction_graph_populations` is non-empty, the dense decode binding and the CHUNK-bucket binding shall return the identical callable object (same `id`) for the same graph key across calls for the binding's lifetime, and the CHUNK-bucket binding shall reject a callable it did not seal, so the signature of two structurally identical calls is equal.
+- **TXG-REP-006**: When `transaction_graph_populations` is non-empty, the dense decode binding and the CHUNK-bucket binding's sealed transitions shall resolve to the identical callable object (same `id`) for the same graph key across calls for the binding's lifetime; the CHUNK-bucket binding's eager path, resolved for a population outside its set, shall have the same normalized identity `(id(__self__), id(__func__))` on every resolution although each resolution returns a new bound-method object; and the CHUNK-bucket binding shall reject a callable it did not seal, so the signature of two structurally identical calls is equal.
   - Design: Callable identity
-  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_signature_callable_identities_are_stable_across_calls` [CPU]
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_signature_callable_identities_are_stable_across_calls` (also repeated resolution at population 2 with bucket `[1, 31, 63]`: equal normalized identity and equal signatures) [CPU]
   - Configurations: M for the dense decode binding's callable identity; the CHUNK-bucket binding's identity at g1 with `chunk_bucket_graph_populations` `[1, 31, 63]` (its test resolves geometry 1), not at g0 or bucket off, where no bucket binding exists
 - **TXG-REP-007**: While `outer_transaction_capture` is active, `nested_graph_mode` shall return the eager mode at every nested launch site (encoder, decode and CHUNK bucket) and any host-to-device staging shall raise; while it is inactive, `nested_graph_mode` shall return the configured mode.
   - Design: Flat capture
@@ -1219,13 +1280,13 @@ configurations.
   - Design: Capture and the replay-cell oracle; Host control flow inside the body
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_cuda_replay_cell_accepted_control_rows_match_eager` (accepted park-echo and FLUSH × `endpoint_enabled` true and false, accepted forced-endpoint with `endpoint_enabled` true, rejected forced-endpoint with `endpoint_enabled` false; parametrized over M) [CUDA]
   - Configurations: M
-- **TXG-REP-012**: When `transaction_graph_populations` is non-empty and a covered step at g0, g1 with the CHUNK-bucket binding off, or g1 with `chunk_bucket_graph_populations` `[1, 31, 63]`, contains rows the transaction rejects (out-of-sequence CHUNK, wrong echo token, corrupt book, and at g1 a final-tail row with at least 2,560 valid samples, which carries `ROW_STATUS_FINAL_OVERSIZE`), replay shall produce the same nonzero row statuses, outputs and pages as eager, leaving the rejected rows' pages unchanged and committing the other rows; commit-sink collection shall report the same failed request ids as eager, which `postprocess_state` passes to `state_slots.fail_requests` (the step's `failed_req_ids`); the step shall not raise, and the binding shall not latch.
+- **TXG-REP-012**: When `transaction_graph_populations` is non-empty and a covered step at g0, g1 with the CHUNK-bucket binding off, or g1 with `chunk_bucket_graph_populations` `[1, 31, 63]`, contains rows the transaction rejects (out-of-sequence CHUNK, wrong echo token, corrupt book, and at g1 a final-tail row with at least `C·hop` valid samples (2,560 at hop 160), which carries `ROW_STATUS_FINAL_OVERSIZE`), replay shall produce the same nonzero row statuses, outputs and pages as eager, leaving the rejected rows' pages unchanged and committing the other rows; commit-sink collection shall report the same failed request ids as eager, which `postprocess_state` passes to `state_slots.fail_requests` (the step's `failed_req_ids`); the step shall not raise, and the binding shall not latch.
   - Design: Capture and the replay-cell oracle; Lookahead rows at g1; Failure Containment
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_cuda_graph_replay_rejects_corrupt_rows_like_eager` (`failed_req_ids` equal between arms; no latch; parametrized over M, with the oversized final tail at g1) [CUDA]; `tests/models/nemotron_asr/test_transaction_graph.py::test_cuda_one_corrupt_row_in_a_population_is_rejected_alone` (likewise) [CUDA]
   - Configurations: M
 - **TXG-REP-013**: When `transaction_graph_populations` is `[1]` or `[31]` through an `EngineCore`, at g0, at g1 with the CHUNK-bucket binding off, and at g1 with `chunk_bucket_graph_populations` `[1, 31, 63]`, the emitted tokens, echo counts and resident storage after every park shall be bitwise equal to the same configuration run with the option off; in the homogeneous lockstep workload (exactly the declared population of sessions, all sending each CHUNK in the same step), every CHUNK step shall replay its declared cell with zero CHUNK-step fallbacks, and echo steps at undeclared populations are counted `undeclared`; mixed or staggered steps keep eager equivalence and are counted under their fallback reasons.
   - Design: Context and Design Philosophy; g1 and the CHUNK-bucket binding
-  - Test: `tests/v1/engine/test_nemotron_asr.py::test_nemotron_engine_transaction_graph_matches_eager` (also the per-chunk echo counts of both arms; parametrized over the three configurations) [engine-CUDA]; `tests/v1/engine/test_nemotron_asr.py::test_nemotron_engine_transaction_graph_b31_lockstep_matches_eager` (parametrized likewise) [engine-CUDA]
+  - Test: `tests/v1/engine/test_nemotron_asr.py::test_nemotron_engine_transaction_graph_matches_eager` (also the per-chunk echo counts of both arms; parametrized over the three configurations, with `max_num_seqs` 64 and `num_gpu_blocks_override` equal to the session count plus one in the bucket-on configuration rather than `max_num_seqs` equal to the session count; that configuration captures `eager-graphed` encoder cells for populations 1 to 64 and profiles a 64-row transaction, so the test sets `gpu_memory_utilization` explicitly to hold them with the admission inventory, records non-KV memory, `A` and `S`, and treats a capacity failure at startup as a failed test configuration, not a pass) [engine-CUDA]; `tests/v1/engine/test_nemotron_asr.py::test_nemotron_engine_transaction_graph_b31_lockstep_matches_eager` (parametrized likewise) [engine-CUDA]
   - Configurations: M
 - **TXG-REP-014**: When `transaction_graph_populations` is non-empty, before `execute` classifies the call, and therefore before it replays or returns from any fallback (uncovered, undeclared, mixed-row or signature), it shall compare the live batch-invariant mode, the per-operation `fp32_precision` settings of `torch.backends.cuda.matmul`, `torch.backends.cudnn.conv` and `torch.backends.cudnn.rnn` (which also reflect `torch.set_float32_matmul_precision()`), and `CUBLAS_WORKSPACE_CONFIG` with their capture-time values using host-only reads that never call the legacy getters (`torch.get_float32_matmul_precision()` and the `allow_tf32` flags), and if any differs, then it shall raise a worker-fatal `RuntimeError` naming the changed constant without replaying, running eager or incrementing any counter.
   - Design: Process constants and excluded paths; Execute order
@@ -1239,24 +1300,24 @@ configurations.
   - Design: Inputs, outputs and signature; Invariants
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_cells_share_no_arena_static_input_or_owned_output` (storage disjointness) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_cuda_owned_outputs_are_allocated_outside_the_graph_pool` (allocator provenance, for example `torch.cuda.memory._snapshot()` segment pool ids, for rows, status and progress) [CUDA]
   - Configurations: M
-- **TXG-REP-017**: When `transaction_graph_populations` is non-empty and eager fallback steps interleave with replayed steps, at g0, at g1 with the CHUNK-bucket binding off, and at g1 with `chunk_bucket_graph_populations` `[1, 31, 63]`, results shall be bitwise equal to the same sequence run entirely eager. The eager steps launch the nested encoder and decode bindings and, with the bucket binding on, the bucket graph for each CHUNK bucket at one of its populations, while the replayed steps run the bucket's eager body recorded in the transaction graph, over the same nested-binding scratch.
+- **TXG-REP-017**: When `transaction_graph_populations` is non-empty and eager fallback steps interleave with replayed steps, at g0, at g1 with the CHUNK-bucket binding off, and at g1 with `chunk_bucket_graph_populations` `[1, 31, 63]`, results shall be bitwise equal to the same sequence run entirely eager. The eager steps launch the nested encoder and decode bindings and, with the bucket binding on, the bucket graph for each CHUNK bucket at one of its populations, while the replayed steps run the bucket's eager body recorded in the transaction graph, over the same nested-binding scratch. In the bucket-on configuration the sequence uses transaction populations `[2, 31]` and interleaves: replayed 31-row CHUNK steps (the bucket's eager body for population 31); eager `mixed-roles` steps of 31 CHUNK rows and one echo row, whose 31-row bucket launches the bucket graph at 31 over the same scratch; eager `undeclared` one-row CHUNK steps, which launch the bucket graph at 1; and replayed two-row CHUNK steps, whose bucket resolves the bucket's eager path.
   - Design: Invariants; g1 and the CHUNK-bucket binding
-  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_cuda_interleaved_fallbacks_and_replays_match_eager` (parametrized over the three configurations) [CUDA]
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_cuda_interleaved_fallbacks_and_replays_match_eager` (parametrized over the three configurations; the bucket-on sequence as stated) [CUDA]
   - Configurations: M
 - **TXG-REP-018**: When `transaction_graph_populations` is non-empty, the binding shall build the capture rows of every cell, `replay` cells included, with plan geometry equal to the served geometry, in the admission inventory, the serving inventory and the cell inputs that post-warmup verification rebuilds; and a `replay` cell's key and label shall carry no geometry.
   - Design: One served geometry: configuration and row admission; Capture and the replay-cell oracle
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_capture_rows_carry_the_served_geometry` (new; every cell kind, both inventories and the verification rebuild, parametrized over M) [CPU]
   - Configurations: M
-- **TXG-REP-019**: When `transaction_graph_populations` is `[1, 2, 31]`, the served geometry is g1, and the CHUNK-bucket binding is off, or `chunk_bucket_graph_populations` is `[1, 31, 63]` (bucket populations 1 and 31; population 2 outside its set), or `chunk_bucket_graph_populations` is `[1, 63]` (bucket population 1; populations 2 and 31 outside its set), these accepted rows shall replay with results bitwise equal to eager in each of the three configurations: (a) a one-chunk session's row (chunk sequence 0, final tail with fewer than 2,560 valid samples) in a `chunk-fresh` cell, alone at population 1 and beside regular first chunks at populations 2 and 31; (b) a continuing final-tail row with fewer than 2,560 valid samples beside regular continuing rows in one `chunk-continuing` cell at populations 2 and 31; and (c) at populations 1 and 31, after each session's final CHUNK, each of its REPLAY rows in a `replay` cell, the emitting ones advancing the queue head and the drained one parking with its pending echo cleared, followed by its FLUSH in a `replay` cell, which emits park and leaves the queue and book unchanged.
+- **TXG-REP-019**: When `transaction_graph_populations` is `[1, 2, 31]`, the served geometry is g1, and the CHUNK-bucket binding is off, or `chunk_bucket_graph_populations` is `[1, 31, 63]` (bucket populations 1 and 31; population 2 outside its set), or `chunk_bucket_graph_populations` is `[1, 63]` (bucket population 1; populations 2 and 31 outside its set), these accepted rows shall replay with results bitwise equal to eager in each of the three configurations: (a) a one-chunk session's row (chunk sequence 0, final tail with fewer than `C·hop` valid samples (2,560 at hop 160)) in a `chunk-fresh` cell, alone at population 1 and beside regular first chunks at populations 2 and 31; (b) a continuing final-tail row with fewer than `C·hop` valid samples (2,560 at hop 160) beside regular continuing rows in one `chunk-continuing` cell at populations 2 and 31; and (c) at populations 1 and 31, after each session's final CHUNK, each of its REPLAY rows in a `replay` cell, the emitting ones advancing the queue head and the drained one parking with its pending echo cleared, followed by its FLUSH in a `replay` cell, which emits park and leaves the queue and book unchanged.
   - Design: Lookahead rows at g1; Host control flow inside the body; Capture and the replay-cell oracle
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_cuda_g1_lookahead_rows_match_eager` (new; cases (a) to (c) at the stated populations × the three configurations) [CUDA]
   - Configurations: g1 with the CHUNK-bucket binding off, with `[1, 31, 63]` and with `[1, 63]`; not g0, because the lookahead frame and the 2,560-sample bound exist only at g1
 
 ### Post-warmup verification (VER)
 
-- **TXG-VER-001**: When `transaction_graph_populations` is non-empty and the model's post-warmup verification runs, it shall compare with their values recorded at publication the live `pool_layout`, the device of the core's encoder parameters (against the device the resident pools were captured on), the projected resident layout rebuilt from the live `pool_layout` (for each transaction role, the component pool it starts in, its address, byte offset in that component, shape, strides and dtype), every published cell's signature rebuilt over layout-only pools (all entries but the resident-pool and input-layout entries), the live call bindings, and the address and size of every binding-external buffer the graphs read (the core's parameters and buffers, the entry scratch of the nested encoder and decode graph bindings and, when the CHUNK-bucket binding is on at g1, each sealed bucket transition's staged inputs, state copy and owned outputs, which the bucket binding reports through its `external_tensors()` inventory), holding no resident tensor; and if any differs, then it shall raise an error naming `transaction_graph_populations`, the cell and the changed pool, device, projected role, signature entry, call binding or buffer. Serving capture shall require the pool layout it records.
+- **TXG-VER-001**: When `transaction_graph_populations` is non-empty and the model's post-warmup verification runs, it shall compare with their values recorded at publication the live `pool_layout`, the device of the core's encoder parameters (against the device the resident pools were captured on), the projected resident layout rebuilt from the live `pool_layout` (for each transaction role, the component pool it starts in, its address, byte offset in that component, shape, strides and dtype), every published cell's signature rebuilt over layout-only pools (all entries but the resident-pool and input-layout entries), the live call bindings, and the address and size of every binding-external buffer the graphs read (the core's parameters and buffers, the entry scratch of the nested encoder and decode graph bindings and, when the CHUNK-bucket binding is on at g1, each sealed bucket transition's staged inputs, state copy and owned outputs, which the bucket binding reports through its `external_tensors()` inventory), holding no resident tensor; while the call bindings' `bucket_transition` is not `None`, it shall also require both the recorded and the live inventory to hold every entry of the schema derived from that binding's sealed cells, `encoder.bucket.<g>.<n>.<field>` for each sealed cell `(g, n)` of the binding, with fields `env`, `prompt` and `status` (staged inputs); `state.raw_tail`, `state.mel_tail`, `state.frontend_counters`, `state.channel.<i>`, `state.window_valid.<i>` and `state.time.<i>` for each encoder layer `i`, `state.h`, `state.c` and `state.last_label` (state copy); and `out.token_ids`, `out.token_lengths`, `out.row_status`, `out.frame_emission_counts`, `out.frame_final_labels`, `out.frame_valid_lengths`, `out.valid_samples`, `out.geometry_id`, `out.final_tail`, `out.prompt_index`, `out.chunk_sequence`, `out.counter_invariant_bad` and `out.counter_delta_bad` (owned outputs); and if any compared value differs, or any expected bucket entry is missing, then it shall raise an error naming `transaction_graph_populations`, the cell and the changed pool, device, projected role, signature entry, call binding or buffer, or the missing bucket entry. Serving capture shall require the pool layout it records.
   - Design: Post-Warmup Verification
-  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_post_warmup_verification_rejects_resized_external_buffer` (calls the verification with the live `pool_layout`; parametrized over every mismatch kind, including a core moved to another device, a projection that swaps the `h` and `c` roles and a projection that changes a role's strides, each with every component pool unchanged, and at g1 with the CHUNK-bucket binding on a relocated or resized bucket staged input, state copy and owned output) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_verification_keeps_no_resident_view` (after `post_warmup`, with the binding published and verified, no resident view outlives the test's own references and the model state's bindings) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_serving_capture_requires_the_pool_layout` (capture without a pool layout is a `TypeError` naming `pool_layout`) [CPU]
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_post_warmup_verification_rejects_resized_external_buffer` (calls the verification with the live `pool_layout`; parametrized over every mismatch kind, including a core moved to another device, a projection that swaps the `h` and `c` roles and a projection that changes a role's strides, each with every component pool unchanged, and at g1 with the CHUNK-bucket binding on a relocated or resized bucket staged input, state copy and owned output, plus, for each expected bucket field and for a whole sealed cell, an inventory missing it, and an empty inventory, each of which fails) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_verification_keeps_no_resident_view` (after `post_warmup`, with the binding published and verified, no resident view outlives the test's own references and the model state's bindings) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_serving_capture_requires_the_pool_layout` (capture without a pool layout is a `TypeError` naming `pool_layout`) [CPU]
   - Configurations: M; the bucket-buffer mismatch kinds only with the bucket on, because those buffers exist only then
 - **TXG-VER-002**: When `transaction_graph_populations` is non-empty and core calls `ModelState.post_warmup()`, the model state shall run the post-warmup verification once over its current bindings' `pool_layout`, and no `prepare_step` shall run it; every non-dummy `prepare_step` shall check the binding's failed latch before registry pruning, `state_slots.begin_step`, request activation and any transaction, and raise the TXG-FAIL-004 error if it is set.
   - Design: Post-Warmup Verification
@@ -1264,7 +1325,7 @@ configurations.
   - Configurations: M
 - **TXG-VER-003**: When `transaction_graph_populations` is non-empty, if post-warmup verification finds a changed pool layout, device, projected resident role, signature entry, call binding or binding-external buffer address or size (including, at g1 with the CHUNK-bucket binding on, a sealed bucket transition's staged inputs, state copy or owned outputs), then `post_warmup` shall raise a worker-fatal `RuntimeError` naming the cell and the changed item and latch the binding, with the session registry unchanged and no resident page written, so every later non-dummy `prepare_step` fails at its latch check (TXG-VER-002).
   - Design: Post-Warmup Verification
-  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_post_warmup_mismatch_is_fatal_before_any_state_change` (parametrized over the TXG-VER-001 mismatch kinds, the bucket buffers included) [CPU]
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_post_warmup_mismatch_is_fatal_before_any_state_change` (parametrized over the TXG-VER-001 mismatch kinds, the bucket buffers and each missing bucket entry included; each case latches the binding and a later `prepare_step` fails) [CPU]
   - Configurations: M, inheriting TXG-VER-001's mismatch kinds, the bucket buffers only with the bucket on
 - **TXG-VER-004**: When `transaction_graph_populations` is non-empty, startup shall run the model's post-warmup verification from core's `ModelState.post_warmup()` hook, after every worker warmup and before the worker serves, and a mismatch shall fail startup.
   - Design: Post-Warmup Verification; Core Obligations, item 2 (delivered)
@@ -1328,9 +1389,9 @@ configurations.
   - Design: Host control flow inside the body
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_cuda_replay_freezes_nested_counters_and_counts_once` (parametrized over M) [CUDA]
   - Configurations: M
-- **TXG-OBS-006**: When `transaction_graph_populations` is non-empty at g1 with `chunk_bucket_graph_populations` `[1, 31, 63]`, an eager step whose CHUNK bucket is at a bucket population shall advance that bucket cell's replay count by one and no fallback count, an eager step whose CHUNK bucket is at another declared population (for example 2) shall advance that population's fallback count by one and no replay count, and an eager step with no CHUNK row shall advance neither; the serving baseline of these counts is their reading after startup (after `post_warmup` and before the first served step), and serving counts are differences from that baseline.
+- **TXG-OBS-006**: When `transaction_graph_populations` is `[2]` at g1 with `chunk_bucket_graph_populations` `[1, 31, 63]`, an eager step whose CHUNK bucket holds a bucket population of rows (for example a one-row CHUNK step, counted `undeclared`) shall advance that bucket cell's replay count by one, no bucket fallback count and no encoder invocation counter, because the sealed bucket body runs the native encoder rather than the guarded encoder transition (`chunk_bucket_graph.py:151-161`, `advance.py:1310-1314`); an eager step whose CHUNK bucket holds another number of rows (for example a three-row CHUNK step, counted `undeclared`) shall advance the bucket's fallback count for that population by one, no bucket replay count, and the guarded encoder transition's invocation counter by one (`chunk_bucket_graph.py:474-480`); an eager step with no CHUNK row (for example one REPLAY row) shall advance neither bucket count; and a replayed two-row CHUNK step shall advance none of them; the serving baseline of these counts is their reading after startup (after `post_warmup` and before the first served step), and serving counts are differences from that baseline.
   - Design: g1 and the CHUNK-bucket binding; Host control flow inside the body
-  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_cuda_bucket_counts_record_eager_invocations` (new; transaction populations `[1, 2]`; baseline read after startup; deltas across one eager step at 1, one at 2, one non-CHUNK eager step and one replayed step) [CUDA]
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_cuda_bucket_counts_record_eager_invocations` (new; transaction populations `[2]`; baseline read after startup; bucket and encoder-invocation deltas across one eager one-row CHUNK step, one eager three-row CHUNK step, one eager one-row REPLAY step and one replayed two-row CHUNK step) [CUDA]
   - Configurations: g1 with `chunk_bucket_graph_populations` `[1, 31, 63]`; not g0 or bucket off, because the bucket's counts exist only with the bucket on
 
 ### Core warmup fix (CORE; owned by the core persistent-state design)
