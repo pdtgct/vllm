@@ -59,6 +59,39 @@ def _clone_state(state: SessionStateBatch) -> SessionStateBatch:
     )
 
 
+def _state_names(state: SessionStateBatch) -> tuple[str, ...]:
+    """Names of ``_state_tensors(state)``'s entries, in order."""
+    return (
+        "raw_tail",
+        "mel_tail",
+        "frontend_counters",
+        *(f"channel.{index}" for index in range(len(state.channel))),
+        *(f"window_valid.{index}" for index in range(len(state.window_valid))),
+        *(f"time.{index}" for index in range(len(state.time))),
+        "h",
+        "c",
+        "last_label",
+    )
+
+
+#: Names of ``_outputs``'s entries, in order.
+_OUTPUT_NAMES = (
+    "token_ids",
+    "token_lengths",
+    "row_status",
+    "frame_emission_counts",
+    "frame_final_labels",
+    "frame_valid_lengths",
+    "valid_samples",
+    "geometry_id",
+    "final_tail",
+    "prompt_index",
+    "chunk_sequence",
+    "counter_invariant_bad",
+    "counter_delta_bad",
+)
+
+
 def _outputs(bucket: ChunkBucketResult) -> tuple[torch.Tensor, ...]:
     result, batch = bucket.result, bucket.batch
     values = (
@@ -272,11 +305,29 @@ def capture_chunk_bucket(
             prompt_index=escaped[9],
             chunk_sequence=escaped[10],
         )
+        # @spec TXG-OBS-006
         transition.replay_count += 1
         return ChunkBucketResult(batch, result, escaped[11], escaped[12])
 
     frozen_capacity = queue_capacity
     transition.replay_count = 0
+    # The staged inputs, state copy and owned outputs the graph reads and
+    # writes; an enclosing capture records their addresses.
+    transition.scratch = {
+        "env": static_env,
+        "prompt": static_prompt,
+        "status": static_status,
+        **{
+            f"state.{name}": tensor
+            for name, tensor in zip(
+                _state_names(static_state), _state_tensors(static_state), strict=True
+            )
+        },
+        **{
+            f"out.{name}": tensor
+            for name, tensor in zip(_OUTPUT_NAMES, owned, strict=True)
+        },
+    }
     return transition
 
 
@@ -338,6 +389,32 @@ class ExactChunkGraphBinding:
             )
         }
         encoder_execution.reserve_chunk_graph_cells(self._cells)
+
+    @property
+    def cells(self) -> frozenset[tuple[int, int]]:
+        """The sealed ``(geometry, population)`` cells this binding serves."""
+        return self._cells
+
+    # @spec TXG-VER-001
+    def external_tensors(self) -> dict[str, torch.Tensor]:
+        """Every published sealed cell's scratch, keyed by cell and field.
+
+        The staged inputs, state copy and owned outputs are closure storage of
+        each sealed transition. An enclosing capture that runs a transition
+        eagerly records their addresses, so they must not be rebound after it.
+        """
+        mode = execution_mode(self._core)
+        tensors: dict[str, torch.Tensor] = {}
+        for geometry, population in sorted(self._cells):
+            entry = self._encoder._chunk_graph_entries.get(
+                mode.graph_key("chunk", (geometry, population))
+            )
+            if entry is None:
+                continue
+            prefix = f"encoder.bucket.{geometry}.{population}"
+            scratch = getattr(entry, "scratch", {})
+            tensors.update((f"{prefix}.{name}", t) for name, t in scratch.items())
+        return tensors
 
     @property
     def ready(self) -> bool:
@@ -445,6 +522,7 @@ class ExactChunkGraphBinding:
             self._encoder._discard()
             raise
 
+    # @spec TXG-REP-006
     def resolve(
         self,
         *,
@@ -471,6 +549,7 @@ class ExactChunkGraphBinding:
             execution_mode(self._core).graph_key("chunk", cell)
         ]
 
+    # @spec TXG-OBS-006
     def _fallback(
         self, core: Any, env: torch.Tensor, state: SessionStateBatch, **kwargs: Any
     ) -> ChunkBucketResult:

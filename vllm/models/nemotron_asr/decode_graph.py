@@ -479,6 +479,7 @@ class DenseGraphBinding:
             )
         return self._bind_decode(self._entries[key], self._runtime, captured=False)
 
+    # @spec TXG-REP-006
     def decode_fn(self, *, geometry: int, tier: int) -> Callable[..., Any]:
         """Return the startup-bound callable for one exact graph key."""
         key = self._batch_invariant_mode.graph_key("decode_fn", (geometry, tier))

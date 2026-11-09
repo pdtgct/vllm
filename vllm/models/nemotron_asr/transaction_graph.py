@@ -54,8 +54,9 @@ CELL_REPLAY = "replay"
 
 #: The option every configuration and startup error names.
 OPTION = "transaction_graph_populations"
-#: The one served geometry: the 80 ms cadence, ``CADENCES`` index 0 (g0).
-SERVED_GEOMETRY = 0
+#: The served geometry sets, as ``CADENCES`` indices: the 80 ms cadence (g0)
+#: or the 160 ms cadence (g1). An engine with the option on serves one.
+SERVED_GEOMETRY_SETS = ((0,), (1,))
 
 
 @dataclass(frozen=True, order=True)
@@ -101,6 +102,7 @@ def classify_transaction(
     return None, "mixed-fresh"
 
 
+# @spec TXG-REP-006
 def _callable_identity(fn: Any) -> tuple[int, int]:
     """Identity stable across repeated bound-method attribute reads."""
     return id(getattr(fn, "__self__", None)), id(getattr(fn, "__func__", fn))
@@ -510,6 +512,57 @@ def _external_buffers(core: Any, nested: Sequence[Any] = ()) -> dict[str, Any]:
     return layouts
 
 
+#: The owned outputs of each sealed CHUNK-bucket transition.
+_BUCKET_OUTPUTS = (
+    "token_ids",
+    "token_lengths",
+    "row_status",
+    "frame_emission_counts",
+    "frame_final_labels",
+    "frame_valid_lengths",
+    "valid_samples",
+    "geometry_id",
+    "final_tail",
+    "prompt_index",
+    "chunk_sequence",
+    "counter_invariant_bad",
+    "counter_delta_bad",
+)
+
+
+def _bucket_inventory_schema(bucket: Any, *, layers: int) -> tuple[str, ...]:
+    """The scratch entries every sealed cell of ``bucket`` must report.
+
+    Derived from the binding's sealed cells and the encoder layer count, never
+    from the inventory it reports: the staged inputs, the state copy and the
+    owned outputs of each cell. Empty when the CHUNK-bucket binding is off.
+    """
+    if bucket is None:
+        return ()
+    fields = (
+        "env",
+        "prompt",
+        "status",
+        "state.raw_tail",
+        "state.mel_tail",
+        "state.frontend_counters",
+        *(
+            f"state.{family}.{index}"
+            for family in ("channel", "window_valid", "time")
+            for index in range(layers)
+        ),
+        "state.h",
+        "state.c",
+        "state.last_label",
+        *(f"out.{name}" for name in _BUCKET_OUTPUTS),
+    )
+    return tuple(
+        f"encoder.bucket.{geometry}.{population}.{name}"
+        for geometry, population in sorted(bucket.cells)
+        for name in fields
+    )
+
+
 def _failure_figures(
     device: torch.device, baseline: int | None
 ) -> tuple[int | None, int | None, int | None]:
@@ -799,13 +852,16 @@ class TransactionGraphBinding:
             raise ValueError(
                 f"{OPTION} must be distinct integers in 1..{maximum_population}"
             )
-        if tuple(geometries) != (SERVED_GEOMETRY,):
+        # @spec TXG-ENV-012, TXG-REP-001
+        served = tuple(geometries)
+        if served not in SERVED_GEOMETRY_SETS or type(served[0]) is not int:
             raise ValueError(
-                f"{OPTION} serves only geometry g{SERVED_GEOMETRY}, "
-                f"not {tuple(geometries)}"
+                f"{OPTION} serves exactly one geometry, (0,) for g0 or (1,) for "
+                f"g1, not {served!r}"
             )
+        (geometry,) = served
         cells = [
-            TransactionCell(kind, SERVED_GEOMETRY, int(population))
+            TransactionCell(kind, geometry, int(population))
             for population in populations
             for kind in (CELL_FRESH_CHUNK, CELL_CONTINUING_CHUNK)
         ]
@@ -814,7 +870,7 @@ class TransactionGraphBinding:
             for population in populations
         ]
         self._cells = tuple(sorted(cells))
-        self._replay_geometry = SERVED_GEOMETRY
+        self._served_geometry = geometry
         self._vllm_config = vllm_config
         self._runtime = runtime
         self._capture_stream: Any = None
@@ -1199,7 +1255,8 @@ class TransactionGraphBinding:
         Capture and post-warmup verification both build a cell's inputs here,
         so a cell's live signature is computed exactly as at capture.
         """
-        geometry = self._replay_geometry if cell.kind == CELL_REPLAY else cell.geometry
+        # @spec TXG-REP-018
+        geometry = self._served_geometry if cell.kind == CELL_REPLAY else cell.geometry
         plan = _capture_plan(
             cell,
             block_ids=block_ids,
@@ -1440,7 +1497,9 @@ class TransactionGraphBinding:
         entries that name a resident address or the device. ``call`` and
         ``nested`` are the live call bindings and nested bindings; the call
         bindings and every binding-external buffer's address and size are
-        compared too. Nothing built here is retained. A mismatch is
+        compared too. While the CHUNK-bucket binding is on, the recorded and
+        the live inventories must each hold every entry of the schema derived
+        from its sealed cells. Nothing built here is retained. A mismatch is
         worker-fatal and latches the binding.
         """
         self.check_latch()
@@ -1539,6 +1598,21 @@ class TransactionGraphBinding:
         if binding is not None:
             raise failed(f"cells {labels}", f"call binding {binding} changed")
         external = _external_buffers(core, nested)
+        # @spec TXG-VER-001, TXG-VER-003
+        if call.bucket_transition is not None and not hasattr(
+            call.bucket_transition, "cells"
+        ):
+            raise failed(f"cells {labels}", "the CHUNK-bucket binding names no cells")
+        schema = _bucket_inventory_schema(
+            call.bucket_transition, layers=len(pools.channel)
+        )
+        for which, inventory in (("recorded", startup.external), ("live", external)):
+            missing = next((name for name in schema if name not in inventory), None)
+            if missing is not None:
+                raise failed(
+                    f"cells {labels}",
+                    f"the {which} CHUNK-bucket inventory lacks buffer {missing}",
+                )
         for name, layout in startup.external.items():
             if external.get(name) != layout:
                 raise failed(
@@ -1641,6 +1715,7 @@ class TransactionGraphBinding:
             raise
         finally:
             graph.context.inputs = None
+        # @spec TXG-OBS-005
         self._replays[graph.cell] = self._replays.get(graph.cell, 0) + 1
         return rows
 
@@ -1669,7 +1744,10 @@ class TransactionGraphBinding:
         warm-ups, ``capture_seconds`` its capture and instantiation.
         ``admission_bytes`` (``A``) and ``serving_bytes`` (``S``) are
         normalized free-memory differences, ``None`` off CUDA.
+        ``served_geometry`` is the served ``CADENCES`` index, which ``replay``
+        cell labels do not carry.
         """
+        # @spec TXG-OBS-004
         fields = (
             "retained_bytes",
             "warmup_seconds",
@@ -1692,6 +1770,7 @@ class TransactionGraphBinding:
             "ready": self.ready,
             "worker_pid": os.getpid(),
             "instance_id": self._instance_id,
+            "served_geometry": self._served_geometry,
             "retained_bytes_total": self._retained_bytes_total,
             "admission_bytes": self._admission_bytes,
             "serving_bytes": self._serving_bytes,

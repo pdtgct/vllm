@@ -141,16 +141,18 @@ def _transaction_graph_populations(vllm_config: Any, hf_config: Any) -> tuple[in
     if getattr(compilation, "cudagraph_mm_encoder", False):
         raise ValueError(f"{option} requires cudagraph_mm_encoder disabled")
     lookaheads = getattr(hf_config, "supported_num_lookahead_tokens", None)
-    # Exactly the integer 0: no coercion, so 0.5, True and "0" are rejected.
+    # @spec TXG-ENV-004
+    # Exactly one integer lookahead, 0 (g0) or 1 (g1): no coercion, so 0.5,
+    # 1.0, True and "0" are rejected.
     if not (
         isinstance(lookaheads, (list, tuple))
         and len(lookaheads) == 1
         and type(lookaheads[0]) is int
-        and lookaheads[0] == 0
+        and lookaheads[0] in (0, 1)
     ):
         raise ValueError(
-            f"{option} serves only g0: supported_num_lookahead_tokens must be "
-            f"[0], not {lookaheads!r}"
+            f"{option} serves exactly one geometry: supported_num_lookahead_tokens "
+            f"must be [0] (g0) or [1] (g1), not {lookaheads!r}"
         )
     scheduler = vllm_config.scheduler_config
     bound = min(int(scheduler.max_num_seqs), int(scheduler.max_num_batched_tokens))
@@ -477,8 +479,10 @@ class NemotronASRForRNNT(nn.Module):
                 "given, vLLM's auto policy downcasts float32 checkpoints "
                 "on SM80+ GPUs. Pass --dtype float32."
             )
-        # The option's envelope is checked before every other mode rejection,
-        # so each rejection of an option-on configuration names the option.
+        # @spec TXG-ENV-010
+        # The option's envelope is checked before every other mode rejection
+        # and before the CHUNK-bucket binding is constructed, so each rejection
+        # of an option-on configuration names the option.
         transaction_populations = _transaction_graph_populations(vllm_config, hf_config)
         # Pool sizing is resolved after vLLM's real memory profile in the
         # common worker. The model constructor deliberately does not invent
@@ -599,6 +603,7 @@ class NemotronASRForRNNT(nn.Module):
             if native_burst_enabled:
                 raise ValueError("CHUNK serving pilot requires native burst disabled")
             validate_native_burst_config(vllm_config, hf_config=hf_config)
+            # @spec TXG-ENV-009, TXG-ENV-011
             self._chunk_bucket_binding = ExactChunkGraphBinding(
                 self.core,
                 hf_config,
@@ -613,6 +618,7 @@ class NemotronASRForRNNT(nn.Module):
             )
 
             scheduler = vllm_config.scheduler_config
+            # @spec TXG-ENV-009
             self._transaction_graph = TransactionGraphBinding(
                 populations=list(transaction_populations),
                 geometries=served_geometries,
@@ -984,8 +990,12 @@ class NemotronASRForRNNT(nn.Module):
         _warm_scatter(pools, block_id=int(NULL_BLOCK_ID) + 1)
         return scratch.raw, pools
 
+    # @spec TXG-ENV-009
     def _transaction_call_bindings(self) -> Any:
-        """The call bindings both transaction graph inventories capture."""
+        """The call bindings both transaction graph inventories capture.
+
+        CHUNK buckets resolve through the CHUNK-bucket binding while it is on.
+        """
         from vllm.models.nemotron_asr.transaction_graph import (
             TransactionCallBindings,
         )
@@ -1062,11 +1072,19 @@ class NemotronASRForRNNT(nn.Module):
             project_nemotron_state_pools(storage, n_layers=int(self.config.n_layers))
         )
 
+    # @spec TXG-ENV-009, TXG-VER-001
     def _nested_execution_bindings(self) -> tuple[Any, ...]:
-        """The nested bindings whose scratch the outer transaction body reads."""
+        """The nested bindings whose scratch the outer transaction body reads.
+
+        The CHUNK-bucket binding joins them while it is on.
+        """
         return tuple(
             binding
-            for binding in (self._encoder_execution, self._decode_graph_binding)
+            for binding in (
+                self._encoder_execution,
+                self._decode_graph_binding,
+                getattr(self, "_chunk_bucket_binding", None),
+            )
             if binding is not None
         )
 

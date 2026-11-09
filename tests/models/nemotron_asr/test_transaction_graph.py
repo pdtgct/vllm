@@ -2521,6 +2521,13 @@ _UNCOVERED = {
         {},
         ("fallbacks:{}:capture", tg.CELL_FRESH_CHUNK, 1),
     ),
+    "capture-b2": (
+        [],
+        [1, 2],
+        [True, True],
+        {},
+        ("fallbacks:{}:capture", tg.CELL_FRESH_CHUNK, 2),
+    ),
     "memory-profile": (
         [],
         [1],
@@ -2559,8 +2566,26 @@ def test_uncovered_calls_run_eager_and_are_counted(
     ids, embeds, plan = _rows(
         decodes, prefills, fresh, geometry=served.geometry, **options
     )
-    flags = {"capture": case == "capture", "memory_profile": case == "memory-profile"}
+    flags = {
+        "capture": case.startswith("capture"),
+        "memory_profile": case == "memory-profile",
+    }
     before = binding.counters()
+    if served.bucket and case in ("capture", "memory-profile"):
+        # The prologue rejects these modes before ``execute`` with the bucket
+        # on, on the eager and the graph path alike: the bucket refuses a
+        # capture-mode resolution of its sealed B1 cell, and its graphed decoder
+        # cannot run a memory profile. No counter moves and no page changes.
+        untouched = _clone_pools(graph_pools)
+        with pytest.raises(ValueError) as eager:
+            _step(core, eager_pools, call, ids, embeds, plan, None, **flags)
+        with pytest.raises(ValueError) as graph:
+            _step(core, graph_pools, call, ids, embeds, plan, binding, **flags)
+        assert str(graph.value) == str(eager.value)
+        assert binding.counters() == before
+        _assert_pools_equal(graph_pools, untouched)
+        _assert_pools_equal(eager_pools, untouched)
+        return
     expected = _step(core, eager_pools, call, ids, embeds, plan, None, **flags)
     actual = _step(core, graph_pools, call, ids, embeds, plan, binding, **flags)
     _assert_records_equal([actual], [expected])
@@ -4096,7 +4121,9 @@ def test_admission_captures_full_inventory_before_eager_profiles(
         events.append("encoder")
 
     def profiled(value: Any, **kwargs: Any) -> Any:
-        events.append("profile")
+        # The eager profile transactions run over the ready domain; the
+        # eager-graphed encoder warm-up's own invocations do not.
+        events.append("profile" if kwargs.get("ready_domain") else "warmup")
         return profile(value, **kwargs)
 
     monkeypatch.setattr(profile_execution, "warmup_static_encoder_execution", encoder)
@@ -4114,6 +4141,7 @@ def test_admission_captures_full_inventory_before_eager_profiles(
     assert events.count("capture") == len(labels)
     first, last = events.index(("N", 0)), events.index(("N", 2))
     assert events.index("encoder") < first
+    assert all(index < first for index, event in enumerate(events) if event == "warmup")
     if bucket is not None:
         assert events.index("bucket-published") < first
     assert all(
@@ -4334,16 +4362,21 @@ def test_admission_holder_lives_until_serving_capture(
     _free_memory(monkeypatch, _budget(_stand_in_bytes(model), 1 << 20, 1 << 20))
     count = len(model._transaction_graph.cells)
     during_profiles: list[int] = []
+    during_warmup: list[int] = []
     profile = profile_execution.run_persistent_state_profile
 
     def profiled(value: Any, **kwargs: Any) -> Any:
-        during_profiles.append(len(_live([record.arena for record in prepared])))
+        # The eager profile transactions run over the ready domain; the
+        # eager-graphed encoder warm-up's own invocations precede admission.
+        alive = len(_live([record.arena for record in prepared]))
+        (during_profiles if kwargs.get("ready_domain") else during_warmup).append(alive)
         return profile(value, **kwargs)
 
     monkeypatch.setattr(profile_execution, "run_persistent_state_profile", profiled)
     model.prepare_execution_memory()
     arenas = [record.arena for record in prepared]
     assert during_profiles and all(alive == count for alive in during_profiles)
+    assert all(alive == 0 for alive in during_warmup)
     assert len(_live(arenas)) == count, "released before prepare returned"
     # The profile window closes and capacity is fixed outside the model.
     state, slots = _model_state(model, config)
@@ -5730,7 +5763,9 @@ _REACH_CASES = [
     ("served", "populations", "target"),
     _REACH_CASES,
     ids=[
-        target or f"{served.name}-option-{'on' if populations else 'off'}"
+        target
+        if served is None
+        else f"{served.name}-option-{'on' if populations else 'off'}"
         for served, populations, target in _REACH_CASES
     ],
 )
