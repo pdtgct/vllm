@@ -181,33 +181,88 @@ captured copy would replay a frozen pinned source.
 The body is not branch-free. Its host control flow depends only on fields
 fixed by the cell or covered by the signature: `endpoint_enabled` (signature);
 the fresh-mask class (cell kind, plus `n_fresh`); the geometry's lookahead and
-hop (cell geometry); decode output widths and `k_max` (geometry plus the decode
+hop (cell geometry; the host reads a lookahead only for CHUNK buckets,
+`advance.py:3484-3487`, so a `replay` cell has no host geometry branch);
+decode output widths and `k_max` (geometry plus the decode
 callable's identity); and the capture flag (forced off; `capture` is a
 fallback reason). Any further host-dependent field the body branches on must
 join the signature or the cell key before its cell is published. Within one
-cell and signature the graph is data-independent.
+cell and signature the graph is data-independent. Per-row protocol state is
+device data, not host control flow: whether a CHUNK row is a session's first
+chunk (`chunk_sequence` 0) or a final tail (`final_tail`), which sets its
+frontend target and its lookahead handling (`advance.py:1235-1240`), and, for
+non-CHUNK rows, the per-row cadence the prologue stages from the plan's
+geometry (`advance.py:3196-3199`) and the body reads from the arena
+(`advance.py:3398`), and the book's geometry check (`advance.py:3440`).
 
 Nested host-side checks and counters run only while a cell is captured and
 are frozen under replay: `_validate_result_structure` (`advance.py:3541`), the
 guarded-transition invocation counters (`encoder_execution.py:830`, `:2174`)
-and the CHUNK binding's fallback counts (`chunk_bucket_graph.py:479`). For
-replayed steps, encoder invocation counts and CHUNK-binding fallback counts
-do not advance; per-step batch stats still do, because the prologue stages
-them. The transaction counters are the per-replay record.
+and the CHUNK binding's replay and fallback counts (`chunk_bucket_graph.py:275`,
+`:479`). For replayed steps, encoder invocation counts and CHUNK-binding replay
+and fallback counts do not advance; per-step batch stats still do, because the
+prologue stages them. Those nested counts advance only when their host code
+runs: on eager steps and during startup, including each cell's eager
+reference, warm-ups and capture in both inventories (Capture and the
+replay-cell oracle) and the eager profile transactions. Serving measurements
+of nested counts are deltas from a baseline read after startup. The
+transaction counters are the per-replay record.
 
 ### Capture and the replay-cell oracle
 
 Capturing a cell (`transaction_graph.py:1233`) runs an eager reference on
 capture rows the transaction rejects (so no page is stored), three eager
 warm-ups through the wrapper, the capture, and a replay that must reproduce the
-reference outputs and pages bitwise before the cell is published. That
-self-check covers rejected rows only. Correctness for accepted rows rests on
-tests that drive accepted rows of every kind through replay and compare with
-eager bitwise, including `replay` cells carrying accepted FLUSH and park-echo
+reference outputs and pages bitwise before the cell is published. Capture rows
+carry the served geometry in their plan, for `replay` cells as for CHUNK cells
+(`transaction_graph.py:1202`). The eager reference launches nested graphs,
+while the warm-ups and the capture run them eagerly inside the capture scope
+(Flat capture), so the self-check also compares the two nested paths, on
+rejected rows. That self-check covers rejected rows only. Correctness for
+accepted rows rests on tests that drive accepted rows of every kind through
+replay at each servable geometry and compare with eager bitwise. At g1 they
+cover every case in Lookahead rows at g1, with the CHUNK-bucket binding on and
+off, and with the bucket on at a population outside its configured set. They
+include `replay` cells carrying accepted FLUSH and park-echo
 rows with endpointing on and off, and accepted forced-endpoint rows with
 endpointing on. With endpointing off the forced-endpoint control is not
 recognized (`advance.py:3423-3431`), so such a row is rejected, under replay
 exactly as under eager.
+
+### Lookahead rows at g1
+
+At g1 the lookahead `L` is 1 and a regular chunk is `C = 16` mel frames of
+2,560 samples. The frontend sets each row's target to `(8L + 1) + seq·C` for
+chunk sequence `seq`; a final-tail row ignores its target, and a final tail of
+`C·hop` samples or more is rejected with `ROW_STATUS_FINAL_OVERSIZE`
+(`advance.py:1235-1240`). A session's first chunk takes no mel-tail prefix and
+drops nothing; a continuing row takes the nine-frame prefix and drops the
+configured pre-encode outputs; every row's encoder length is its own
+`output_lengths(prefix + new frames) - drop`, clamped at zero, and zero when
+the row produced no new frames (`advance.py:1247-1296`). Decode reads only the first `L + 1` encoder frames,
+bounded per row by that length (`advance.py:1338-1347`). These are per-row
+device values within one cell and signature. For every case below, replay is
+bitwise equal to eager in outputs, statuses, progress and pages:
+
+- **Fresh and final in one chunk.** A one-chunk session (`seq` 0, final tail
+  under `C·hop` samples) is a `chunk-fresh` row: no prefix, no drop, and an
+  encoder length that may be below `L + 1`. It may share its cell
+  with regular first chunks.
+- **Final tail among regular continuing rows.** Freshness and finality are
+  independent (`advance.py:1235-1240`), and a final tail is not a separate
+  kind. A continuing final-tail row therefore shares a `chunk-continuing` cell
+  with regular rows; only its frame count and encoder length differ, and the
+  regular rows' outputs are unaffected by it.
+- **Final CHUNK, then REPLAY, then FLUSH.** After the final tail, the
+  session's REPLAY rows drain its queued emissions: each validated echo emits
+  the next queued label and advances the queue head, and a drained REPLAY
+  parks and clears the pending echo (`advance.py:897-930`). Its FLUSH then
+  emits park and leaves the queue and book unchanged (`advance.py:994-995`).
+  These are non-CHUNK rows in `replay` cells, which read their cadence from
+  the arena, and replay matches eager at every step of the sequence.
+- **Oversized final tail.** The row is rejected with
+  `ROW_STATUS_FINAL_OVERSIZE`, a terminal status: its pages stay unchanged, the
+  other rows commit, and collection fails its request (Failure Containment).
 
 ### Callable identity
 
@@ -233,6 +288,10 @@ hf_overrides = {
 }
 ```
 
+This serves g0. Serving g1 sets `supported_num_lookahead_tokens` to `[1]` and
+may also set `chunk_bucket_graph_populations` (g1 and the CHUNK-bucket
+binding).
+
 The engine also needs `cudagraph_mode` `NONE` and `max_num_seqs` of at least
 the largest population. The model validates at
 construction, each failure a configuration error naming the option:
@@ -241,8 +300,10 @@ construction, each failure a configuration error naming the option:
   `dense-eager`;
 - the runner's `cudagraph_mode` is `NONE` with no runner-managed encoder
   graphs, so `needs_cudagraph_capture()` is false;
-- the served geometry set is exactly g0 (`supported_num_lookahead_tokens ==
-  [0]`);
+- the served geometry set is exactly one geometry, g0 or g1:
+  `supported_num_lookahead_tokens` is a one-element list or tuple whose
+  element is the `int` 0 or 1, with no coercion, so an absent value (every
+  published cadence), `[0, 1]`, `[3]`, `[1.0]` and `[True]` are rejected;
 - every population is an integer in `1..min(max_num_seqs,
   max_num_batched_tokens)` (each row is one token), and populations are
   distinct;
@@ -253,11 +314,25 @@ When memory, not the `max_num_seqs + 1` cap, binds capacity, the usable slot
 count is known only after profiling. In that case the serving-capture slot
 check (`transaction_graph.py:1129-1133`) fails startup.
 
-### g0 only: configuration and row admission
+### One served geometry: configuration and row admission
 
-Non-g0 geometries are rejected at configuration. `replay` cells carry no
-geometry and cover non-CHUNK rows of any geometry. Leaving g1 uncaptured
-therefore cannot keep g1 sessions' echo and FLUSH rows out of replay.
+An engine with the option on serves exactly one geometry, g0 or g1. Every
+other served set, `{g0, g1}` included, is rejected at configuration. Both the
+model's configuration check and the binding's guard accept exactly the served
+sets `(0,)` and `(1,)`; an unsupported singleton such as `(3,)` and any set of
+another size raise a `ValueError` that names `transaction_graph_populations`,
+the permitted values (`[0]` or `[1]`) and the rejected declaration. The
+binding receives the served set from the model and declares its CHUNK cells at
+that geometry; it captures
+each `replay` cell with rows of the same geometry. The cell count per
+population and the inventory's one dedicated graph pool are the same at either
+geometry; at g1 only the sizes that scale with the chunk width (samples, mel
+and encoder frames, decode output widths) grow. `replay` cells carry no
+geometry in their key and cover non-CHUNK rows of any geometry, so leaving a
+geometry uncaptured cannot keep its sessions' echo and FLUSH rows out of
+replay. The served set, not the captured cells, therefore bounds the
+geometries a replay can reach, and every row a replayed step carries is a row
+of the geometry its cell was captured and validated at.
 
 The served geometry set is enforced twice:
 
@@ -279,7 +354,67 @@ The served geometry set is enforced twice:
 Both checks apply whenever the model serves, independent of
 `transaction_graph_populations`.
 
-The restriction lifts only when g1 meets the same acceptance criteria.
+Serving g0 and g1 in one engine is outside the envelope (Decisions &
+Alternatives, "Served geometries"; Open Question 6).
+
+### g1 and the CHUNK-bucket binding
+
+At g1 the option runs with or without the CHUNK-bucket binding
+(`chunk_bucket_graph_populations`). That binding serves only g1 populations 1,
+31 and 63 and has its own construction requirements: the `eager-graphed`
+encoder arm, the `dense-graphed` decoder, native burst off, synchronous,
+non-speculative single-device execution, and `supported_num_lookahead_tokens`
+`[1]` (`chunk_bucket_graph.py:113`, `:299-309`,
+`encoder_execution.py:765-787`, `native_burst.py:221-249`). The bucket binding
+owns those errors, and they do not name `transaction_graph_populations`; with
+`[0]` and the bucket on, the bucket binding rejects the configuration, so the
+two never meet at g0. The option's own validation runs first
+(`nemotron_asr.py:482`, before the bucket's construction at `:584-608`), and
+that precedence is kept, so a served set the option rejects always fails with
+the option's error. When both are on:
+
+- **Startup order.** `prepare_execution_memory` warms up and publishes the
+  bucket inventory before admission (`nemotron_asr.py:925-927`, `:935`), so
+  both transaction inventories capture against the published bucket
+  inventory. The eager CHUNK-cell and `max_num_seqs` profiles then run with
+  the retained nested inventory (encoder, decode and CHUNK-bucket graphs) and
+  the admission inventory alive (Ordering, step 3); the serving inventory does
+  not yet exist.
+- **Call binding.** The bucket binding is the transaction's
+  `bucket_transition` call binding, so its identity is in the startup key, and
+  the transition it resolves for a CHUNK bucket is in the signature. At a
+  bucket population it resolves the sealed transition; at any other
+  population, its bound eager path (`chunk_bucket_graph.py:461-462`,
+  `:474-480`), whose identity is stable for the binding's lifetime (Callable
+  identity). Transaction populations need not equal bucket populations.
+- **Replayed and eager steps.** Flat capture runs the resolved transition
+  eagerly inside the outer capture (`chunk_bucket_graph.py:249`), so a
+  replayed step executes the bucket's eager body (`chunk_bucket_graph.py:150-163`)
+  as recorded kernels and launches no bucket graph. An eager step (a fallback,
+  or a capture's eager reference) launches the bucket graph for a bucket at
+  one of its populations. Replay and eager therefore run different nested
+  paths for the same accepted rows, and neither self-check covers accepted
+  rows: the bucket capture checks profile rows, and the transaction capture
+  rejected rows. Accepted-row bitwise equality is a test obligation (Capture
+  and the replay-cell oracle). Both paths write the bucket's scratch (staged
+  inputs, state copy and owned outputs), which is nested-binding scratch
+  (Invariants): each call stages all of it before reading it.
+- **Positional projections.** The bucket capture requires unprepared
+  positional projections (`chunk_bucket_graph.py:127`), and the
+  `eager-graphed` arm rejects prepared ones (`encoder_execution.py:1012-1022`).
+  The signature's `_stream_relative_position_lengths` entry is therefore empty
+  at capture and stays empty; the bucket binding adds no source of `signature`
+  fallback.
+- **Counters.** The bucket's replay and fallback counts
+  (`chunk_bucket_graph.py:275`, `:479`) count invocations of its sealed
+  transitions and of its eager path, whichever a CHUNK bucket resolves. A
+  replayed transaction step increments neither (Host control flow inside the
+  body). They advance on eager steps with a CHUNK bucket and during startup:
+  each CHUNK cell's eager reference, warm-ups and
+  capture in both transaction inventories, and the eager profile transactions,
+  which pass the bucket binding (`nemotron_asr.py:945-962`,
+  `profile_execution.py:311`). `replay` cells invoke no bucket. Serving
+  measurements of these counts are deltas from a baseline read after startup.
 
 ### Echo eligibility, mixed steps and signature mismatch
 
@@ -372,8 +507,10 @@ reload after execution materialization (`nemotron_asr.py:649-653`).
 - Cells share no arena, static input or owned output. Intermediates may share
   graph-pool memory, because replays are serialized and no intermediate is
   live across a replay.
-- Nested-binding scratch is shared by the outer graph and the eager-path nested
-  launches. It is fully written before it is read within a call.
+- Nested-binding scratch (encoder, decode and, at g1, CHUNK-bucket) is shared
+  by the outer graph and the eager-path nested launches. It is fully written
+  before it is read within a call, and its addresses and sizes are checked
+  after the warmups (Post-Warmup Verification, check 6).
 
 ## Memory Admission
 
@@ -464,8 +601,10 @@ makes the binding ready.
    proven-identical allocator or graph-exec bytes; the final check is the
    authority.
 3. **Eager profiles.** The existing CHUNK-cell and `max_num_seqs` profile
-   transactions run with both inventories alive, so their transient peak is
-   measured on top of retained graph memory.
+   transactions run with both inventories alive, the retained nested inventory
+   (encoder, decode and, when on, CHUNK-bucket graphs) and the admission
+   inventory, so their transient peak is measured on top of retained graph
+   memory.
 4. **Window closes.** `non_kv_cache_memory` includes the admission inventory
    (graph-pool segments, instantiated graphs, arenas, owned outputs). The peak
    headroom includes the preparation and capture peak.
@@ -579,7 +718,16 @@ dtype, and projected as the resident pools are. It checks, in order:
 6. the address and size of every binding-external buffer the graphs read. These
    are the core's parameters and buffers and the entry scratch of the nested
    encoder and decode graph bindings, which each reports through its
-   `external_tensors()` inventory.
+   `external_tensors()` inventory. When the CHUNK-bucket binding is on, they
+   also include, for each of its sealed transitions, the staged inputs, the
+   state copy and the owned outputs, which the bucket binding reports through
+   its own `external_tensors()` inventory and which the model includes among
+   its nested execution bindings. Those buffers are held by the sealed
+   transitions (`chunk_bucket_graph.py:135-180`), outside both
+   `EncoderExecution.external_tensors` (`encoder_execution.py:1636-1665`) and
+   the model's nested-binding list (`nemotron_asr.py:1065-1071`), so the bucket
+   binding must provide that inventory before the option serves with it on. A
+   changed address or size is worker-fatal like every other mismatch here.
 
 A mismatch is worker-fatal: it latches the binding and fails startup.
 Verification does not run again at serving time. Every non-dummy
@@ -682,7 +830,10 @@ cell's next replay. The commit sink consumes them earlier in the step.
 - The execution profile receipt includes readiness and, per cell, arena bytes,
   reserved-memory growth, warm-up and capture seconds, and capture order. It
   also includes `A`, `S`, the release check, and the admission and serving
-  capture seconds.
+  capture seconds, and the served geometry. Cell labels stay as they are
+  (`transaction_graph.py:76-77`): a `replay` label names no geometry, so the
+  receipt's served geometry is what distinguishes evidence from g0 and g1
+  engines.
 
 ## Core Dependency: Persistent-State Warmup
 
@@ -752,19 +903,21 @@ accepted. It also requires:
   through `collective_rpc` and the plugin's `vllm.general_plugins` worker
   entry point, so serving fallback rates are observed outside in-process runs.
 
-Covering the default cadence first requires validating g1 as an envelope
-extension.
+The default cadence is g1, so this evidence is taken at g1, with the
+CHUNK-bucket binding on or off as the baseline configuration declares.
+Serving g0 and g1 in one engine is not a prerequisite.
 
 ## Decisions & Alternatives
 
 | Decision | Chosen | Alternatives Considered | Rationale |
 |----------|--------|------------------------|-----------|
 | Placement | Design doc beside the model, moving with it to the plugin; numbered acceptance criteria | Core design doc; EARS with `@spec` tags | The model owns the option; the plugin move must not orphan intent |
-| Posture | Opt-in, with admission, the g0 restriction and counted fallbacks | Default-on; opt-in without admission | Startup and capacity costs and mixed-step rates are unmeasured; hidden graph memory breaks capacity planning |
+| Posture | Opt-in, with admission, one served geometry and counted fallbacks | Default-on; opt-in without admission | Startup and capacity costs and mixed-step rates are unmeasured; hidden graph memory breaks capacity planning |
 | Coverage key | Exact population per kind and geometry | Padded population buckets | Padding changes row counts through decode and commit and needs its own exactness proof |
 | Capture shape | Flat: nested bindings eager inside one outer capture | Nested graph launches | One launch; nested launches keep per-region cost and separate pools |
 | Host inputs | Persistent double-buffered pinned arena, one copy | Per-call `HostStaging`; captured host-to-device copies | Captured copies replay frozen sources; per-call staging adds launches |
-| Non-g0 geometries | Rejected at configuration and at row admission | Captured but unvalidated; left uncaptured and counted | Replay cells are geometry-agnostic, so uncaptured g1 still reaches replay through its echo rows |
+| Served geometries | Exactly one per engine, g0 or g1; any other set rejected at configuration and its rows at row admission; CHUNK cells declared, and `replay` cells captured, at the served geometry | (a) g0 and g1 together in one engine; (b) a general geometry set over every published cadence; (c) other geometries captured but unvalidated, or left uncaptured and counted | g1 is the default cadence, and one served geometry keeps the inventory at three cells per population; (a) has no mixed-geometry use yet, raises the inventory to five cells per population, makes `multi-geometry` reachable, may need a geometry key on `replay` cells (Open Question 6), and cannot run with the CHUNK-bucket binding, which accepts only `[1]`; (b) adds the costs of (a) for cadences with no accepted-row evidence; (c) `replay` cells key no geometry, so an unvalidated or uncaptured geometry still reaches replay through its echo rows |
+| CHUNK-bucket binding at g1 | Composes with the option: flat capture records the bucket's eager body, while eager steps launch its graph; accepted-row bitwise equality between the two is a test obligation, with the bucket on and off and at a population outside its set; its scratch joins post-warmup verification | Require it off; require it on; nest its graph launch inside the outer graph | Both arms are served g1 configurations, and the bucket graph is the eager reference when it is on; flat capture already covers its kernels, and a nested launch keeps its per-region cost and separate pool (Capture shape); because replay and eager run different nested paths and neither self-check covers accepted rows, equivalence must be tested rather than inferred |
 | Admission method | Model-local: retain the full admission inventory over stand-in storage through the profile window, then check `S <= A` | (a) Reserved-memory delta of serving capture; (b) placeholder tensor of the measured size; (c) extrapolate from one cell; (d) core graph estimator; (e) measure the admission capture's normalized delta and peak, release it, and charge both through a core accounting hook before capacity selection | (a) and (b) miss graph-exec memory, fragmentation and peak; (c) is unsound without reuse; (d) does not see model graphs; (e) is viable but needs a new core hook and an explicit composition of the measured peak with the profile peak, while retention reuses the existing window unchanged |
 | Graph pool | One dedicated pool per inventory | Platform global pool shared with nested graphs | Releasing admission must return exactly its segments, whatever stream serving capture uses |
 | Failure boundary | All step allocations before replay; any failure from the launch on is worker-fatal with a latch | Roll back pages; fall back to eager after a replay error | Body and scatters are one launch, so partial mutation is unknowable; rollback needs hot-path snapshots |
@@ -815,14 +968,38 @@ extension.
    g0. Proposal: no fixed cap; configuration rejects a declaration whose
    projected startup, extrapolated from the probe's per-cell cost, exceeds
    half of the ready timeout.
-6. **g1 extension.** Whether `replay` cells need a geometry key once more than
-   one geometry is served, and what g1 evidence lifts the restriction.
-   **Probe:** a g1-only bitwise lockstep run with accepted rows of every kind,
-   and a mixed g0/g1 row-level replay comparison.
+6. **More than one served geometry.** Outside the envelope; each engine
+   captures `replay` cells at its one served geometry (One served geometry).
+   Open if a mixed-geometry use appears: whether a `replay` cell captured with
+   rows of one geometry replays rows of another bitwise. Replay rows read their
+   cadence from staged arena data (`advance.py:3196-3199`) and check the book's
+   geometry as data (`advance.py:3440`), which suggests no geometry key is
+   needed; no test establishes it. Also open: how `multi-geometry` steps are
+   counted, and how the CHUNK-bucket binding, which accepts only `[1]`,
+   composes. **Probe:** a `replay` cell captured with g0 rows, replaying
+   accepted g1 park-echo, FLUSH and forced-endpoint rows, compared with eager
+   bitwise.
 7. **Lazily bound encoder buffers.** Whether any served stream rebinds them
    after warm-up, which would cause a permanent `signature` fallback.
    **Probe:** a long-stream run with the `signature` counter and the
-   lazy-buffer layout logged per step.
+   lazy-buffer layout logged per step, at each servable geometry. g1 windows
+   are wider than g0's; materialization extends `encoder.pos_enc.pe` to its
+   cap (`encoder_execution.py:980`), so a g1 stream is expected to leave its
+   layout unchanged; the probe must check this on long g1 streams.
+8. **Rejection reason of g1 capture rows.** Capture inputs are zero
+   embeddings, whose envelope header names geometry 0, while the capture plan
+   names the served geometry (`transaction_graph.py:626-666`). At g1 the rows
+   therefore also carry `ROW_STATUS_GEOMETRY`. The self-check requires only
+   that every capture row is rejected and no page is stored, which holds
+   either way. Open: whether capture rows should carry a header naming the
+   served geometry, so the rejected-row path is the same at g0 and g1.
+9. **`multi-geometry` under one served geometry.** Unreachable: the served set
+   is a singleton, and `bind_rows` rejects any other geometry before the
+   registry mutates. Mixed geometry stays under Open Question 6.
+10. **Admission per CHUNK-bucket arm.** With the bucket on, the transaction
+    captures record the bucket's eager-body intermediates, so `A` and `S`
+    differ between the two arms. Admission is per configuration, so `S <= A`
+    is unaffected. **Probe:** report `A` and `S` for each arm.
 
 ## Acceptance Criteria
 
