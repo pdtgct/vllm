@@ -17,7 +17,7 @@ import sys
 import weakref
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -61,7 +61,7 @@ from tests.models.nemotron_asr.test_decode_graph_binding import (
 from tests.models.nemotron_asr.test_decode_graph_binding import (
     _runtime as _decode_runtime,
 )
-from tests.models.nemotron_asr.test_plan_local import _bind, _feature, _row
+from tests.models.nemotron_asr.test_plan_local import _bind, _feature, _header, _row
 from tests.utils import create_new_process_for_each_test
 from vllm.config.compilation import CUDAGraphMode
 from vllm.models.nemotron_asr import profile_execution
@@ -79,7 +79,13 @@ from vllm.models.nemotron_asr.commit_sink import (
     BoundedCommitSink,
     resolve_status_reports,
 )
-from vllm.models.nemotron_asr.decode_graph import DenseGraphBinding, GraphRuntime
+from vllm.models.nemotron_asr.decode_graph import (
+    DenseGraphBinding,
+    GraphRuntime,
+    execution_tiers,
+)
+from vllm.models.nemotron_asr.frontend import ROW_STATUS_FINAL_OVERSIZE
+from vllm.models.nemotron_asr.manifests import served_geometry_ids
 from vllm.models.nemotron_asr.model_state_v2 import NemotronASRModelState
 from vllm.models.nemotron_asr.plan import SessionRegistry
 from vllm.models.nemotron_asr.state_profile import (
@@ -99,6 +105,80 @@ Pools = dict[str, Any]
 #: The page every synthetic pool's scatter warm-up names: not the null page,
 #: and inside each of these pools, which all hold at least two pages.
 WARM_BLOCK = 1
+#: Raw samples of one regular g1 (160 ms) CHUNK, ``C·hop`` at hop 160.
+G1_SAMPLES = 2_560
+#: Regular CHUNK samples per served ``CADENCES`` index.
+_CADENCE_SAMPLES = {GEOM_REG: REG_SAMPLES, 1: G1_SAMPLES, GEOM_FINAL: FINAL_SAMPLES}
+
+
+@dataclass(frozen=True)
+class _Served:
+    """One served test configuration (design: Acceptance Criteria preamble).
+
+    ``geometry`` is the served ``CADENCES`` index, which equals its lookahead
+    for g0 and g1; ``bucket`` is ``chunk_bucket_graph_populations``. A
+    bucket-on configuration also serves the graphed encoder and decode arms
+    and ``max_num_seqs`` 64, which meets every bucket population's tier
+    condition.
+    """
+
+    name: str
+    geometry: int
+    bucket: tuple[int, ...] = ()
+
+    @property
+    def samples(self) -> int:
+        return _CADENCE_SAMPLES[self.geometry]
+
+    def hf(self) -> dict[str, Any]:
+        hf: dict[str, Any] = {"supported_num_lookahead_tokens": [self.geometry]}
+        if self.bucket:
+            hf.update(
+                chunk_bucket_graph_populations=list(self.bucket),
+                encoder_execution_arm="eager-graphed",
+                decode_dispatch_arm="dense-graphed",
+            )
+        return hf
+
+    def engine(self) -> dict[str, Any]:
+        if not self.bucket:
+            return {}
+        return {"max_num_seqs": 64, "max_num_batched_tokens": 64}
+
+    def label(self, kind: str, population: int) -> str:
+        """The label of the ``kind`` cell at ``population``, as the binding names it."""
+        if kind == tg.CELL_REPLAY:
+            return f"{kind}:b{population}"
+        return f"{kind}:g{self.geometry}:b{population}"
+
+    def cell(self, kind: str, population: int) -> tg.TransactionCell:
+        geometry = -1 if kind == tg.CELL_REPLAY else self.geometry
+        return tg.TransactionCell(kind, geometry, population)
+
+
+G0 = _Served("g0", GEOM_REG)
+G1 = _Served("g1", 1)
+G1_BUCKET = _Served("g1-bucket", 1, (1, 31, 63))
+#: g1 with bucket populations 1 and 63, so population 31 resolves the
+#: bucket's eager path (TXG-REP-010, TXG-REP-019).
+G1_BUCKET_1_63 = _Served("g1-bucket-1-63", 1, (1, 63))
+#: The test configurations M: g0; g1 with the CHUNK-bucket binding off; g1
+#: with ``chunk_bucket_graph_populations`` ``[1, 31, 63]``.
+M = (G0, G1, G1_BUCKET)
+#: M and g1 with bucket populations ``[1, 63]``.
+M_AND_1_63 = (*M, G1_BUCKET_1_63)
+#: The g1 configurations TXG-REP-019 runs in.
+G1_CONFIGURATIONS = (G1, G1_BUCKET, G1_BUCKET_1_63)
+
+
+def _over(configurations: tuple[_Served, ...]) -> Any:
+    """Parametrize a test's ``served`` argument over ``configurations``."""
+    return pytest.mark.parametrize(
+        "served", configurations, ids=[served.name for served in configurations]
+    )
+
+
+over_m = _over(M)
 
 
 # ---- runtimes --------------------------------------------------------------
@@ -368,25 +448,53 @@ def _binding(
     *,
     populations: tuple[int, ...] = (1, 2),
     device: torch.device = CPU,
+    geometry: int = GEOM_REG,
 ) -> tg.TransactionGraphBinding:
     binding = tg.TransactionGraphBinding(
         populations=list(populations),
-        geometries=(GEOM_REG,),
-        maximum_population=4,
+        geometries=(geometry,),
+        maximum_population=max(4, *populations),
         vllm_config=object(),
         runtime=runtime,
     )
     if device.type == "cuda":
         advance.warmup_advance_model_rows_scatter(**pools, block_id=WARM_BLOCK)
-    binding.capture(
-        core,
-        pools=_transaction_pools(pools),
-        call=call,
-        hidden_size=CARRIER_HIDDEN,
-        device=device,
-        pool_layout={},
-    )
+    _serve(binding, core, call, _transaction_pools(pools), device)
     return binding
+
+
+def _served_setup(
+    monkeypatch: pytest.MonkeyPatch,
+    served: _Served,
+    *,
+    device: torch.device = CPU,
+    endpoint: bool = True,
+    num_blocks: int = 4,
+) -> tuple[Any, tg.TransactionCallBindings, Pools]:
+    """The core, call bindings and resident pools of ``served``, binding level.
+
+    Without the CHUNK-bucket binding they are the tiny core, its eager call
+    bindings and synthetic pools. With it they are a warmed model's: the
+    bucket binding as ``bucket_transition``, the dense decode binding and the
+    graphed encoder, each over the test runtime of ``device``, with pools of
+    the model's resident layout. ``endpoint`` selects the ``endpoint_enabled``
+    pool configuration.
+    """
+    if not served.bucket:
+        core = _core(device)
+        call = _call_bindings(core, endpoint=endpoint)
+        return core, call, _endpoint_pools(num_blocks, device, endpoint=endpoint)
+    model, _config = _model(
+        monkeypatch, served=served, device=device, transaction_graph_populations=[]
+    )
+    model.prepare_execution_memory()
+    assert model._chunk_bucket_binding.ready
+    call = _model_call(model)
+    pools = _pool_arguments(_transaction_view(_scratch(num_blocks, device)))
+    if not endpoint:
+        call = replace(call, eou_token_id=None)
+        del pools["endpoint_history_pool"], pools["endpoint_book_pool"]
+    return model.core, call, pools
 
 
 # ---- model, stand-in storage and memory-reading fixtures -------------------
@@ -454,20 +562,40 @@ def _engine_config(
     cudagraph_mm_encoder: bool = False,
     num_gpu_blocks_override: int | None = None,
     kv_cache_memory_bytes: int | None = None,
+    async_scheduling: bool = False,
+    speculative_config: Any = None,
+    parallel_sizes: dict[str, int] | None = None,
+    enable_expert_parallel: bool = False,
+    logits_processors: Any = None,
 ) -> SimpleNamespace:
-    """The engine configuration fields the model and its state consumer read."""
+    """The engine configuration fields the model and its state consumer read.
+
+    ``parallel_sizes`` overrides the parallel configuration's ``*_size``
+    fields, each 1 by default.
+    """
+    sizes = {
+        name: 1
+        for name in (
+            "pipeline_parallel_size",
+            "tensor_parallel_size",
+            "data_parallel_size",
+            "decode_context_parallel_size",
+            "prefill_context_parallel_size",
+        )
+    }
+    sizes.update(parallel_sizes or {})
     return SimpleNamespace(
         model_config=SimpleNamespace(
             hf_config=hf_config,
             dtype=torch.float32,
             max_model_len=143,
-            logits_processors=None,
+            logits_processors=logits_processors,
             get_inputs_embeds_size=lambda: CARRIER_HIDDEN,
         ),
         scheduler_config=SimpleNamespace(
             max_num_seqs=max_num_seqs,
             max_num_batched_tokens=max_num_batched_tokens,
-            async_scheduling=False,
+            async_scheduling=async_scheduling,
         ),
         cache_config=SimpleNamespace(
             num_gpu_blocks_override=num_gpu_blocks_override,
@@ -479,14 +607,10 @@ def _engine_config(
             cudagraph_mm_encoder=cudagraph_mm_encoder,
         ),
         parallel_config=SimpleNamespace(
-            pipeline_parallel_size=1,
-            tensor_parallel_size=1,
-            data_parallel_size=1,
-            decode_context_parallel_size=1,
-            prefill_context_parallel_size=1,
-            enable_expert_parallel=False,
+            **sizes,
+            enable_expert_parallel=enable_expert_parallel,
         ),
-        speculative_config=None,
+        speculative_config=speculative_config,
         attention_config=SimpleNamespace(hisparse_config=None),
     )
 
@@ -497,14 +621,26 @@ def _model(
     runtime: Callable[[], GraphRuntime] = _rerun_runtime,
     device: torch.device = CPU,
     engine: dict[str, Any] | None = None,
+    served: _Served | None = None,
     **hf: Any,
 ) -> tuple[Any, SimpleNamespace]:
     """Construct the served model around the tiny core.
 
     ``runtime`` builds the outer transaction runtime; ``engine`` overrides
-    engine fields and ``hf`` the served configuration.
+    engine fields and ``hf`` the served configuration. ``served`` supplies the
+    served geometry and CHUNK-bucket fields beneath ``hf`` and ``engine``; with
+    the bucket on, the nested encoder and decode bindings capture through the
+    test runtime of ``device``.
     """
-    from vllm.models.nemotron_asr import nemotron_asr
+    from vllm.models.nemotron_asr import decode_graph, encoder_execution, nemotron_asr
+
+    if served is not None:
+        hf = {**served.hf(), **hf}
+        engine = {**served.engine(), **(engine or {})}
+        if served.bucket:
+            nested = _cuda_runtime if device.type == "cuda" else _rerun_runtime
+            monkeypatch.setattr(encoder_execution, "platform_graph_runtime", nested)
+            monkeypatch.setattr(decode_graph, "platform_graph_runtime", nested)
 
     def make_core(**kwargs: Any) -> torch.nn.Module:
         core = torch.nn.Module()
@@ -674,10 +810,11 @@ def _readings(*values: int) -> Callable[[int], int]:
 def _admission_binding(
     populations: tuple[int, ...] = (1, 2),
     runtime: GraphRuntime | None = None,
+    geometry: int = GEOM_REG,
 ) -> tg.TransactionGraphBinding:
     return tg.TransactionGraphBinding(
         populations=list(populations),
-        geometries=(GEOM_REG,),
+        geometries=(geometry,),
         maximum_population=max(populations),
         vllm_config=object(),
         runtime=runtime or _rerun_runtime(),
@@ -692,9 +829,15 @@ def _admit(
     device: torch.device = CPU,
 ) -> None:
     """Admission capture over stand-in storage, as ``prepare_execution_memory``."""
-    _seam(binding, "admit")(
-        core, allocate=stand_in, call=call, hidden_size=CARRIER_HIDDEN, device=device
-    )
+    admit = _seam(binding, "admit")
+    with _bucket_mode(call):
+        admit(
+            core,
+            allocate=stand_in,
+            call=call,
+            hidden_size=CARRIER_HIDDEN,
+            device=device,
+        )
 
 
 def _serve(
@@ -705,14 +848,15 @@ def _serve(
     device: torch.device = CPU,
 ) -> None:
     """Serving capture over resident pools, as ``capture_transaction_graphs``."""
-    binding.capture(
-        core,
-        pools=pools,
-        call=call,
-        hidden_size=CARRIER_HIDDEN,
-        device=device,
-        pool_layout={},
-    )
+    with _bucket_mode(call):
+        binding.capture(
+            core,
+            pools=pools,
+            call=call,
+            hidden_size=CARRIER_HIDDEN,
+            device=device,
+            pool_layout={},
+        )
 
 
 def _track_capture_cells(
@@ -903,6 +1047,8 @@ def cpu_readings(
 
 def _model_call(model: Any) -> tg.TransactionCallBindings:
     """The call bindings the model's serving capture uses."""
+    decoder = model._decode_graph_binding
+    tier = {} if decoder is None else {"execution_tier": decoder.execution_tier}
     return tg.TransactionCallBindings(
         adapter=model._emission_adapter,
         decode_resolver=model._decode_resolver,
@@ -912,6 +1058,7 @@ def _model_call(model: Any) -> tg.TransactionCallBindings:
         park_id=PARK_ID,
         eou_token_id=EOU,
         graph_covers_decode=model._decode_graph_binding is not None,
+        **tier,
     )
 
 
@@ -951,12 +1098,19 @@ def _schedule(
     return step
 
 
+def _model_geometry(model: Any) -> int:
+    """The one geometry ``model`` serves, as a ``CADENCES`` index."""
+    (geometry,) = served_geometry_ids(model.config)
+    return geometry
+
+
 def _serve_session(
     model: Any, state: NemotronASRModelState, slots: StateSlotBindings
 ) -> list[int]:
-    """One g0 session: a fresh CHUNK, then its echoes until it parks."""
+    """One session at the served geometry: a fresh CHUNK, then its echoes until
+    it parks."""
     layer = model._persistent_state_layer.prefix
-    audio = _chunk(17, seq=0, geometry=GEOM_REG, final=False, prompt=0)
+    audio = _chunk(17, seq=0, geometry=_model_geometry(model), final=False, prompt=0)
     token, emitted = PLACEHOLDER_ID, []
     for computed in range(CAP + 2):
         step = _schedule(slots, layer, {"left": token})
@@ -1005,9 +1159,10 @@ def _serve_session(
 def _chunk_forward(
     model: Any, state: NemotronASRModelState, slots: StateSlotBindings
 ) -> None:
-    """Session ``left``'s fresh g0 CHUNK step, up to its commit collection."""
+    """Session ``left``'s fresh CHUNK step at the served geometry, up to its
+    commit collection."""
     layer = model._persistent_state_layer.prefix
-    audio = _chunk(17, seq=0, geometry=GEOM_REG, final=False, prompt=0)
+    audio = _chunk(17, seq=0, geometry=_model_geometry(model), final=False, prompt=0)
     step = _schedule(slots, layer, {"left": PLACEHOLDER_ID})
     state.prepare_step(step, dummy_run=False, is_profile=False)
     slots.begin_step(step, SimpleNamespace(wait_stream=lambda _: None))
@@ -1094,11 +1249,15 @@ def _rows(
     chunk: list[bool] | None = None,
     num_pool_blocks: int = 4,
     device: torch.device = CPU,
+    geometry: int = GEOM_REG,
 ) -> Rows:
-    """Ids, carriers and plan: echo rows on ``decodes``, then CHUNK rows."""
+    """Ids, carriers and plan: echo rows on ``decodes``, then CHUNK rows.
+
+    Every row names ``geometry`` unless ``geometries`` names each row's.
+    """
     fresh = [True] * len(prefills) if fresh is None else fresh
     rows = len(decodes) + len(prefills)
-    geometries = [GEOM_REG] * rows if geometries is None else geometries
+    geometries = [geometry] * rows if geometries is None else geometries
     chunk = [False] * len(decodes) + [True] * len(prefills) if chunk is None else chunk
     carriers = [
         _chunk(5 + row, seq=0, geometry=geometries[row], final=False, prompt=0)
@@ -1119,6 +1278,28 @@ def _rows(
     return ids, embeds.to(device), plan
 
 
+def _bucket_mode(call: tg.TransactionCallBindings) -> Any:
+    """Inference mode when ``call`` routes CHUNK buckets through the bucket binding.
+
+    The bucket's sealed transitions and the guarded encoder transition were
+    warmed under inference mode, as the model runs, and their signatures
+    include the tensors' dispatch keys.
+    """
+    return torch.inference_mode() if call.bucket_transition else nullcontext()
+
+
+def _tiered(plan: Any, call: tg.TransactionCallBindings) -> Any:
+    """``plan`` with the decode execution tier the model assigns its CHUNK rows.
+
+    A plan that already names a tier, or a call whose graphs do not cover the
+    decode, keeps its tier.
+    """
+    chunk_rows = int(plan.is_chunk.sum())
+    if not call.graph_covers_decode or not chunk_rows or plan.execution_tier:
+        return plan
+    return replace(plan, execution_tier=call.execution_tier(chunk_rows))
+
+
 def _advance(
     core: Any,
     pools: Pools,
@@ -1130,24 +1311,26 @@ def _advance(
 ) -> torch.Tensor:
     """One ``advance_model_rows`` call over ``rows`` and ``pools``."""
     ids, embeds, plan = rows
-    return advance.advance_model_rows(
-        core,
-        torch.tensor(ids, dtype=torch.long, device=embeds.device),
-        embeds,
-        plan,
-        adapter=call.adapter,
-        decode_resolver=call.decode_resolver,
-        encoder_transition=call.encoder_transition,
-        bucket_transition=call.bucket_transition,
-        placeholder_id=PLACEHOLDER_ID,
-        park_id=PARK_ID,
-        eou_token_id=call.eou_token_id,
-        commit_sink=sink,
-        graph_covers_decode=call.graph_covers_decode,
-        transaction_graph=graph,
-        **kwargs,
-        **pools,
-    )
+    plan = _tiered(plan, call)
+    with _bucket_mode(call):
+        return advance.advance_model_rows(
+            core,
+            torch.tensor(ids, dtype=torch.long, device=embeds.device),
+            embeds,
+            plan,
+            adapter=call.adapter,
+            decode_resolver=call.decode_resolver,
+            encoder_transition=call.encoder_transition,
+            bucket_transition=call.bucket_transition,
+            placeholder_id=PLACEHOLDER_ID,
+            park_id=PARK_ID,
+            eou_token_id=call.eou_token_id,
+            commit_sink=sink,
+            graph_covers_decode=call.graph_covers_decode,
+            transaction_graph=graph,
+            **kwargs,
+            **pools,
+        )
 
 
 def _prepared(
@@ -1155,25 +1338,27 @@ def _prepared(
 ) -> Any:
     """The host prologue's ``TransactionInputs`` for ``rows``."""
     ids, embeds, plan = rows
-    return advance.prepare_transaction(
-        core,
-        torch.tensor(ids, dtype=torch.long, device=embeds.device),
-        embeds,
-        plan,
-        pools=_transaction_pools(pools),
-        eou_token_id=call.eou_token_id,
-        adapter=call.adapter,
-        decode_resolver=call.decode_resolver,
-        encoder_transition=call.encoder_transition,
-        bucket_transition=call.bucket_transition,
-        placeholder_id=PLACEHOLDER_ID,
-        park_id=PARK_ID,
-        has_commit_sink=True,
-        capture=False,
-        graph_covers_decode=call.graph_covers_decode,
-        memory_profile=False,
-        native_burst_handoff=None,
-    )
+    plan = _tiered(plan, call)
+    with _bucket_mode(call):
+        return advance.prepare_transaction(
+            core,
+            torch.tensor(ids, dtype=torch.long, device=embeds.device),
+            embeds,
+            plan,
+            pools=_transaction_pools(pools),
+            eou_token_id=call.eou_token_id,
+            adapter=call.adapter,
+            decode_resolver=call.decode_resolver,
+            encoder_transition=call.encoder_transition,
+            bucket_transition=call.bucket_transition,
+            placeholder_id=PLACEHOLDER_ID,
+            park_id=PARK_ID,
+            has_commit_sink=True,
+            capture=False,
+            graph_covers_decode=call.graph_covers_decode,
+            memory_profile=False,
+            native_burst_handoff=None,
+        )
 
 
 class _PermissiveLease:
@@ -1265,15 +1450,21 @@ def _collected_step(
     return (out.cpu(), status, progress), failed
 
 
-def _leased(request_id: str, block: int) -> tuple[SessionRegistry, _TrackedSink, Rows]:
+def _leased(
+    request_id: str, block: int, geometry: int = GEOM_REG
+) -> tuple[SessionRegistry, _TrackedSink, Rows]:
     """A registry holding one fresh session's lease, its sink and CHUNK rows."""
     registry = SessionRegistry()
-    [bound] = _bind(registry, [_row(request_id, block, chunk=True, prior=False)])
-    ids, embeds, _plan_rows = _rows([], [block])
+    header = _header(geometry=geometry, valid=_CADENCE_SAMPLES[geometry])
+    [bound] = _bind(
+        registry, [_row(request_id, block, chunk=True, prior=False, header=header)]
+    )
+    ids, embeds, _plan_rows = _rows([], [block], geometry=geometry)
     plan = _plan(
         prefills=[block],
         num_pool_blocks=4,
         generations=[bound.admission_generation],
+        geometries=[geometry],
         request_ids=(request_id,),
     )
     return registry, _TrackedSink(registry), (ids, embeds, plan)
@@ -1291,7 +1482,7 @@ def _chunk(
     """One CHUNK envelope; ``samples`` defaults to the geometry's cadence."""
     torch.manual_seed(seed)
     if samples is None:
-        samples = FINAL_SAMPLES if geometry == GEOM_FINAL else REG_SAMPLES
+        samples = _CADENCE_SAMPLES[geometry]
     return _envelope(
         torch.randn(samples) * 0.01,
         final=final,
@@ -1306,15 +1497,17 @@ def _drive(
     pools: Pools,
     call: tg.TransactionCallBindings,
     graph: Any,
+    geometry: int = GEOM_REG,
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """Two sessions through fresh, continuing and final CHUNKs plus echoes.
 
     Rows use block ids, prompts, row orders and endpoint policies that differ
-    from the capture inputs, and the populations change between steps.
+    from the capture inputs, and the populations change between steps. Every
+    session serves ``geometry``.
     """
     device = pools["book_pool"].device
     records: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
-    sessions = {"a": (2, GEOM_REG, 1), "c": (3, GEOM_REG, 2)}
+    sessions = {"a": (2, geometry, 1), "c": (3, geometry, 2)}
     policies = {"a": (1, 2, 1), "c": (0, 0, 0)}
 
     def echo(tokens: dict[str, int]) -> None:
@@ -1353,7 +1546,7 @@ def _drive(
                     geometry=sessions[name][1],
                     final=final,
                     prompt=sessions[name][2],
-                    samples=REG_SAMPLES // 2 if final else None,
+                    samples=_CADENCE_SAMPLES[geometry] // 2 if final else None,
                 )
                 for index, name in enumerate(names)
             ]
@@ -1382,7 +1575,7 @@ def _drive(
     chunk(["a", "c"], 0, fresh=True, final=False)
     chunk(["c", "a"], 1, fresh=False, final=False)
     chunk(["a"], 2, fresh=False, final=False)
-    sessions["b"] = (1, GEOM_REG, 3)
+    sessions["b"] = (1, geometry, 3)
     policies["b"] = (1, 1, 0)
     chunk(["b"], 0, fresh=True, final=True)
     return records
@@ -1395,17 +1588,22 @@ def _assert_records_equal(actual: list[Any], expected: list[Any]) -> None:
             torch.testing.assert_close(left.cpu(), right.cpu(), atol=0, rtol=0)
 
 
-def _replay_parity(device: torch.device, runtime: GraphRuntime) -> None:
-    core = _core(device)
-    call = _call_bindings(core)
-    eager_pools = _endpoint_pools(4, device)
+def _replay_parity(
+    device: torch.device,
+    runtime: GraphRuntime,
+    monkeypatch: pytest.MonkeyPatch,
+    served: _Served = G0,
+) -> None:
+    core, call, eager_pools = _served_setup(monkeypatch, served, device=device)
     graph_pools = _clone_pools(eager_pools)
-    binding = _binding(core, graph_pools, call, runtime, device=device)
+    binding = _binding(
+        core, graph_pools, call, runtime, device=device, geometry=served.geometry
+    )
     _assert_pools_equal(graph_pools, eager_pools)
     assert binding.ready
 
-    expected = _drive(core, eager_pools, call, None)
-    actual = _drive(core, graph_pools, call, binding)
+    expected = _drive(core, eager_pools, call, None, served.geometry)
+    actual = _drive(core, graph_pools, call, binding, served.geometry)
 
     _assert_records_equal(actual, expected)
     _assert_pools_equal(graph_pools, eager_pools)
@@ -1419,13 +1617,14 @@ def _replay_parity(device: torch.device, runtime: GraphRuntime) -> None:
     counts = binding.counters()
     assert counts["fallbacks"] == 0
     assert counts["replays"] == len(expected)
-    for label in (
-        "chunk-fresh:g0:b2",
-        "chunk-continuing:g0:b2",
-        "chunk-continuing:g0:b1",
-        "chunk-fresh:g0:b1",
-        "replay:b1",
+    for kind, population in (
+        (tg.CELL_FRESH_CHUNK, 2),
+        (tg.CELL_CONTINUING_CHUNK, 2),
+        (tg.CELL_CONTINUING_CHUNK, 1),
+        (tg.CELL_FRESH_CHUNK, 1),
+        (tg.CELL_REPLAY, 1),
     ):
+        label = served.label(kind, population)
         assert counts[f"replays:{label}"] >= 1, label
 
 
@@ -1441,13 +1640,15 @@ def _drive_population(
     population: int,
     *,
     chunks: int,
+    geometry: int = GEOM_REG,
 ) -> tuple[list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]], int]:
     """``population`` sessions in lockstep: one fresh, then continuing CHUNKs.
 
     Sessions own descending block ids and mixed prompts, the row order changes
     every CHUNK and every CHUNK drains its echoes before the next one, so
     every CHUNK step is one declared cell. Echo steps shrink as rows park.
-    Returns the records and the number of echo transactions.
+    Every session serves ``geometry``. Returns the records and the number of
+    echo transactions.
     """
     device = pools["book_pool"].device
     names = [f"s{index}" for index in range(population)]
@@ -1466,7 +1667,7 @@ def _drive_population(
                 _chunk(
                     101 * seq + names.index(name),
                     seq=seq,
-                    geometry=GEOM_REG,
+                    geometry=geometry,
                     final=False,
                     prompt=prompt[name],
                 )
@@ -1478,6 +1679,7 @@ def _drive_population(
             num_pool_blocks=population + 1,
             has_initial=[seq > 0] * population,
             prompts=[prompt[name] for name in order],
+            geometries=[geometry] * population,
             request_ids=tuple(order),
         )
         record = _step(
@@ -1499,6 +1701,7 @@ def _drive_population(
                 decodes=[block[name] for name in active],
                 num_pool_blocks=population + 1,
                 prompts=[prompt[name] for name in active],
+                geometries=[geometry] * len(active),
                 request_ids=tuple(active),
             )
             record = _step(
@@ -1526,6 +1729,8 @@ def _population_parity(
     *,
     chunks: int,
     endpoint: bool = True,
+    monkeypatch: pytest.MonkeyPatch,
+    served: _Served = G0,
 ) -> None:
     """Lockstep CHUNKs at ``population`` replay their cells bitwise exactly.
 
@@ -1533,35 +1738,44 @@ def _population_parity(
     steps whose population shrank may fall back, as ``undeclared``.
     ``endpoint`` selects the ``endpoint_enabled`` pool configuration.
     """
-    core = _core(device)
-    call = _call_bindings(core, endpoint=endpoint)
-    eager_pools = _endpoint_pools(population + 1, device, endpoint=endpoint)
+    core, call, eager_pools = _served_setup(
+        monkeypatch,
+        served,
+        device=device,
+        endpoint=endpoint,
+        num_blocks=population + 1,
+    )
     graph_pools = _clone_pools(eager_pools)
     binding = tg.TransactionGraphBinding(
         populations=[population],
-        geometries=(GEOM_REG,),
+        geometries=(served.geometry,),
         maximum_population=population,
         vllm_config=object(),
         runtime=runtime,
     )
     if device.type == "cuda":
         advance.warmup_advance_model_rows_scatter(**graph_pools, block_id=WARM_BLOCK)
-    binding.capture(
-        core,
-        pools=_transaction_pools(graph_pools),
-        call=call,
-        hidden_size=CARRIER_HIDDEN,
-        device=device,
-        pool_layout={},
-    )
+    _serve(binding, core, call, _transaction_pools(graph_pools), device)
     _assert_pools_equal(graph_pools, eager_pools)
     assert binding.ready
 
     expected, echoes = _drive_population(
-        core, eager_pools, call, None, population, chunks=chunks
+        core,
+        eager_pools,
+        call,
+        None,
+        population,
+        chunks=chunks,
+        geometry=served.geometry,
     )
     actual, _ = _drive_population(
-        core, graph_pools, call, binding, population, chunks=chunks
+        core,
+        graph_pools,
+        call,
+        binding,
+        population,
+        chunks=chunks,
+        geometry=served.geometry,
     )
 
     _assert_records_equal(actual, expected)
@@ -1574,8 +1788,10 @@ def _population_parity(
     }
     assert emitted - {PARK_ID}, "the trajectory must emit labels"
     counts = binding.counters()
-    assert counts[f"replays:chunk-fresh:g0:b{population}"] == 1
-    assert counts[f"replays:chunk-continuing:g0:b{population}"] == chunks - 1
+    fresh = served.label(tg.CELL_FRESH_CHUNK, population)
+    continuing = served.label(tg.CELL_CONTINUING_CHUNK, population)
+    assert counts[f"replays:{fresh}"] == 1
+    assert counts[f"replays:{continuing}"] == chunks - 1
     echo_replays = counts[f"replays:replay:b{population}"]
     fallbacks = {
         key: value
@@ -1611,29 +1827,39 @@ def _functional_encoder() -> Iterator[None]:
         patch.undo()
 
 
-def _nested_launchers(modes: list[Any]) -> dict[str, Callable[[], Any]]:
+def _nested_launchers(
+    modes: list[Any], served: _Served = G0
+) -> dict[str, Callable[[], Any]]:
     """Captured encoder, decode and CHUNK-bucket entry points, by binding.
 
-    Every launch through them appends its graph mode to ``modes``.
+    Every launch through them appends its graph mode to ``modes``. The
+    encoder and decode entries serve ``served``'s geometry; the CHUNK-bucket
+    entry exists only when ``served`` has the bucket on.
     """
+    geometry = served.geometry
     encoder = encoder_tests.build_encoder_execution(
         encoder_tests._compiled_core(),
         encoder_tests._dense_graphed_config("eager-graphed"),
         maximum_population=1,
-        warmup_geometries=(0,),
+        warmup_geometries=(geometry,),
         vllm_config=object(),
         graph_runtime=_recording(encoder_tests._graph_runtime(), modes),
     )
+    shape = encoder._geometry_shapes[geometry]
 
     def encode(population: int = 1) -> Any:
         with _functional_encoder():
             return encoder.transition(
-                *encoder_tests._graph_transition_args(population=population)
+                *encoder_tests._graph_transition_args(
+                    population=population,
+                    mel_width=shape.mel_width,
+                    out_width=shape.out_width,
+                )
             )
 
     with _functional_encoder():
         encoder.warmup_domain(
-            expected_cells=((0, 1),),
+            expected_cells=((geometry, 1),),
             invoke=lambda _geometry, population: encode(population),
         )
     _, decode = _decode_calls()
@@ -1642,7 +1868,7 @@ def _nested_launchers(modes: list[Any]) -> dict[str, Callable[[], Any]]:
         predictor=object(),
         joint=object(),
         vllm_config=object(),
-        frame_widths=(2,),
+        frame_widths=(2,) * (geometry + 1),
         tiers=(1,),
         encoder_hidden=3,
         predictor_layers=2,
@@ -1651,7 +1877,7 @@ def _nested_launchers(modes: list[Any]) -> dict[str, Callable[[], Any]]:
         runtime=_recording(_decode_runtime(), modes),
     )
     dense.warmup(CPU, torch.float32)
-    decode_fn = dense.decode_fn(geometry=0, tier=1)
+    decode_fn = dense.decode_fn(geometry=geometry, tier=1)
     decode_state = rnnt.DecodeState(
         h=torch.ones(2, 1, 5), c=torch.ones(2, 1, 5), last_label=torch.tensor([4])
     )
@@ -1674,7 +1900,7 @@ def _nested_launchers(modes: list[Any]) -> dict[str, Callable[[], Any]]:
         capture_decode_fn=rnnt.decode_dense_masked_frames,
         decoder_tier=1,
     )
-    return {
+    launchers = {
         "encoder": encode,
         "decode": lambda: decode_fn(
             torch.ones(1, 2, 3), torch.tensor([2]), object(), object(), decode_state
@@ -1687,11 +1913,18 @@ def _nested_launchers(modes: list[Any]) -> dict[str, Callable[[], Any]]:
             decode_fn=rnnt.decode_dense_masked_frames,
         ),
     }
+    if not served.bucket:
+        del launchers["chunk-bucket"]
+    return launchers
 
 
 @pytest.mark.cpu_test
 @torch.inference_mode()
-def test_nested_bindings_run_eagerly_only_inside_the_capture_scope() -> None:
+@over_m
+def test_nested_bindings_run_eagerly_only_inside_the_capture_scope(
+    served: _Served,
+) -> None:
+    # @spec TXG-REP-007
     runtime = _rerun_runtime()
     assert nested_graph_mode(runtime) == "graph"
     with outer_transaction_capture():
@@ -1699,7 +1932,9 @@ def test_nested_bindings_run_eagerly_only_inside_the_capture_scope() -> None:
     assert nested_graph_mode(runtime) == "graph"
 
     modes: list[Any] = []
-    for name, launch in _nested_launchers(modes).items():
+    launchers = _nested_launchers(modes, served)
+    assert ("chunk-bucket" in launchers) == bool(served.bucket)
+    for name, launch in launchers.items():
         modes.clear()
         launch()
         with outer_transaction_capture():
@@ -1709,9 +1944,11 @@ def test_nested_bindings_run_eagerly_only_inside_the_capture_scope() -> None:
 
 
 @pytest.mark.cpu_test
-def test_host_staging_is_rejected_inside_the_capture_scope() -> None:
+@over_m
+def test_host_staging_is_rejected_inside_the_capture_scope(served: _Served) -> None:
+    # @spec TXG-REP-007
     staging = advance.HostStaging(4)
-    vector = torch.arange(2, dtype=torch.int64)
+    vector = torch.full((2,), served.geometry, dtype=torch.int64)
     with outer_transaction_capture():
         with pytest.raises(RuntimeError, match="frozen host source"):
             advance._h2d(vector, CPU)
@@ -1723,48 +1960,41 @@ def test_host_staging_is_rejected_inside_the_capture_scope() -> None:
 
 
 def _fresh_chunk_inputs(
-    core: Any, pools: Pools, call: tg.TransactionCallBindings, blocks: list[int]
+    core: Any,
+    pools: Pools,
+    call: tg.TransactionCallBindings,
+    blocks: list[int],
+    geometry: int = GEOM_REG,
 ) -> Any:
     plan = _policy(
-        _plan(prefills=blocks, num_pool_blocks=4, prompts=[1] * len(blocks)),
+        _plan(
+            prefills=blocks,
+            num_pool_blocks=4,
+            prompts=[1] * len(blocks),
+            geometries=[geometry] * len(blocks),
+        ),
         1,
         3,
         2,
     )
     device = pools["book_pool"].device
     embeds = torch.stack(
-        [_chunk(3, seq=0, geometry=GEOM_REG, final=False, prompt=1)] * len(blocks)
+        [_chunk(3, seq=0, geometry=geometry, final=False, prompt=1)] * len(blocks)
     ).to(device)
-    return advance.prepare_transaction(
-        core,
-        torch.full((len(blocks),), PLACEHOLDER_ID, dtype=torch.long, device=device),
-        embeds,
-        plan,
-        pools=_transaction_pools(pools),
-        eou_token_id=EOU,
-        adapter=call.adapter,
-        decode_resolver=call.decode_resolver,
-        encoder_transition=None,
-        bucket_transition=None,
-        placeholder_id=PLACEHOLDER_ID,
-        park_id=PARK_ID,
-        has_commit_sink=True,
-        capture=False,
-        graph_covers_decode=False,
-        memory_profile=False,
-        native_burst_handoff=None,
-    )
+    return _prepared(core, pools, call, ([PLACEHOLDER_ID] * len(blocks), embeds, plan))
 
 
 @pytest.mark.cpu_test
-def test_arena_stager_matches_live_staging_bit_identical() -> None:
-    core = _core()
-    call = _call_bindings(core)
-    live_pools = _endpoint_pools(4)
+@over_m
+def test_arena_stager_matches_live_staging_bit_identical(
+    monkeypatch: pytest.MonkeyPatch, served: _Served
+) -> None:
+    # @spec TXG-REP-008
+    core, call, live_pools = _served_setup(monkeypatch, served)
     arena_pools = _clone_pools(live_pools)
     for pools in (live_pools, arena_pools):
         pools["book_pool"][1:, _BOOK["last_label"]] = core.blank_id
-    inputs = _fresh_chunk_inputs(core, live_pools, call, [3, 1])
+    inputs = _fresh_chunk_inputs(core, live_pools, call, [3, 1], served.geometry)
     arena_inputs = replace(inputs, pools=_transaction_pools(arena_pools))
     arena = tg.TransactionArena(tg._arena_layout(inputs), CPU)
     arena.upload(arena_inputs)
@@ -1773,17 +2003,18 @@ def test_arena_stager_matches_live_staging_bit_identical() -> None:
 
     ids = torch.full((2,), PLACEHOLDER_ID, dtype=torch.long)
     embeds = torch.stack(
-        [_chunk(3, seq=0, geometry=GEOM_REG, final=False, prompt=1)] * 2
+        [_chunk(3, seq=0, geometry=served.geometry, final=False, prompt=1)] * 2
     )
-    live = advance.run_transaction_body(
-        core,
-        ids,
-        embeds,
-        inputs,
-        advance.LiveTransactionStager(inputs, advance.HostStaging(4)),
-    )
-    advance.execute_transaction_scatters(live.scatter_ops)
-    with outer_transaction_capture():
+    with _bucket_mode(call):
+        live = advance.run_transaction_body(
+            core,
+            ids,
+            embeds,
+            inputs,
+            advance.LiveTransactionStager(inputs, advance.HostStaging(4)),
+        )
+        advance.execute_transaction_scatters(live.scatter_ops)
+    with _bucket_mode(call), outer_transaction_capture():
         staged = advance.run_transaction_body(
             core, ids, embeds, arena_inputs, tg.ArenaTransactionStager(arena)
         )
@@ -1798,15 +2029,18 @@ def test_arena_stager_matches_live_staging_bit_identical() -> None:
 
 
 @pytest.mark.cpu_test
-def test_arena_rejects_vectors_outside_its_layout() -> None:
-    core = _core()
-    call = _call_bindings(core)
-    pools = _endpoint_pools(4)
+@over_m
+def test_arena_rejects_vectors_outside_its_layout(
+    monkeypatch: pytest.MonkeyPatch, served: _Served
+) -> None:
+    # @spec TXG-REP-005
+    core, call, pools = _served_setup(monkeypatch, served)
+    geometry = served.geometry
     arena = tg.TransactionArena(
-        tg._arena_layout(_fresh_chunk_inputs(core, pools, call, [1])), CPU
+        tg._arena_layout(_fresh_chunk_inputs(core, pools, call, [1], geometry)), CPU
     )
     with pytest.raises(ValueError, match="differs from the arena"):
-        arena.upload(_fresh_chunk_inputs(core, pools, call, [1, 2]))
+        arena.upload(_fresh_chunk_inputs(core, pools, call, [1, 2], geometry))
     with pytest.raises(ValueError, match="only int64 and bool"):
         tg.TransactionArena((("x", torch.float32, (1,)),), CPU)
 
@@ -1831,11 +2065,16 @@ class _FenceEvent:
 
 
 @pytest.mark.cpu_test
-def test_arena_alternates_host_buffers_across_calls() -> None:
-    core = _core()
-    call = _call_bindings(core)
-    pools = _endpoint_pools(4)
-    calls = [_fresh_chunk_inputs(core, pools, call, [block]) for block in (1, 3, 2)]
+@over_m
+def test_arena_alternates_host_buffers_across_calls(
+    monkeypatch: pytest.MonkeyPatch, served: _Served
+) -> None:
+    # @spec TXG-REP-008
+    core, call, pools = _served_setup(monkeypatch, served)
+    calls = [
+        _fresh_chunk_inputs(core, pools, call, [block], served.geometry)
+        for block in (1, 3, 2)
+    ]
     arena = tg.TransactionArena(tg._arena_layout(calls[0]), CPU)
     log: list[Any] = []
     arena._events = [_FenceEvent(index, arena, log) for index in range(2)]
@@ -1874,73 +2113,92 @@ _CLASSIFIED = {
     "replay": ([2, 4], [], [], {}),
     "empty": ([], [], [], {}),
     "fresh-non-chunk": ([], [2], [True], {"chunk": [False]}),
+    # The served geometry beside another; the test substitutes it.
     "multi-geometry": ([], [2, 4], [True, True], {"geometries": [0, GEOM_FINAL]}),
     "mixed-roles": ([2], [4], [True], {}),
     "mixed-fresh": ([], [2, 4], [True, False], {}),
 }
 
+#: The cell kind each covered classification case names.
 _CELLS = {
-    "chunk-fresh": tg.TransactionCell(tg.CELL_FRESH_CHUNK, GEOM_REG, 2),
-    "chunk-continuing": tg.TransactionCell(tg.CELL_CONTINUING_CHUNK, GEOM_REG, 2),
-    "replay": tg.TransactionCell(tg.CELL_REPLAY, -1, 2),
+    "chunk-fresh": tg.CELL_FRESH_CHUNK,
+    "chunk-continuing": tg.CELL_CONTINUING_CHUNK,
+    "replay": tg.CELL_REPLAY,
 }
 
 
 @pytest.mark.cpu_test
+@over_m
 @pytest.mark.parametrize("case", list(_CLASSIFIED))
-def test_classification_covers_declared_shapes_only(case: str) -> None:
-    core = _core()
-    call = _call_bindings(core)
-    pools = _endpoint_pools(6)
+def test_classification_covers_declared_shapes_only(
+    monkeypatch: pytest.MonkeyPatch, served: _Served, case: str
+) -> None:
+    # @spec TXG-REP-002
+    core, call, pools = _served_setup(monkeypatch, served, num_blocks=6)
     decodes, prefills, fresh, options = _CLASSIFIED[case]
-    rows = _rows(decodes, prefills, fresh, num_pool_blocks=6, **options)
+    if case == "multi-geometry" and served.bucket:
+        # Unreachable within the envelope; the bucket's dense decode binding
+        # serves only g1, so the eager call bindings classify this step.
+        core, call, pools = _served_setup(monkeypatch, G1, num_blocks=6)
+    if case == "multi-geometry":
+        options = {"geometries": [served.geometry, GEOM_FINAL]}
+    rows = _rows(
+        decodes,
+        prefills,
+        fresh,
+        num_pool_blocks=6,
+        geometry=served.geometry,
+        **options,
+    )
     assert rows[2].live_block_ids.tolist() == [1, 2, 3, 4, 5]
-    expected = (_CELLS[case], None) if case in _CELLS else (None, case)
+    expected = (served.cell(_CELLS[case], 2), None) if case in _CELLS else (None, case)
     assert tg.classify_transaction(_prepared(core, pools, call, rows)) == expected
 
 
 @pytest.mark.cpu_test
-def test_replay_matches_eager_across_varied_plans_on_cpu() -> None:
-    _replay_parity(CPU, _rerun_runtime())
+def test_replay_matches_eager_across_varied_plans_on_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _replay_parity(CPU, _rerun_runtime(), monkeypatch)
 
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize(("population", "chunks"), _POPULATION_CHUNKS)
 def test_population_lockstep_replays_every_chunk_on_cpu(
-    population: int, chunks: int
+    monkeypatch: pytest.MonkeyPatch, population: int, chunks: int
 ) -> None:
-    _population_parity(CPU, _rerun_runtime(), population, chunks=chunks)
+    _population_parity(
+        CPU, _rerun_runtime(), population, chunks=chunks, monkeypatch=monkeypatch
+    )
 
 
 def _corrupt_row_in_population(
-    device: torch.device, runtime: GraphRuntime, population: int
+    device: torch.device,
+    runtime: GraphRuntime,
+    population: int,
+    monkeypatch: pytest.MonkeyPatch,
+    served: _Served = G0,
 ) -> None:
     """One out-of-sequence row in a continuing population is rejected alone.
 
     Collection reports the same failed request under replay as under eager,
     and the rejection neither raises nor latches the binding.
     """
-    core = _core(device)
-    call = _call_bindings(core)
-    eager_pools = _endpoint_pools(population + 1, device)
+    geometry = served.geometry
+    core, call, eager_pools = _served_setup(
+        monkeypatch, served, device=device, num_blocks=population + 1
+    )
     graph_pools = _clone_pools(eager_pools)
     binding = tg.TransactionGraphBinding(
         populations=[population],
-        geometries=(GEOM_REG,),
+        geometries=(geometry,),
         maximum_population=population,
         vllm_config=object(),
         runtime=runtime,
     )
     if device.type == "cuda":
         advance.warmup_advance_model_rows_scatter(**graph_pools, block_id=WARM_BLOCK)
-    binding.capture(
-        core,
-        pools=_transaction_pools(graph_pools),
-        call=call,
-        hidden_size=CARRIER_HIDDEN,
-        device=device,
-        pool_layout={},
-    )
+    _serve(binding, core, call, _transaction_pools(graph_pools), device)
     blocks = list(range(1, population + 1))
     bad = population // 2
 
@@ -1954,7 +2212,7 @@ def _corrupt_row_in_population(
                     _chunk(
                         7 * seq + index,
                         seq=stamped,
-                        geometry=GEOM_REG,
+                        geometry=geometry,
                         final=False,
                         prompt=0,
                     )
@@ -1963,6 +2221,7 @@ def _corrupt_row_in_population(
                 prefills=blocks,
                 num_pool_blocks=population + 1,
                 has_initial=[seq > 0] * population,
+                geometries=[geometry] * population,
             )
             before = _clone_pools(pools)
             record, failed = _collected_step(
@@ -2005,6 +2264,7 @@ def _corrupt_row_in_population(
                     _plan(
                         decodes=[blocks[index] for index in active],
                         num_pool_blocks=population + 1,
+                        geometries=[geometry] * len(active),
                     ),
                     None,
                 )
@@ -2022,7 +2282,8 @@ def _corrupt_row_in_population(
     assert not bool(status[torch.arange(population) != bad].any())
     counts = binding.counters()
     assert counts["fallbacks"] == 0
-    assert counts[f"replays:chunk-continuing:g0:b{population}"] == 1
+    continuing = served.label(tg.CELL_CONTINUING_CHUNK, population)
+    assert counts[f"replays:{continuing}"] == 1
     _collected_step(
         core,
         graph_pools,
@@ -2033,6 +2294,7 @@ def _corrupt_row_in_population(
             [False] * population,
             num_pool_blocks=population + 1,
             device=device,
+            geometry=geometry,
         ),
         binding,
     )
@@ -2042,32 +2304,36 @@ def _corrupt_row_in_population(
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("population", [31, 63])
 def test_one_corrupt_row_in_a_population_is_rejected_alone_on_cpu(
-    population: int,
+    monkeypatch: pytest.MonkeyPatch, population: int
 ) -> None:
-    _corrupt_row_in_population(CPU, _rerun_runtime(), population)
+    _corrupt_row_in_population(CPU, _rerun_runtime(), population, monkeypatch)
 
 
 @pytest.mark.cpu_test
-def test_capture_input_stores_no_page_and_publishes_every_cell() -> None:
-    core = _core()
-    call = _call_bindings(core)
-    pools = _endpoint_pools(4)
+@over_m
+def test_capture_input_stores_no_page_and_publishes_every_cell(
+    monkeypatch: pytest.MonkeyPatch, served: _Served
+) -> None:
+    # @spec TXG-REP-001 / TXG-REP-009 / TXG-LIFE-001
+    core, call, pools = _served_setup(monkeypatch, served)
     for tensor in (pools["book_pool"], pools["queue_pool"]):
         tensor.fill_(3)
     before = _clone_pools(pools)
     launches: list[tuple[int, str]] = []
     binding = _binding(
-        core, pools, call, _logging_runtime(launches), populations=(1, 2)
+        core,
+        pools,
+        call,
+        _logging_runtime(launches),
+        populations=(1, 2),
+        geometry=served.geometry,
     )
     _assert_pools_equal(pools, before)
     assert binding.ready
     assert [cell.label for cell in binding.cells] == [
-        "chunk-continuing:g0:b1",
-        "chunk-continuing:g0:b2",
-        "chunk-fresh:g0:b1",
-        "chunk-fresh:g0:b2",
-        "replay:b1",
-        "replay:b2",
+        served.label(kind, population)
+        for kind in (tg.CELL_CONTINUING_CHUNK, tg.CELL_FRESH_CHUNK, tg.CELL_REPLAY)
+        for population in (1, 2)
     ]
     wrappers = sorted({index for index, _mode in launches})
     assert len(wrappers) == len(binding.cells)
@@ -2078,15 +2344,17 @@ def test_capture_input_stores_no_page_and_publishes_every_cell() -> None:
 
 
 @pytest.mark.cpu_test
-def test_capture_self_check_mismatch_publishes_nothing() -> None:
-    core = _core()
-    call = _call_bindings(core)
-    pools = _endpoint_pools(4)
+@over_m
+def test_capture_self_check_mismatch_publishes_nothing(
+    monkeypatch: pytest.MonkeyPatch, served: _Served
+) -> None:
+    # @spec TXG-REP-009
+    core, call, pools = _served_setup(monkeypatch, served)
     before = _clone_pools(pools)
     runtime = _logging_runtime([], corrupt=lambda _index: True)
     binding = tg.TransactionGraphBinding(
         populations=[1, 2],
-        geometries=(GEOM_REG,),
+        geometries=(served.geometry,),
         maximum_population=4,
         vllm_config=object(),
         runtime=runtime,
@@ -2101,11 +2369,13 @@ def test_capture_self_check_mismatch_publishes_nothing() -> None:
 
 
 @pytest.mark.cpu_test
-def test_cells_share_no_arena_static_input_or_owned_output() -> None:
-    core = _core()
-    call = _call_bindings(core)
-    pools = _endpoint_pools(4)
-    binding = _binding(core, pools, call, _rerun_runtime())
+@over_m
+def test_cells_share_no_arena_static_input_or_owned_output(
+    monkeypatch: pytest.MonkeyPatch, served: _Served
+) -> None:
+    # @spec TXG-REP-016
+    core, call, pools = _served_setup(monkeypatch, served)
+    binding = _binding(core, pools, call, _rerun_runtime(), geometry=served.geometry)
     storages: list[int] = []
     for graph in binding._graphs.values():
         for tensor in (
@@ -2124,40 +2394,39 @@ def test_cells_share_no_arena_static_input_or_owned_output() -> None:
 
 
 @pytest.mark.cpu_test
+@over_m
 def test_receipt_captures_largest_population_first_and_reports_cost(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, served: _Served
 ) -> None:
-    core = _core()
-    call = _call_bindings(core)
-    pools = _endpoint_pools(5)
+    # @spec TXG-REP-001 / TXG-OBS-004
+    core, call, pools = _served_setup(monkeypatch, served, num_blocks=5)
     binding = tg.TransactionGraphBinding(
         populations=[1, 4, 2],
-        geometries=(GEOM_REG,),
+        geometries=(served.geometry,),
         maximum_population=4,
         vllm_config=object(),
         runtime=_rerun_runtime(),
     )
     stand_in = _StandIn()
-    admitted, served = 1 << 20, (1 << 20) - 4096
+    admitted, serving = 1 << 20, (1 << 20) - 4096
     _free_memory(
         monkeypatch,
         lambda index: _budget(
-            stand_in.nbytes[0] if stand_in.nbytes else 0, admitted, served
+            stand_in.nbytes[0] if stand_in.nbytes else 0, admitted, serving
         )(index),
     )
     _admit(binding, core, call, stand_in)
     assert stand_in.slots == [5]
-    binding.capture(
-        core,
-        pools=_transaction_pools(pools),
-        call=call,
-        hidden_size=CARRIER_HIDDEN,
-        device=CPU,
-        pool_layout={},
-    )
+    _serve(binding, core, call, _transaction_pools(pools))
     receipt = binding.receipt()
     cells = {entry["cell"]: entry for entry in receipt["cells"]}
     assert len(cells) == 9 and all(entry["captured"] for entry in cells.values())
+    assert sorted(cells) == sorted(
+        served.label(kind, population)
+        for kind in (tg.CELL_FRESH_CHUNK, tg.CELL_CONTINUING_CHUNK, tg.CELL_REPLAY)
+        for population in (1, 2, 4)
+    )
+    assert receipt["served_geometry"] == served.geometry
     order = sorted(cells.values(), key=lambda entry: entry["capture_index"])
     populations = [int(entry["cell"].rsplit(":b", 1)[1]) for entry in order]
     assert populations == sorted(populations, reverse=True)
@@ -2169,7 +2438,7 @@ def test_receipt_captures_largest_population_first_and_reports_cost(
     assert receipt["retained_bytes_total"] is None
     assert receipt["ready"] is True
     assert receipt["admission_bytes"] == admitted
-    assert receipt["serving_bytes"] == served
+    assert receipt["serving_bytes"] == serving
     assert receipt["admission_release_verified"] is True
     assert receipt["admission_capture_seconds"] > 0
     assert receipt["serving_capture_seconds"] > 0
@@ -2185,17 +2454,20 @@ def _first_step(
     blocks: list[int],
     fresh: list[bool],
     capture: bool = False,
+    geometry: int = GEOM_REG,
+    num_pool_blocks: int = 4,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     embeds = torch.stack(
         [
-            _chunk(5 + i, seq=0, geometry=GEOM_REG, final=False, prompt=0)
+            _chunk(5 + i, seq=0, geometry=geometry, final=False, prompt=0)
             for i in range(len(blocks))
         ]
     ).to(pools["book_pool"].device)
     plan = _plan(
         prefills=blocks,
-        num_pool_blocks=4,
+        num_pool_blocks=num_pool_blocks,
         has_initial=[not value for value in fresh],
+        geometries=[geometry] * len(blocks),
     )
     return _step(
         core,
@@ -2210,7 +2482,8 @@ def _first_step(
 
 
 #: Uncovered calls on ``_binding``'s cells, every reachable reason:
-#: ``(decodes, prefills, fresh, options, key)``.
+#: ``(decodes, prefills, fresh, options, key)``; ``{label}`` is the cell
+#: label at the served geometry, ``(kind, population)``.
 _UNCOVERED = {
     "mixed-fresh": (
         [],
@@ -2239,31 +2512,53 @@ _UNCOVERED = {
         [1, 2, 3],
         [True] * 3,
         {},
-        "fallbacks:chunk-fresh:g0:b3:undeclared",
+        ("fallbacks:{}:undeclared", tg.CELL_FRESH_CHUNK, 3),
     ),
-    "capture": ([], [1], [True], {}, "fallbacks:chunk-fresh:g0:b1:capture"),
+    "capture": (
+        [],
+        [1],
+        [True],
+        {},
+        ("fallbacks:{}:capture", tg.CELL_FRESH_CHUNK, 1),
+    ),
     "memory-profile": (
         [],
         [1],
         [True],
         {},
-        "fallbacks:chunk-fresh:g0:b1:memory-profile",
+        ("fallbacks:{}:memory-profile", tg.CELL_FRESH_CHUNK, 1),
     ),
 }
 
 
 @pytest.mark.cpu_test
+@over_m
 @pytest.mark.parametrize("case", list(_UNCOVERED))
-def test_uncovered_calls_run_eager_and_are_counted(case: str) -> None:
-    core = _core()
-    call = _call_bindings(core)
-    graph_pools = _endpoint_pools(4)
+def test_uncovered_calls_run_eager_and_are_counted(
+    monkeypatch: pytest.MonkeyPatch, served: _Served, case: str
+) -> None:
+    # @spec TXG-REP-003
+    setup = served
+    if case == "multi-geometry" and served.bucket:
+        # Unreachable within the envelope; the bucket's dense decode binding
+        # serves only g1, so the eager call bindings run this step.
+        setup = G1
+    core, call, graph_pools = _served_setup(monkeypatch, setup)
     eager_pools = _clone_pools(graph_pools)
-    binding = _binding(core, graph_pools, call, _rerun_runtime())
+    binding = _binding(
+        core, graph_pools, call, _rerun_runtime(), geometry=served.geometry
+    )
     for pools in (graph_pools, eager_pools):
         pools["book_pool"][1:, _BOOK["last_label"]] = core.blank_id
     decodes, prefills, fresh, options, key = _UNCOVERED[case]
-    ids, embeds, plan = _rows(decodes, prefills, fresh, **options)
+    if isinstance(key, tuple):
+        pattern, kind, population = key
+        key = pattern.format(served.label(kind, population))
+    if case == "multi-geometry":
+        options = {"geometries": [served.geometry, GEOM_FINAL]}
+    ids, embeds, plan = _rows(
+        decodes, prefills, fresh, geometry=served.geometry, **options
+    )
     flags = {"capture": case == "capture", "memory_profile": case == "memory-profile"}
     before = binding.counters()
     expected = _step(core, eager_pools, call, ids, embeds, plan, None, **flags)
@@ -2291,23 +2586,31 @@ def _arena_snapshot(
 
 
 @pytest.mark.cpu_test
-def test_relocated_pools_fall_back_instead_of_replaying() -> None:
-    core = _core()
-    call = _call_bindings(core)
-    captured_pools = _endpoint_pools(4)
-    binding = _binding(core, captured_pools, call, _rerun_runtime())
+@over_m
+def test_relocated_pools_fall_back_instead_of_replaying(
+    monkeypatch: pytest.MonkeyPatch, served: _Served
+) -> None:
+    # @spec TXG-REP-005 / TXG-LIFE-003
+    core, call, captured_pools = _served_setup(monkeypatch, served)
+    untouched = _clone_pools(captured_pools)
+    binding = _binding(
+        core, captured_pools, call, _rerun_runtime(), geometry=served.geometry
+    )
     captured = binding.counters()["captured_cells"]
     arenas = _arena_snapshot(binding)
     moved = _clone_pools(captured_pools)
     reference = _clone_pools(captured_pools)
-    kwargs = dict(core=core, call=call, blocks=[1], fresh=[True])
+    kwargs = dict(
+        core=core, call=call, blocks=[1], fresh=[True], geometry=served.geometry
+    )
     actual = _first_step(binding, moved, **kwargs)
     expected = _first_step(None, reference, **kwargs)
     _assert_records_equal([actual], [expected])
     _assert_pools_equal(moved, reference)
-    _assert_pools_equal(captured_pools, _endpoint_pools(4))
+    _assert_pools_equal(captured_pools, untouched)
     assert all(torch.equal(buffer, saved) for buffer, saved in arenas)
-    assert binding.counters()["fallbacks:chunk-fresh:g0:b1:signature"] == 1
+    label = served.label(tg.CELL_FRESH_CHUNK, 1)
+    assert binding.counters()[f"fallbacks:{label}:signature"] == 1
     assert binding.counters()["captured_cells"] == captured
 
 
@@ -2329,7 +2632,7 @@ def _signature(base: SimpleNamespace, **changes: Any) -> tuple[Any, ...]:
         call["inputs"],
         call["ids"],
         call["embeds"],
-        graph_covers_decode=False,
+        graph_covers_decode=base.call.graph_covers_decode,
     )
 
 
@@ -2360,7 +2663,9 @@ def _resize_lazy_buffer(core: Any) -> dict[str, Any]:
 
 #: One structural input changed per case, as ``base -> field changes``.
 _STRUCTURAL: dict[str, Callable[[SimpleNamespace], dict[str, Any]]] = {
-    "population": lambda b: _prepared_call(b.core, b.pools, b.call, _rows([], [1])),
+    "population": lambda b: _prepared_call(
+        b.core, b.pools, b.call, _rows([], [1], geometry=b.geometry)
+    ),
     "placeholder-id": lambda b: {
         "inputs": replace(b.inputs, placeholder_id=PLACEHOLDER_ID + 7)
     },
@@ -2368,7 +2673,7 @@ _STRUCTURAL: dict[str, Callable[[SimpleNamespace], dict[str, Any]]] = {
     "eou-token-id": lambda b: {"inputs": replace(b.inputs, eou_token_id=EOU + 1)},
     "endpoint-enabled": lambda b: {"inputs": replace(b.inputs, endpoint_enabled=False)},
     "n-fresh": lambda b: _prepared_call(
-        b.core, b.pools, b.call, _rows([], [1, 2], [True, False])
+        b.core, b.pools, b.call, _rows([], [1, 2], [True, False], geometry=b.geometry)
     ),
     "decode-callable": lambda b: {
         "inputs": _with_bucket(
@@ -2399,26 +2704,33 @@ _STRUCTURAL: dict[str, Callable[[SimpleNamespace], dict[str, Any]]] = {
 
 
 @pytest.mark.cpu_test
+@over_m
 @pytest.mark.parametrize("change", [*_STRUCTURAL, "arena-layout", "arena-data"])
 def test_signature_covers_every_structural_input(
-    monkeypatch: pytest.MonkeyPatch, change: str
+    monkeypatch: pytest.MonkeyPatch, served: _Served, change: str
 ) -> None:
-    core = _core()
-    call = _call_bindings(core)
-    pools = _endpoint_pools(4)
+    # @spec TXG-REP-004
+    core, call, pools = _served_setup(monkeypatch, served)
+    geometry = served.geometry
     base = SimpleNamespace(
         core=core,
         pools=pools,
         call=call,
-        **_prepared_call(core, pools, call, _rows([], [1, 2])),
+        geometry=geometry,
+        **_prepared_call(core, pools, call, _rows([], [1, 2], geometry=geometry)),
     )
     expected = _signature(base)
     if change == "arena-data":
         ids = [PLACEHOLDER_ID] * 2
-        plan = _plan(prefills=[3, 1], num_pool_blocks=4, prompts=[2, 1])
+        plan = _plan(
+            prefills=[3, 1],
+            num_pool_blocks=4,
+            prompts=[2, 1],
+            geometries=[geometry] * 2,
+        )
         embeds = torch.stack(
             [
-                _chunk(seed, seq=0, geometry=GEOM_REG, final=False, prompt=prompt)
+                _chunk(seed, seq=0, geometry=geometry, final=False, prompt=prompt)
                 for seed, prompt in ((41, 2), (43, 1))
             ]
         )
@@ -2433,33 +2745,105 @@ def test_signature_covers_every_structural_input(
 
 
 @pytest.mark.cpu_test
+@over_m
 def test_arena_layout_mismatch_is_a_signature_fallback(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, served: _Served
 ) -> None:
-    core = _core()
-    call = _call_bindings(core)
-    graph_pools = _endpoint_pools(4)
-    binding = _binding(core, graph_pools, call, _rerun_runtime())
+    # @spec TXG-REP-005
+    core, call, graph_pools = _served_setup(monkeypatch, served)
+    binding = _binding(
+        core, graph_pools, call, _rerun_runtime(), geometry=served.geometry
+    )
     eager_pools = _clone_pools(graph_pools)
     for pools in (graph_pools, eager_pools):
         pools["book_pool"][1:, _BOOK["last_label"]] = core.blank_id
     arenas = _arena_snapshot(binding)
     captured = binding.counters()["captured_cells"]
-    _extend_arena_layout(monkeypatch)
-    kwargs = dict(core=core, call=call, blocks=[1], fresh=[True])
-    expected = _first_step(None, eager_pools, **kwargs)
-    actual = _first_step(binding, graph_pools, **kwargs)
+    with monkeypatch.context() as patch:
+        _extend_arena_layout(patch)
+        kwargs = dict(
+            core=core, call=call, blocks=[1], fresh=[True], geometry=served.geometry
+        )
+        expected = _first_step(None, eager_pools, **kwargs)
+        actual = _first_step(binding, graph_pools, **kwargs)
     _assert_records_equal([actual], [expected])
     _assert_pools_equal(graph_pools, eager_pools)
     assert all(torch.equal(buffer, saved) for buffer, saved in arenas)
     counts = binding.counters()
-    assert counts["fallbacks:chunk-fresh:g0:b1:signature"] == 1
+    label = served.label(tg.CELL_FRESH_CHUNK, 1)
+    assert counts[f"fallbacks:{label}:signature"] == 1
     assert counts["fallbacks"] == 1 and counts["replays"] == 0
     assert counts["captured_cells"] == captured
+    if served.bucket:
+        _wider_bucket_call_is_a_counted_bucket_error(monkeypatch, served)
+
+
+def _wider_bucket_call_is_a_counted_bucket_error(
+    monkeypatch: pytest.MonkeyPatch, served: _Served
+) -> None:
+    """A signature fallback whose eager bucket raises propagates unlatched.
+
+    At bucket population 31, ``inputs_embeds`` one column wider than captured
+    changes the signature's input-embeddings entry and the sealed bucket's
+    captured envelope signature, so the eager fallback's bucket raises after
+    the ``signature`` counter increments, with the error eager raises for the
+    same input over a clone of the pools, the pools as eager leaves them and
+    every arena unchanged. The binding stays unlatched and a following valid
+    call replays bitwise equal to eager.
+    """
+    population = 31
+    blocks = list(range(1, population + 1))
+    core, call, pools = _served_setup(monkeypatch, served, num_blocks=population + 1)
+    binding = tg.TransactionGraphBinding(
+        populations=[population],
+        geometries=(served.geometry,),
+        maximum_population=population,
+        vllm_config=object(),
+        runtime=_rerun_runtime(),
+    )
+    _serve(binding, core, call, _transaction_pools(pools))
+    eager_pools = _clone_pools(pools)
+    arenas = _arena_snapshot(binding)
+    ids, embeds, plan = _rows(
+        [], blocks, num_pool_blocks=population + 1, geometry=served.geometry
+    )
+    wider = (ids, torch.cat((embeds, torch.zeros(population, 1)), dim=1), plan)
+    label = served.label(tg.CELL_FRESH_CHUNK, population)
+    with pytest.raises(ValueError) as eager:
+        _advance(core, eager_pools, call, wider, None, _CommitRecorder())
+    assert "bucket graph invocation differs" in str(eager.value)
+    with pytest.raises(ValueError) as replayed:
+        _advance(core, pools, call, wider, binding, _CommitRecorder())
+    assert str(replayed.value) == str(eager.value)
+    _assert_pools_equal(pools, eager_pools)
+    assert all(torch.equal(buffer, saved) for buffer, saved in arenas)
+    counts = binding.counters()
+    assert counts[f"fallbacks:{label}:signature"] == 1
+    assert counts["replays"] == 0
+    binding.check_latch()
+    rows = (ids, embeds, plan)
+    expected = _step(core, eager_pools, call, *rows, None)
+    actual = _step(core, pools, call, *rows, binding)
+    _assert_records_equal([actual], [expected])
+    _assert_pools_equal(pools, eager_pools)
+    assert binding.counters()[f"replays:{label}"] == 1
+
+
+def _normalized_identity(fn: Any) -> tuple[int, ...]:
+    """``(id(__self__), id(__func__))`` for a bound method, else ``(id(fn),)``."""
+    owner = getattr(fn, "__self__", None)
+    if owner is None:
+        return (id(fn),)
+    return (id(owner), id(fn.__func__))
 
 
 @pytest.mark.cpu_test
-def test_signature_callable_identities_are_stable_across_calls() -> None:
+@over_m
+def test_signature_callable_identities_are_stable_across_calls(
+    served: _Served,
+) -> None:
+    # @spec TXG-REP-006
+    geometry = served.geometry
     _, decode = _decode_calls()
     dense = DenseGraphBinding(
         decode_fn=decode,
@@ -2467,7 +2851,7 @@ def test_signature_callable_identities_are_stable_across_calls() -> None:
         joint=object(),
         vllm_config=object(),
         frame_widths=(2, 2),
-        tiers=(1, 2),
+        tiers=execution_tiers(64) if served.bucket else (1, 2),
         encoder_hidden=3,
         predictor_layers=2,
         predictor_hidden=5,
@@ -2475,8 +2859,12 @@ def test_signature_callable_identities_are_stable_across_calls() -> None:
         runtime=_decode_runtime(),
     )
     dense.warmup(CPU, torch.float32)
-    decode_fn = dense.decode_fn(geometry=1, tier=1)
-    assert all(dense.decode_fn(geometry=1, tier=1) is decode_fn for _ in range(3))
+    decode_fn = dense.decode_fn(geometry=geometry, tier=1)
+    assert all(
+        dense.decode_fn(geometry=geometry, tier=1) is decode_fn for _ in range(3)
+    )
+    if not served.bucket:
+        return
 
     core = _core()
 
@@ -2489,10 +2877,10 @@ def test_signature_callable_identities_are_stable_across_calls() -> None:
         _chunk_graph_entries={},
         reserve_chunk_graph_cells=lambda _cells: None,
     )
-    chunk = ExactChunkGraphBinding(core, object(), encoder, dense, [1])
-    encoder._chunk_graph_entries[execution_mode(core).graph_key("chunk", (1, 1))] = (
-        sealed
-    )
+    chunk = ExactChunkGraphBinding(core, object(), encoder, dense, list(served.bucket))
+    for population in served.bucket:
+        key = execution_mode(core).graph_key("chunk", (1, population))
+        encoder._chunk_graph_entries[key] = sealed
 
     def resolve(fn: Any) -> Any:
         return chunk.resolve(
@@ -2506,6 +2894,21 @@ def test_signature_callable_identities_are_stable_across_calls() -> None:
     assert all(resolve(dense.decode_fn(geometry=1, tier=1)) is sealed for _ in range(3))
     with pytest.raises(ValueError, match="sealed"):
         resolve(lambda *_args: None)
+
+    # Population 2 is outside the bucket's set: each resolution reads its
+    # eager path afresh, a new bound method with one normalized identity.
+    eager = [
+        chunk.resolve(
+            geometry=1,
+            population=2,
+            decode_fn=dense.decode_fn(geometry=1, tier=2),
+            encoder_transition=encoder.transition,
+            capture=False,
+        )
+        for _ in range(3)
+    ]
+    assert eager[0] is not eager[1]
+    assert len({_normalized_identity(fn) for fn in eager}) == 1
 
     def resolver(request: Any) -> Any:
         tier = dense.execution_tier(request.execution_batch_size)
@@ -2522,23 +2925,24 @@ def test_signature_callable_identities_are_stable_across_calls() -> None:
         graph_covers_decode=True,
     )
     pools = _endpoint_pools(4)
-    signatures = []
-    for block in (1, 2):
-        ids, embeds, plan = _rows([], [block], geometries=[1])
-        inputs = _prepared(
-            core, pools, call, (ids, embeds, replace(plan, execution_tier=1))
-        )
-        assert inputs.buckets[0].transition is sealed
-        signatures.append(
-            tg.transaction_signature(
-                core,
-                inputs,
-                torch.tensor(ids, dtype=torch.long),
-                embeds,
-                graph_covers_decode=True,
+    for calls in (([1], [2]), ([1, 2], [3, 1])):
+        signatures = []
+        for blocks in calls:
+            ids, embeds, plan = _rows([], blocks, geometries=[1] * len(blocks))
+            plan = replace(plan, execution_tier=dense.execution_tier(len(blocks)))
+            inputs = _prepared(core, pools, call, (ids, embeds, plan))
+            if len(blocks) == 1:
+                assert inputs.buckets[0].transition is sealed
+            signatures.append(
+                tg.transaction_signature(
+                    core,
+                    inputs,
+                    torch.tensor(ids, dtype=torch.long),
+                    embeds,
+                    graph_covers_decode=True,
+                )
             )
-        )
-    assert signatures[0] == signatures[1]
+        assert signatures[0] == signatures[1], calls
 
 
 #: Per-operation TF32 enablement; each case flips one ``fp32_precision``.
@@ -2630,29 +3034,46 @@ def _path_pools(path: str, pools: Pools) -> Pools:
     return _clone_pools(pools) if path == "signature" else pools
 
 
+#: ``(served, constant, path)``: every constant on every path at g0, one
+#: constant on every path in the g1 configurations, and the unchanged control
+#: in each configuration.
+_CONSTANT_CASES = [
+    *(
+        (served, constant, path)
+        for served in M
+        for constant in (
+            _PROCESS_CONSTANTS if served is G0 else ("CUBLAS_WORKSPACE_CONFIG",)
+        )
+        for path in _PATHS
+    ),
+    *((served, "unchanged", "replay") for served in M),
+]
+
+
 @pytest.mark.cpu_test
 @pytest.mark.parametrize(
-    ("constant", "path"),
-    [(constant, path) for constant in _PROCESS_CONSTANTS for path in _PATHS]
-    + [("unchanged", "replay")],
+    ("served", "constant", "path"),
+    _CONSTANT_CASES,
+    ids=[f"{s.name}-{constant}-{path}" for s, constant, path in _CONSTANT_CASES],
 )
 def test_process_constant_change_is_fatal_on_every_path(
-    monkeypatch: pytest.MonkeyPatch, constant: str, path: str
+    monkeypatch: pytest.MonkeyPatch, served: _Served, constant: str, path: str
 ) -> None:
     """A changed constant is fatal; the guard reads only per-operation settings.
 
     The ``unchanged`` case makes every legacy getter raise from before capture,
     so a guard that snapshots or checks through them fails a covered call.
     """
+    # @spec TXG-REP-014
+    core, call, pools = _served_setup(monkeypatch, served)
     if constant == "unchanged":
         _legacy_precision_getters_raise(monkeypatch)
-    core = _core()
-    call = _call_bindings(core)
-    pools = _endpoint_pools(4)
-    binding = _binding(core, pools, call, _rerun_runtime())
+    binding = _binding(core, pools, call, _rerun_runtime(), geometry=served.geometry)
+    rows = _rows(*_PATHS[path], geometry=served.geometry)
     if constant == "unchanged":
-        _advance(core, pools, call, _rows(*_PATHS[path]), binding, _CommitRecorder())
-        assert binding.counters()["replays:chunk-fresh:g0:b1"] == 1
+        _advance(core, pools, call, rows, binding, _CommitRecorder())
+        label = served.label(tg.CELL_FRESH_CHUNK, 1)
+        assert binding.counters()[f"replays:{label}"] == 1
         return
     live = _path_pools(path, pools)
     before = _clone_pools(live)
@@ -2662,18 +3083,21 @@ def test_process_constant_change_is_fatal_on_every_path(
         _changed_process_constant(constant, monkeypatch),
         pytest.raises(RuntimeError, match=_PROCESS_CONSTANTS[constant]),
     ):
-        _advance(core, live, call, _rows(*_PATHS[path]), binding, sink)
+        _advance(core, live, call, rows, binding, sink)
     assert sink.log == []
     _assert_pools_equal(live, before)
     assert binding.counters() == counts
 
 
 @pytest.mark.cpu_test
-def test_replay_reserves_before_any_page_write_and_stages_after() -> None:
-    core = _core()
-    call = _call_bindings(core)
-    pools = _endpoint_pools(4)
-    binding = _binding(core, pools, call, _rerun_runtime())
+@over_m
+def test_replay_reserves_before_any_page_write_and_stages_after(
+    monkeypatch: pytest.MonkeyPatch, served: _Served
+) -> None:
+    # @spec TXG-FAIL-002
+    core, call, pools = _served_setup(monkeypatch, served)
+    binding = _binding(core, pools, call, _rerun_runtime(), geometry=served.geometry)
+    label = served.label(tg.CELL_FRESH_CHUNK, 1)
     untouched = _clone_pools(pools)
     seen: list[str] = []
 
@@ -2684,15 +3108,15 @@ def test_replay_reserves_before_any_page_write_and_stages_after() -> None:
             return super().reserve(plan)
 
     sink = Sink()
-    _advance(core, pools, call, _rows([], [1]), binding, sink)
+    _advance(core, pools, call, _rows([], [1], geometry=served.geometry), binding, sink)
     assert seen == ["reserve"] and sink.log == ["reserve", "stage"]
     assert int(sink.staged[0][0]) == 0
     assert int(pools["frontend_counter_pool"][1].abs().sum()) > 0
-    assert binding.counters()["replays:chunk-fresh:g0:b1"] == 1
+    assert binding.counters()[f"replays:{label}"] == 1
 
-    registry, leased, rows = _leased("right", 2)
+    registry, leased, rows = _leased("right", 2, served.geometry)
     _advance(core, pools, call, rows, binding, leased)
-    assert binding.counters()["replays:chunk-fresh:g0:b1"] == 2
+    assert binding.counters()[f"replays:{label}"] == 2
     registry.prune(())  # the request is aborted after its replay
     reports, _records, _lease_ok = leased.collect()
     assert [report.request_id for report in reports] == ["right"]
@@ -2713,6 +3137,7 @@ def _assert_latched(
     pools: Pools,
     monkeypatch: pytest.MonkeyPatch,
     paths: tuple[str, ...] = ("replay", "uncovered"),
+    geometry: int = GEOM_REG,
 ) -> None:
     """Later covered and fallback calls fail at the latch, counting nothing."""
     classified: list[Any] = []
@@ -2727,8 +3152,9 @@ def _assert_latched(
     before = _clone_pools(pools)
     for path in paths:
         sink = _CommitRecorder()
+        rows = _rows(*_PATHS[path], geometry=geometry)
         with pytest.raises(RuntimeError, match="a fresh worker is required"):
-            _advance(core, pools, call, _rows(*_PATHS[path]), binding, sink)
+            _advance(core, pools, call, rows, binding, sink)
         assert sink.log == [], path
     assert not classified
     assert binding.counters() == counts
@@ -2736,36 +3162,38 @@ def _assert_latched(
 
 
 @pytest.mark.cpu_test
+@over_m
 def test_replay_failure_cancels_the_reservation_once(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, served: _Served
 ) -> None:
-    core = _core()
-    call = _call_bindings(core)
-    pools = _endpoint_pools(4)
-    binding = _binding(core, pools, call, _rerun_runtime())
-    graph = binding._graphs[tg.TransactionCell(tg.CELL_FRESH_CHUNK, GEOM_REG, 1)]
+    # @spec TXG-FAIL-004
+    geometry = served.geometry
+    core, call, pools = _served_setup(monkeypatch, served)
+    binding = _binding(core, pools, call, _rerun_runtime(), geometry=geometry)
+    graph = binding._graphs[served.cell(tg.CELL_FRESH_CHUNK, 1)]
     graph.replay = _fail("replay failed")
     sink = _CommitRecorder()
     with pytest.raises(RuntimeError, match="replay failed"):
-        _advance(core, pools, call, _rows([], [1]), binding, sink)
+        _advance(core, pools, call, _rows([], [1], geometry=geometry), binding, sink)
     assert sink.log == ["reserve", "cancel"]
     assert binding.counters()["replays"] == 0
-    _assert_latched(binding, core, call, pools, monkeypatch)
+    _assert_latched(binding, core, call, pools, monkeypatch, geometry=geometry)
 
 
 @pytest.mark.cpu_test
+@over_m
 def test_stage_failure_after_done_latches_the_binding(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, served: _Served
 ) -> None:
-    core = _core()
-    call = _call_bindings(core)
-    pools = _endpoint_pools(4)
-    binding = _binding(core, pools, call, _rerun_runtime())
+    # @spec TXG-FAIL-004
+    geometry = served.geometry
+    core, call, pools = _served_setup(monkeypatch, served)
+    binding = _binding(core, pools, call, _rerun_runtime(), geometry=geometry)
     sink = _TrackedSink(fail_stage=True)
     with pytest.raises(RuntimeError, match="injected stage failure"):
-        _advance(core, pools, call, _rows([], [1]), binding, sink)
+        _advance(core, pools, call, _rows([], [1], geometry=geometry), binding, sink)
     assert sink.log == ["reserve", "stage", "cancel"]
-    _assert_latched(binding, core, call, pools, monkeypatch)
+    _assert_latched(binding, core, call, pools, monkeypatch, geometry=geometry)
 
 
 #: Worker-fatal sources; each latches the binding (Failure Containment).
@@ -2780,14 +3208,16 @@ _FATAL_SOURCES = (
 
 
 @pytest.mark.cpu_test
+@over_m
 @pytest.mark.parametrize("later", ["covered", "fallback"])
 @pytest.mark.parametrize("source", _FATAL_SOURCES)
 @pytest.mark.usefixtures("cpu_readings")
 def test_every_fatal_source_latches_before_classification(
-    monkeypatch: pytest.MonkeyPatch, source: str, later: str
+    monkeypatch: pytest.MonkeyPatch, served: _Served, source: str, later: str
 ) -> None:
+    # @spec TXG-FAIL-004
     platform = _entry_runtime([])
-    model, config = _model(monkeypatch, runtime=lambda: platform.runtime)
+    model, config = _model(monkeypatch, runtime=lambda: platform.runtime, served=served)
     model.prepare_execution_memory()
     state, slots = _model_state(model, config, num_blocks=4)
     _initialize(state, slots)
@@ -2795,9 +3225,9 @@ def test_every_fatal_source_latches_before_classification(
     assert binding.ready
     pools = _pool_arguments(_resident(model, slots))
     call = _model_call(model)
-    rows = _rows(*_PATHS["replay"])
+    rows = _rows(*_PATHS["replay"], geometry=served.geometry)
     if source == "replay":
-        cell = tg.TransactionCell(tg.CELL_FRESH_CHUNK, GEOM_REG, 1)
+        cell = served.cell(tg.CELL_FRESH_CHUNK, 1)
         binding._graphs[cell].replay = _fail("injected replay failure")
         with pytest.raises(RuntimeError, match="injected replay failure"):
             _advance(model.core, pools, call, rows, binding, _CommitRecorder())
@@ -2825,7 +3255,9 @@ def test_every_fatal_source_latches_before_classification(
         with pytest.raises(RuntimeError, match=r"(?i)pool layout|call binding"):
             _initialize(state, moved)
     path = "replay" if later == "covered" else "uncovered"
-    _assert_latched(binding, model.core, call, pools, monkeypatch, (path,))
+    _assert_latched(
+        binding, model.core, call, pools, monkeypatch, (path,), served.geometry
+    )
     with pytest.raises(RuntimeError, match="a fresh worker is required"):
         state.prepare_step(
             SchedulerOutput.make_empty(), dummy_run=False, is_profile=False
@@ -2870,15 +3302,15 @@ def _inject_pre_boundary_fault(
 
 
 @pytest.mark.cpu_test
+@over_m
 @pytest.mark.parametrize("fault", _PRE_BOUNDARY)
 def test_pre_boundary_failure_keeps_baseline_and_cancels_ticket_once(
-    monkeypatch: pytest.MonkeyPatch, fault: str
+    monkeypatch: pytest.MonkeyPatch, served: _Served, fault: str
 ) -> None:
-    core = _core()
-    call = _call_bindings(core)
-    pools = _endpoint_pools(4)
-    binding = _binding(core, pools, call, _rerun_runtime())
-    rows = _rows(*_PATHS["replay"])
+    # @spec TXG-FAIL-001
+    core, call, pools = _served_setup(monkeypatch, served)
+    binding = _binding(core, pools, call, _rerun_runtime(), geometry=served.geometry)
+    rows = _rows(*_PATHS["replay"], geometry=served.geometry)
     if fault == "commit-reservation":
         sink: _CommitRecorder = _StagelessSink()
         with pytest.raises(ValueError) as eager:
@@ -2902,18 +3334,20 @@ def test_pre_boundary_failure_keeps_baseline_and_cancels_ticket_once(
 
 
 @pytest.mark.cpu_test
-def test_stale_lease_fails_before_replay_writes_a_page() -> None:
-    core = _core()
-    call = _call_bindings(core)
-    pools = _endpoint_pools(4)
-    binding = _binding(core, pools, call, _rerun_runtime())
+@over_m
+def test_stale_lease_fails_before_replay_writes_a_page(
+    monkeypatch: pytest.MonkeyPatch, served: _Served
+) -> None:
+    # @spec TXG-FAIL-001
+    core, call, pools = _served_setup(monkeypatch, served)
+    binding = _binding(core, pools, call, _rerun_runtime(), geometry=served.geometry)
     before = _clone_pools(pools)
     with pytest.raises(ValueError, match="not registered"):
         _advance(
             core,
             pools,
             call,
-            _rows([], [1]),
+            _rows([], [1], geometry=served.geometry),
             binding,
             BoundedCommitSink(SessionRegistry(), max_rows=4),
         )
@@ -2922,30 +3356,41 @@ def test_stale_lease_fails_before_replay_writes_a_page() -> None:
 
 
 @pytest.mark.cpu_test
-def test_cleared_wrapper_entry_is_fatal_and_never_captures() -> None:
-    core = _core()
-    call = _call_bindings(core)
-    pools = _endpoint_pools(4)
+@over_m
+def test_cleared_wrapper_entry_is_fatal_and_never_captures(
+    monkeypatch: pytest.MonkeyPatch, served: _Served
+) -> None:
+    # @spec TXG-FAIL-008
+    geometry = served.geometry
+    core, call, pools = _served_setup(monkeypatch, served)
     captures: list[Any] = []
     platform = _entry_runtime(captures)
-    binding = _binding(core, pools, call, platform.runtime)
+    binding = _binding(core, pools, call, platform.runtime, geometry=geometry)
     started = len(captures)
     assert started == len(binding.cells)
     captured = binding.counters()["captured_cells"]
     platform.clear_all_graphs()
 
     moved, reference = _clone_pools(pools), _clone_pools(pools)
-    kwargs = dict(core=core, call=call, blocks=[1], fresh=[True])
+    kwargs = dict(core=core, call=call, blocks=[1], fresh=[True], geometry=geometry)
     actual = _first_step(binding, moved, **kwargs)
     expected = _first_step(None, reference, **kwargs)
     _assert_records_equal([actual], [expected])
-    assert binding.counters()["fallbacks:chunk-fresh:g0:b1:signature"] == 1
+    label = served.label(tg.CELL_FRESH_CHUNK, 1)
+    assert binding.counters()[f"fallbacks:{label}:signature"] == 1
 
     arenas = _arena_snapshot(binding)
     before = _clone_pools(pools)
     sink = _CommitRecorder()
     with pytest.raises(RuntimeError, match=r"(?i)wrapper entry"):
-        _advance(core, pools, call, _rows(*_PATHS["replay"]), binding, sink)
+        _advance(
+            core,
+            pools,
+            call,
+            _rows(*_PATHS["replay"], geometry=geometry),
+            binding,
+            sink,
+        )
     assert len(captures) == started
     assert binding.counters()["captured_cells"] == captured
     assert sink.log == []
@@ -2954,16 +3399,18 @@ def test_cleared_wrapper_entry_is_fatal_and_never_captures() -> None:
 
 
 @pytest.mark.cpu_test
+@over_m
 @pytest.mark.parametrize("cause", ["abort", "replay-raised"])
-def test_abort_after_replay_does_not_roll_back_pages(cause: str) -> None:
-    core = _core()
-    call = _call_bindings(core)
-    pools = _endpoint_pools(4)
-    binding = _binding(core, pools, call, _rerun_runtime())
-    registry, sink, rows = _leased("left", 1)
+def test_abort_after_replay_does_not_roll_back_pages(
+    monkeypatch: pytest.MonkeyPatch, served: _Served, cause: str
+) -> None:
+    # @spec TXG-FAIL-007
+    core, call, pools = _served_setup(monkeypatch, served)
+    binding = _binding(core, pools, call, _rerun_runtime(), geometry=served.geometry)
+    registry, sink, rows = _leased("left", 1, served.geometry)
     written: list[Pools] = []
     if cause == "replay-raised":
-        graph = binding._graphs[tg.TransactionCell(tg.CELL_FRESH_CHUNK, GEOM_REG, 1)]
+        graph = binding._graphs[served.cell(tg.CELL_FRESH_CHUNK, 1)]
         replay = graph.replay
 
         def fail() -> None:
@@ -2986,12 +3433,15 @@ def test_abort_after_replay_does_not_roll_back_pages(cause: str) -> None:
 
 
 @pytest.mark.cpu_test
+@over_m
 def test_collection_failure_after_replay_publishes_no_progress(
     monkeypatch: pytest.MonkeyPatch,
     cpu_readings: SimpleNamespace,
+    served: _Served,
 ) -> None:
+    # @spec TXG-FAIL-006
     cpu_readings.expected = 5
-    model, state, slots = _verified_model(monkeypatch, num_blocks=4)
+    model, state, slots = _verified_model(monkeypatch, num_blocks=4, served=served)
     binding = model._transaction_graph
     replays = binding.counters()["replays"]
     _chunk_forward(model, state, slots)
@@ -3012,94 +3462,119 @@ def test_collection_failure_after_replay_publishes_no_progress(
         call=_model_call(model),
         blocks=[2],
         fresh=[True],
+        geometry=served.geometry,
     )
     assert binding.counters()["replays"] == replays + 2
 
 
 @pytest.mark.cpu_test
-def test_failed_capture_publishes_nothing_and_fails_startup() -> None:
-    core = _core()
-    call = _call_bindings(core)
+@over_m
+def test_failed_capture_publishes_nothing_and_fails_startup(
+    monkeypatch: pytest.MonkeyPatch, served: _Served
+) -> None:
+    # @spec TXG-MEM-010
+    core, call, pools = _served_setup(monkeypatch, served)
 
     def broken(*_args: Any) -> Any:
         raise RuntimeError("adapter blew up")
 
     broken_call = replace(call, adapter=broken)
-    pools = _endpoint_pools(4)
     binding = tg.TransactionGraphBinding(
         populations=[1],
-        geometries=(GEOM_REG,),
+        geometries=(served.geometry,),
         maximum_population=4,
         vllm_config=object(),
         runtime=_rerun_runtime(),
     )
     with pytest.raises(RuntimeError, match="transaction_graph_populations"):
-        binding.capture(
-            core,
-            pools=_transaction_pools(pools),
-            call=broken_call,
-            hidden_size=CARRIER_HIDDEN,
-            device=CPU,
-            pool_layout={},
-        )
+        _serve(binding, core, broken_call, _transaction_pools(pools))
     assert not binding.ready and binding.counters()["captured_cells"] == 0
     before = _clone_pools(pools)
     with pytest.raises(RuntimeError):
-        _first_step(binding, pools, core=core, call=call, blocks=[1], fresh=[True])
+        _first_step(
+            binding,
+            pools,
+            core=core,
+            call=call,
+            blocks=[1],
+            fresh=[True],
+            geometry=served.geometry,
+        )
     _assert_pools_equal(pools, before)
     counts = binding.counters()
     assert counts["fallbacks"] == 0 and counts["replays"] == 0
 
 
 @pytest.mark.cpu_test
-def test_replayed_rows_are_owned_by_the_caller() -> None:
-    core = _core()
-    call = _call_bindings(core)
-    pools = _endpoint_pools(4)
-    binding = _binding(core, pools, call, _rerun_runtime())
+@over_m
+def test_replayed_rows_are_owned_by_the_caller(
+    monkeypatch: pytest.MonkeyPatch, served: _Served
+) -> None:
+    # @spec TXG-FAIL-003
+    core, call, pools = _served_setup(monkeypatch, served)
+    binding = _binding(core, pools, call, _rerun_runtime(), geometry=served.geometry)
     for tensor in (pools["book_pool"],):
         tensor[1:, _BOOK["last_label"]] = core.blank_id
-    first = _first_step(binding, pools, core=core, call=call, blocks=[1], fresh=[True])
+    step = dict(core=core, call=call, geometry=served.geometry)
+    first = _first_step(binding, pools, blocks=[1], fresh=[True], **step)
     kept = first[0].clone()
-    _first_step(binding, pools, core=core, call=call, blocks=[2, 3], fresh=[True] * 2)
-    graph = binding._graphs[tg.TransactionCell(tg.CELL_FRESH_CHUNK, GEOM_REG, 1)]
+    _first_step(binding, pools, blocks=[2, 3], fresh=[True] * 2, **step)
+    graph = binding._graphs[served.cell(tg.CELL_FRESH_CHUNK, 1)]
     assert first[0].data_ptr() != graph.rows_out.data_ptr()
     torch.testing.assert_close(first[0], kept, atol=0, rtol=0)
 
 
 @pytest.mark.cpu_test
-def test_population_declaration_is_validated(monkeypatch: pytest.MonkeyPatch) -> None:
+@over_m
+def test_population_declaration_is_validated(
+    monkeypatch: pytest.MonkeyPatch, served: _Served
+) -> None:
+    # @spec TXG-ENV-005
     for populations in ([], [0], [5], [1, 1], ["1"]):
         with pytest.raises(ValueError, match="transaction_graph_populations"):
             tg.TransactionGraphBinding(
                 populations=populations,
-                geometries=(0,),
+                geometries=(served.geometry,),
                 maximum_population=4,
                 vllm_config=object(),
             )
-    engine = {"max_num_seqs": 4, "max_num_batched_tokens": 2}
+    # The batched-token bound binds below max_num_seqs; with the bucket on,
+    # max_num_seqs stays 64 so every bucket population's tier condition holds.
+    seqs = 64 if served.bucket else 4
+    engine = {"max_num_seqs": seqs, "max_num_batched_tokens": 2}
     model, _config = _model(
-        monkeypatch, engine=engine, transaction_graph_populations=[1, 2]
+        monkeypatch, engine=engine, served=served, transaction_graph_populations=[1, 2]
     )
     assert model._transaction_graph is not None
-    for populations in ([3], [5], [0], [2, 2], [True]):
+    for populations in ([3], [seqs + 1], [0], [2, 2], [True]):
         with pytest.raises(ValueError, match="transaction_graph_populations"):
             _model(
-                monkeypatch, engine=engine, transaction_graph_populations=populations
+                monkeypatch,
+                engine=engine,
+                served=served,
+                transaction_graph_populations=populations,
             )
 
 
 @pytest.mark.cpu_test
+@over_m
 def test_counters_reach_the_model_from_an_engine_core(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, served: _Served
 ) -> None:
-    core = _core()
-    call = _call_bindings(core)
-    pools = _endpoint_pools(4)
-    binding = _binding(core, pools, call, _rerun_runtime(), populations=(1,))
+    # @spec TXG-OBS-001 / TXG-OBS-002
+    core, call, pools = _served_setup(monkeypatch, served)
+    binding = _binding(
+        core,
+        pools,
+        call,
+        _rerun_runtime(),
+        populations=(1,),
+        geometry=served.geometry,
+    )
     pools["book_pool"][1:, _BOOK["last_label"]] = core.blank_id
-    _first_step(binding, pools, core=core, call=call, blocks=[1], fresh=[True])
-    _first_step(binding, pools, core=core, call=call, blocks=[2, 3], fresh=[True] * 2)
+    step = dict(core=core, call=call, geometry=served.geometry)
+    _first_step(binding, pools, blocks=[1], fresh=[True], **step)
+    _first_step(binding, pools, blocks=[2, 3], fresh=[True] * 2, **step)
 
     def synchronized(*_args: Any, **_kwargs: Any) -> None:
         raise AssertionError("transaction graph counters synchronized the device")
@@ -3108,8 +3583,9 @@ def test_counters_reach_the_model_from_an_engine_core(
         monkeypatch.setattr(owner, "synchronize", synchronized)
     expected = binding.counters()
     assert expected["captured_cells"] == len(binding.cells)
-    assert expected["replays:chunk-fresh:g0:b1"] == 1
-    assert expected["fallbacks:chunk-fresh:g0:b2:undeclared"] == 1
+    assert expected[f"replays:{served.label(tg.CELL_FRESH_CHUNK, 1)}"] == 1
+    undeclared = served.label(tg.CELL_FRESH_CHUNK, 2)
+    assert expected[f"fallbacks:{undeclared}:undeclared"] == 1
     assert expected["prologue_ns_total"] >= expected["prologue_ns_last"] > 0
     for role, target in _owners(SimpleNamespace(_transaction_graph=binding)).items():
         assert tg.transaction_graph_counters(target) == expected, role
@@ -3121,16 +3597,20 @@ def test_counters_reach_the_model_from_an_engine_core(
 
 
 @pytest.mark.cpu_test
+@over_m
 @pytest.mark.parametrize("declared", [_ABSENT, []], ids=["absent", "empty"])
 def test_option_off_constructs_no_binding(
-    monkeypatch: pytest.MonkeyPatch, declared: Any
+    monkeypatch: pytest.MonkeyPatch, served: _Served, declared: Any
 ) -> None:
+    # @spec TXG-ENV-001
     def refuse(*_args: Any, **_kwargs: Any) -> None:
         pytest.fail("the option is off, yet a transaction graph binding was used")
 
     monkeypatch.setattr(tg.TransactionGraphBinding, "__init__", refuse)
     monkeypatch.setattr(tg.TransactionGraphBinding, "capture", refuse)
-    model, config = _model(monkeypatch, transaction_graph_populations=declared)
+    model, config = _model(
+        monkeypatch, served=served, transaction_graph_populations=declared
+    )
     assert model._transaction_graph is None
     graphs: list[Any] = []
     eager = advance.advance_model_rows
@@ -3157,11 +3637,15 @@ def test_option_off_constructs_no_binding(
     ],
     ids=["native-burst", "compact-decode"],
 )
+@over_m
 def test_option_requires_native_burst_off_and_dense_decode(
-    monkeypatch: pytest.MonkeyPatch, hf: dict[str, Any]
+    monkeypatch: pytest.MonkeyPatch, served: _Served, hf: dict[str, Any]
 ) -> None:
+    # @spec TXG-ENV-002
+    model, _config = _model(monkeypatch, served=served)
+    assert model._transaction_graph is not None
     with pytest.raises(ValueError, match="transaction_graph_populations"):
-        _model(monkeypatch, **hf)
+        _model(monkeypatch, served=served, **hf)
 
 
 #: Runner graph configurations the option rejects: every outer mode but
@@ -3180,26 +3664,64 @@ _RUNNER_GRAPHS = {
 @pytest.mark.parametrize(
     "engine", list(_RUNNER_GRAPHS.values()), ids=list(_RUNNER_GRAPHS)
 )
+@over_m
 def test_option_rejects_every_outer_cudagraph_mode_but_none(
-    monkeypatch: pytest.MonkeyPatch, engine: dict[str, Any]
+    monkeypatch: pytest.MonkeyPatch, served: _Served, engine: dict[str, Any]
 ) -> None:
-    model, _config = _model(monkeypatch)
+    # @spec TXG-ENV-003
+    model, _config = _model(monkeypatch, served=served)
     assert model._transaction_graph is not None
     with pytest.raises(ValueError, match="transaction_graph_populations"):
-        _model(monkeypatch, engine=engine)
+        _model(monkeypatch, served=served, engine=engine)
+
+
+#: ``supported_num_lookahead_tokens`` declarations with the option on:
+#: ``(declaration, accepted)``.
+_LOOKAHEAD_DECLARATIONS = {
+    "list-g0": ([0], True),
+    "list-g1": ([1], True),
+    "tuple-g0": ((0,), True),
+    "tuple-g1": ((1,), True),
+    "every": (_ABSENT, False),
+    "scalar": (0, False),
+    "string": ("[1]", False),
+    "empty": ([], False),
+    "g0-g1": ([0, 1], False),
+    "g1-g1": ([1, 1], False),
+    "g2": ([3], False),
+    "fractional": ([0.5], False),
+    "float": ([1.0], False),
+    "bool": ([True], False),
+    "string-element": (["0"], False),
+}
 
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize(
-    "lookaheads",
-    [[1], [0, 1], [3], _ABSENT, [0.5], [True], ["0"]],
-    ids=["g1", "g0-g1", "g2", "every", "fractional", "bool", "string"],
+    ("lookaheads", "accepted"),
+    list(_LOOKAHEAD_DECLARATIONS.values()),
+    ids=list(_LOOKAHEAD_DECLARATIONS),
 )
-def test_option_rejects_served_geometries_other_than_g0(
-    monkeypatch: pytest.MonkeyPatch, lookaheads: Any
+def test_option_accepts_exactly_one_served_geometry(
+    monkeypatch: pytest.MonkeyPatch, lookaheads: Any, accepted: bool
 ) -> None:
-    with pytest.raises(ValueError, match="transaction_graph_populations"):
+    """Exactly the singleton lookahead lists and tuples of the int 0 or 1 serve.
+
+    A rejection names the permitted values ``[0]`` and ``[1]`` and the
+    rejected declaration. The CHUNK-bucket binding is off.
+    """
+    # @spec TXG-ENV-004
+    if accepted:
+        model, _config = _model(monkeypatch, supported_num_lookahead_tokens=lookaheads)
+        assert model._transaction_graph is not None
+        assert served_geometry_ids(model.config) == (lookaheads[0],)
+        return
+    with pytest.raises(ValueError, match="transaction_graph_populations") as raised:
         _model(monkeypatch, supported_num_lookahead_tokens=lookaheads)
+    message = str(raised.value)
+    assert "[0]" in message and "[1]" in message, message
+    declared = None if lookaheads is _ABSENT else lookaheads
+    assert repr(declared) in message, message
 
 
 @pytest.mark.cpu_test
@@ -3207,21 +3729,306 @@ def test_option_rejects_served_geometries_other_than_g0(
     ("override", "populations", "accepted"),
     [(3, [1, 2], True), (2, [1, 2], False), (2, [1], True)],
 )
+@over_m
 def test_population_declaration_respects_block_override(
     monkeypatch: pytest.MonkeyPatch,
+    served: _Served,
     override: int,
     populations: list[int],
     accepted: bool,
 ) -> None:
+    # @spec TXG-ENV-006
     engine = {"num_gpu_blocks_override": override}
+    model_kwargs = dict(
+        engine=engine, served=served, transaction_graph_populations=populations
+    )
     if accepted:
-        model, _config = _model(
-            monkeypatch, engine=engine, transaction_graph_populations=populations
-        )
+        model, _config = _model(monkeypatch, **model_kwargs)
         assert model._transaction_graph is not None
         return
     with pytest.raises(ValueError, match="transaction_graph_populations"):
-        _model(monkeypatch, engine=engine, transaction_graph_populations=populations)
+        _model(monkeypatch, **model_kwargs)
+
+
+#: Compositions of the option with the CHUNK-bucket binding at g1:
+#: ``(bucket populations, transaction populations, max_num_seqs)``.
+_COMPOSITIONS = {
+    "bucket-1-31-63": ([1, 31, 63], [1, 2, 31], 64),
+    "bucket-1-63": ([1, 63], [31], 64),
+    "bucket-1-seqs-1": ([1], [1], 1),
+    "bucket-1-31-seqs-32": ([1, 31], [1], 32),
+    "bucket-off": ([], [1, 2], 64),
+}
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("bucket", "populations", "max_num_seqs"),
+    list(_COMPOSITIONS.values()),
+    ids=list(_COMPOSITIONS),
+)
+def test_option_composes_with_the_chunk_bucket_binding_at_g1(
+    monkeypatch: pytest.MonkeyPatch,
+    bucket: list[int],
+    populations: list[int],
+    max_num_seqs: int,
+) -> None:
+    """Both bindings construct at g1, and every transaction call routes CHUNK
+    buckets through the bucket binding, which joins the nested bindings.
+
+    The transaction populations need not equal the bucket populations. With
+    the bucket off, the nested bindings omit it.
+    """
+    # @spec TXG-ENV-009
+    served = _Served("g1-composition", 1, tuple(bucket))
+    model, _config = _model(
+        monkeypatch,
+        served=served,
+        engine={"max_num_seqs": max_num_seqs, "max_num_batched_tokens": 64},
+        transaction_graph_populations=populations,
+    )
+    assert model._transaction_graph is not None
+    chunk = model._chunk_bucket_binding
+    assert (chunk is not None) == bool(bucket)
+    call = model._transaction_call_bindings()
+    assert call.bucket_transition is chunk
+    nested = model._nested_execution_bindings()
+    if bucket:
+        assert any(binding is chunk for binding in nested)
+        assert chunk._cells == frozenset((1, population) for population in bucket)
+    else:
+        assert all(
+            not isinstance(binding, ExactChunkGraphBinding) for binding in nested
+        )
+
+
+#: Configurations the option rejects with the bucket on: ``hf`` overrides.
+_PRECEDENCE = {
+    "g0-g1": {"supported_num_lookahead_tokens": [0, 1]},
+    "native-burst": {"experimental_native_burst": True},
+}
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("hf", list(_PRECEDENCE.values()), ids=list(_PRECEDENCE))
+def test_option_checks_precede_chunk_bucket_construction(
+    monkeypatch: pytest.MonkeyPatch, hf: dict[str, Any]
+) -> None:
+    """The option's configuration error precedes the bucket's construction."""
+    # @spec TXG-ENV-010
+    from vllm.models.nemotron_asr import chunk_bucket_graph
+
+    def refuse(*_args: Any, **_kwargs: Any) -> None:
+        pytest.fail("the CHUNK-bucket binding was constructed")
+
+    monkeypatch.setattr(chunk_bucket_graph.ExactChunkGraphBinding, "__init__", refuse)
+    with pytest.raises(ValueError, match="transaction_graph_populations"):
+        _model(monkeypatch, served=G1_BUCKET, **hf)
+
+
+#: Each bucket requirement the option passes but the bucket binding rejects:
+#: ``(hf overrides, engine overrides, the bucket binding's message)``.
+_BUCKET_REQUIREMENTS = {
+    "g0": (
+        {"supported_num_lookahead_tokens": [0]},
+        {},
+        "native burst requires the declared 160-ms lookahead profile",
+    ),
+    "async-scheduling": (
+        {},
+        {"async_scheduling": True},
+        "native burst requires synchronous non-speculative single-device",
+    ),
+    "speculative": (
+        {},
+        {"speculative_config": SimpleNamespace(num_speculative_tokens=1)},
+        "native burst requires synchronous non-speculative single-device",
+    ),
+    **{
+        name.removesuffix("_size").replace("_", "-"): (
+            {},
+            {"parallel_sizes": {name: 2}},
+            "native burst requires synchronous non-speculative single-device",
+        )
+        for name in (
+            "pipeline_parallel_size",
+            "tensor_parallel_size",
+            "data_parallel_size",
+            "decode_context_parallel_size",
+            "prefill_context_parallel_size",
+        )
+    },
+    "expert-parallel": (
+        {},
+        {"enable_expert_parallel": True},
+        "native burst requires synchronous non-speculative single-device",
+    ),
+    "logits-processors": (
+        {},
+        {"logits_processors": ["processor"]},
+        "native burst requires synchronous non-speculative single-device",
+    ),
+    "dense-eager": (
+        {"decode_dispatch_arm": "dense-eager"},
+        {},
+        "CHUNK serving pilot requires distinct populations 1/31/63",
+    ),
+    "seqs-16-bucket-31": (
+        {"chunk_bucket_graph_populations": [31]},
+        {"max_num_seqs": 16},
+        "decode population 31 exceeds captured maximum 16",
+    ),
+    "seqs-48-bucket-63": (
+        {"chunk_bucket_graph_populations": [63]},
+        {"max_num_seqs": 48},
+        "decode population 63 exceeds captured maximum 48",
+    ),
+    "seqs-31-bucket-31": (
+        {"chunk_bucket_graph_populations": [31]},
+        {"max_num_seqs": 31},
+        "CHUNK pilot requires unchanged physical decoder tiers 1/32/64",
+    ),
+    "seqs-63-bucket-63": (
+        {"chunk_bucket_graph_populations": [63]},
+        {"max_num_seqs": 63},
+        "CHUNK pilot requires unchanged physical decoder tiers 1/32/64",
+    ),
+    "encoder-arm": (
+        {"encoder_execution_arm": "dense-graphed"},
+        {},
+        "CHUNK ownership requires an untouched native encoder domain",
+    ),
+}
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("hf", "engine", "message"),
+    list(_BUCKET_REQUIREMENTS.values()),
+    ids=list(_BUCKET_REQUIREMENTS),
+)
+def test_chunk_bucket_requirements_raise_the_bucket_error(
+    monkeypatch: pytest.MonkeyPatch,
+    hf: dict[str, Any],
+    engine: dict[str, Any],
+    message: str,
+) -> None:
+    """A bucket requirement the option does not own fails with the bucket's error.
+
+    The option's own checks pass, so construction reaches the bucket binding,
+    whose ``ValueError`` need not name the option. Construction fails, so no
+    model is returned, and any transaction binding built before the failure
+    published nothing and cannot serve. The ``[0]`` case is the native-burst
+    guard's lookahead error, not a CHUNK error.
+    """
+    # @spec TXG-ENV-011
+    built: list[tg.TransactionGraphBinding] = []
+    construct = tg.TransactionGraphBinding.__init__
+
+    def recorded(self: tg.TransactionGraphBinding, *args: Any, **kwargs: Any) -> None:
+        construct(self, *args, **kwargs)
+        built.append(self)
+
+    monkeypatch.setattr(tg.TransactionGraphBinding, "__init__", recorded)
+    engine = {"max_num_batched_tokens": 64, **engine}
+    with pytest.raises(ValueError) as raised:
+        _model(
+            monkeypatch,
+            served=G1_BUCKET,
+            engine=engine,
+            transaction_graph_populations=[1],
+            **hf,
+        )
+    assert message in str(raised.value), str(raised.value)
+    if "160-ms" in message:
+        assert "CHUNK" not in str(raised.value)
+    for binding in built:
+        assert not binding.ready and not binding.serving_captured
+        assert binding.counters()["captured_cells"] == 0
+
+
+#: Served sets the binding constructor receives: ``(set, accepted)``.
+_BINDING_SETS = {
+    "g0": ((0,), True),
+    "g1": ((1,), True),
+    "empty": ((), False),
+    "index-2": ((2,), False),
+    "g0-g1": ((0, 1), False),
+}
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("geometries", "accepted"), list(_BINDING_SETS.values()), ids=list(_BINDING_SETS)
+)
+def test_binding_rejects_served_sets_other_than_g0_or_g1(
+    geometries: tuple[int, ...], accepted: bool
+) -> None:
+    """The binding accepts exactly the served ``CADENCES`` sets (0,) and (1,)."""
+
+    # @spec TXG-ENV-012
+    def construct() -> tg.TransactionGraphBinding:
+        return tg.TransactionGraphBinding(
+            populations=[1, 2],
+            geometries=geometries,
+            maximum_population=4,
+            vllm_config=object(),
+        )
+
+    if accepted:
+        binding = construct()
+        (geometry,) = geometries
+        assert {cell.geometry for cell in binding.cells} == {geometry, -1}
+        return
+    with pytest.raises(ValueError, match="transaction_graph_populations") as raised:
+        construct()
+    message = str(raised.value)
+    assert "(0,)" in message and "(1,)" in message, message
+    assert repr(geometries) in message, message
+
+
+@pytest.mark.cpu_test
+@pytest.mark.usefixtures("cpu_readings")
+@over_m
+def test_capture_rows_carry_the_served_geometry(
+    monkeypatch: pytest.MonkeyPatch, served: _Served
+) -> None:
+    """Every cell's capture rows, ``replay`` included, name the served geometry.
+
+    The admission inventory, the serving inventory and the cell inputs that
+    post-warmup verification rebuilds all build their rows' plans at the served
+    geometry, and ``replay`` cell keys and labels carry no geometry.
+    """
+    # @spec TXG-REP-018
+    phase = {"value": "admission"}
+    plans: list[tuple[str, str, int]] = []
+    capture_plan = tg._capture_plan
+
+    def recorded(cell: tg.TransactionCell, **kwargs: Any) -> Any:
+        plan = capture_plan(cell, **kwargs)
+        geometries = set(plan.geometry_id.tolist())
+        assert len(geometries) == 1, geometries
+        plans.append((phase["value"], cell.kind, geometries.pop()))
+        return plan
+
+    monkeypatch.setattr(tg, "_capture_plan", recorded)
+    model, config = _model(monkeypatch, served=served)
+    model.prepare_execution_memory()
+    phase["value"] = "serving"
+    state, slots = _model_state(model, config)
+    _initialize(state, slots)
+    phase["value"] = "verification"
+    state.post_warmup()
+    kinds = {tg.CELL_FRESH_CHUNK, tg.CELL_CONTINUING_CHUNK, tg.CELL_REPLAY}
+    for name in ("admission", "serving", "verification"):
+        assert {kind for seen, kind, _ in plans if seen == name} == kinds, name
+    assert {geometry for _phase, _kind, geometry in plans} == {served.geometry}
+    replay = [cell for cell in model._transaction_graph.cells if cell.kind == "replay"]
+    populations = model.config.transaction_graph_populations
+    assert sorted(replay) == sorted(
+        tg.TransactionCell(tg.CELL_REPLAY, -1, population) for population in populations
+    )
+    assert all(cell.label == f"replay:b{cell.population}" for cell in replay)
 
 
 # ---- CPU: memory admission -------------------------------------------------
@@ -3234,10 +4041,12 @@ def _stand_in_bytes(model: Any) -> int:
 
 
 @pytest.mark.cpu_test
+@over_m
 @pytest.mark.parametrize("declared", [_ABSENT, []], ids=["absent", "empty"])
 def test_option_off_performs_no_admission(
-    monkeypatch: pytest.MonkeyPatch, declared: Any
+    monkeypatch: pytest.MonkeyPatch, served: _Served, declared: Any
 ) -> None:
+    # @spec TXG-MEM-001
     from vllm.models.nemotron_asr import state_profile
 
     def refuse(*_args: Any, **_kwargs: Any) -> None:
@@ -3247,22 +4056,38 @@ def test_option_off_performs_no_admission(
     monkeypatch.setattr(tg.TransactionGraphBinding, "admit", refuse, raising=False)
     monkeypatch.setattr(tg.TransactionGraphBinding, "_capture_cell", refuse)
     monkeypatch.setattr(state_profile, "allocate_state_scratch", refuse)
-    model, _config = _model(monkeypatch, transaction_graph_populations=declared)
+    model, _config = _model(
+        monkeypatch, served=served, transaction_graph_populations=declared
+    )
     model.prepare_execution_memory()
     assert model._execution_memory_prepared
     assert model._transaction_graph is None
 
 
 @pytest.mark.cpu_test
+@over_m
 def test_admission_captures_full_inventory_before_eager_profiles(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, served: _Served
 ) -> None:
+    # @spec TXG-MEM-002
     events: list[Any] = []
     model, _config = _model(
         monkeypatch,
         runtime=lambda: _rerun_runtime(lambda _index: events.append("capture")),
+        served=served,
     )
     binding = model._transaction_graph
+    bucket = model._chunk_bucket_binding
+    assert (bucket is not None) == bool(served.bucket)
+    if bucket is not None:
+        publish = model._encoder_execution.publish_chunk_graphs
+
+        def published(*args: Any, **kwargs: Any) -> Any:
+            result = publish(*args, **kwargs)
+            events.append("bucket-published")
+            return result
+
+        monkeypatch.setattr(model._encoder_execution, "publish_chunk_graphs", published)
     warmup = profile_execution.warmup_static_encoder_execution
     profile = profile_execution.run_persistent_state_profile
 
@@ -3289,6 +4114,8 @@ def test_admission_captures_full_inventory_before_eager_profiles(
     assert events.count("capture") == len(labels)
     first, last = events.index(("N", 0)), events.index(("N", 2))
     assert events.index("encoder") < first
+    if bucket is not None:
+        assert events.index("bucket-published") < first
     assert all(
         first < index < last
         for index, event in enumerate(events)
@@ -3312,9 +4139,11 @@ def test_admission_captures_full_inventory_before_eager_profiles(
 
 
 @pytest.mark.cpu_test
+@over_m
 def test_normalized_readings_synchronize_collect_and_empty_first(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, served: _Served
 ) -> None:
+    # @spec TXG-MEM-003
     device_calls: list[str] = []
 
     def record(name: str, result: Any = None) -> Callable[..., Any]:
@@ -3349,8 +4178,7 @@ def test_normalized_readings_synchronize_collect_and_empty_first(
     assert allocated_reading(CPU) is None
     monkeypatch.undo()
 
-    core = _core()
-    call = _call_bindings(core)
+    core, call, _pools = _served_setup(monkeypatch, served)
     stand_in = _StandIn()
     inputs = _track_capture_inputs(monkeypatch)
     prepared = _track_capture_cells(monkeypatch)
@@ -3373,7 +4201,7 @@ def test_normalized_readings_synchronize_collect_and_empty_first(
     # segment the allocator keeps; allocated bytes drop by exactly its size.
     budget = _budget(0, 1 << 20, 1 << 19)
     _free_memory(monkeypatch, budget, lambda index: observe("N", index), allocated)
-    binding = _admission_binding()
+    binding = _admission_binding(geometry=served.geometry)
     _admit(binding, core, call, stand_in)
     at_na, at_n1 = (("N", 1), ("allocated", 0)), (("N", 2), ("allocated", 1))
     assert order == [("N", 0), *at_na, *at_n1]
@@ -3391,12 +4219,13 @@ def test_normalized_readings_synchronize_collect_and_empty_first(
 
 
 @pytest.mark.cpu_test
+@over_m
 @pytest.mark.parametrize("cause", ["readings", "owner"])
 def test_unverified_admission_release_fails_startup(
-    monkeypatch: pytest.MonkeyPatch, cause: str
+    monkeypatch: pytest.MonkeyPatch, served: _Served, cause: str
 ) -> None:
-    core = _core()
-    call = _call_bindings(core)
+    # @spec TXG-MEM-004
+    core, call, _pools = _served_setup(monkeypatch, served)
     owner: list[Any] = []
     stand_in = _StandIn(owner=owner if cause == "owner" else None)
     short = 1 if cause == "readings" else 0
@@ -3407,7 +4236,7 @@ def test_unverified_admission_release_fails_startup(
 
     # Free memory rises far above the stand-in bytes; only allocated bytes count.
     _free_memory(monkeypatch, _budget(1 << 30, 1 << 20, 1 << 20), None, allocated)
-    binding = _admission_binding()
+    binding = _admission_binding(geometry=served.geometry)
     with pytest.raises(RuntimeError, match="transaction_graph_populations") as raised:
         _admit(binding, core, call, stand_in)
     if cause == "readings":
@@ -3420,15 +4249,16 @@ def test_unverified_admission_release_fails_startup(
 
 
 @pytest.mark.cpu_test
+@over_m
 def test_serving_capture_releases_admission_before_measuring(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, served: _Served
 ) -> None:
-    core = _core()
-    call = _call_bindings(core)
+    # @spec TXG-MEM-005
+    core, call, _pools = _served_setup(monkeypatch, served)
     stand_in = _StandIn()
     events: list[Any] = []
     prepared = _track_capture_cells(monkeypatch, events)
-    binding = _admission_binding()
+    binding = _admission_binding(geometry=served.geometry)
     admitted: list[Any] = []
 
     def observe(index: int) -> None:
@@ -3461,12 +4291,13 @@ def test_serving_capture_releases_admission_before_measuring(
 
 
 @pytest.mark.cpu_test
+@over_m
 @pytest.mark.parametrize("excess", [0, 1])
 def test_serving_bytes_above_admission_fail_startup(
-    monkeypatch: pytest.MonkeyPatch, excess: int
+    monkeypatch: pytest.MonkeyPatch, served: _Served, excess: int
 ) -> None:
-    core = _core()
-    call = _call_bindings(core)
+    # @spec TXG-MEM-006
+    core, call, _pools = _served_setup(monkeypatch, served)
     stand_in = _StandIn()
     admitted = 1 << 20
     _free_memory(
@@ -3477,7 +4308,7 @@ def test_serving_bytes_above_admission_fail_startup(
             admitted + excess,
         )(index),
     )
-    binding = _admission_binding()
+    binding = _admission_binding(geometry=served.geometry)
     _admit(binding, core, call, stand_in)
     resident = _transaction_view(_scratch(3))
     if not excess:
@@ -3493,10 +4324,12 @@ def test_serving_bytes_above_admission_fail_startup(
 
 
 @pytest.mark.cpu_test
+@over_m
 def test_admission_holder_lives_until_serving_capture(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, served: _Served
 ) -> None:
-    model, config = _model(monkeypatch)
+    # @spec TXG-MEM-007
+    model, config = _model(monkeypatch, served=served)
     prepared = _track_capture_cells(monkeypatch)
     _free_memory(monkeypatch, _budget(_stand_in_bytes(model), 1 << 20, 1 << 20))
     count = len(model._transaction_graph.cells)
@@ -3526,9 +4359,14 @@ def test_admission_holder_lives_until_serving_capture(
     ids=["block-override", "kv-bytes"],
 )
 @pytest.mark.parametrize("outcome", ["fits", "exceeds", "capture-fails"])
+@over_m
 def test_override_capacity_reports_admission_and_wraps_failures(
-    monkeypatch: pytest.MonkeyPatch, override: dict[str, int], outcome: str
+    monkeypatch: pytest.MonkeyPatch,
+    served: _Served,
+    override: dict[str, int],
+    outcome: str,
 ) -> None:
+    # @spec TXG-MEM-008
     armed = {"value": False}
 
     def on_capture(_index: int) -> None:
@@ -3536,7 +4374,10 @@ def test_override_capacity_reports_admission_and_wraps_failures(
             raise torch.OutOfMemoryError("injected serving capture failure")
 
     model, config = _model(
-        monkeypatch, runtime=lambda: _rerun_runtime(on_capture), engine=override
+        monkeypatch,
+        runtime=lambda: _rerun_runtime(on_capture),
+        engine=override,
+        served=served,
     )
     admitted = 1 << 20
     _free_memory(
@@ -3571,9 +4412,11 @@ _OPTION_STATES = pytest.mark.parametrize(
 
 
 @pytest.mark.cpu_test
+@over_m
 @_OPTION_STATES
 def test_state_spec_names_the_option_as_a_memory_contributor(
     monkeypatch: pytest.MonkeyPatch,
+    served: _Served,
     populations: list[int],
     contributors: tuple[str, ...],
 ) -> None:
@@ -3583,7 +4426,10 @@ def test_state_spec_names_the_option_as_a_memory_contributor(
     rejection and in the runner's KV allocation failure, neither of which a
     model hook surrounds. The names leave the layout unchanged.
     """
-    model, config = _model(monkeypatch, transaction_graph_populations=populations)
+    # @spec TXG-MEM-011 / TXG-MEM-012
+    model, config = _model(
+        monkeypatch, served=served, transaction_graph_populations=populations
+    )
     spec = model._persistent_state_layer.get_kv_cache_spec(config)
     assert spec.memory_contributors == contributors
     layout = build_nemotron_persistent_state_spec(model.config)
@@ -3598,8 +4444,10 @@ def test_state_spec_names_the_option_as_a_memory_contributor(
     ids=["one-page", "override"],
 )
 @_OPTION_STATES
+@over_m
 def test_planner_rejection_names_the_option(
     monkeypatch: pytest.MonkeyPatch,
+    served: _Served,
     populations: list[int],
     contributors: tuple[str, ...],
     budget_pages: int,
@@ -3612,9 +4460,12 @@ def test_planner_rejection_names_the_option(
     pages exceeds a three-page budget. Without the option the message names
     no option.
     """
+    # @spec TXG-MEM-011
     from tests.v1.core.utils import create_scheduler, get_kv_cache_configs
 
-    model, config = _model(monkeypatch, transaction_graph_populations=populations)
+    model, config = _model(
+        monkeypatch, served=served, transaction_graph_populations=populations
+    )
     layer = model._persistent_state_layer
     spec = layer.get_kv_cache_spec(config)
     engine = create_scheduler(max_num_seqs=2, max_model_len=32).vllm_config
@@ -3633,9 +4484,11 @@ def test_planner_rejection_names_the_option(
 
 
 @pytest.mark.cpu_test
+@over_m
 def test_admission_oom_latches_and_reports_progress(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, served: _Served
 ) -> None:
+    # @spec TXG-MEM-009
     captured: list[int] = []
     failing: list[int] = []
 
@@ -3645,7 +4498,9 @@ def test_admission_oom_latches_and_reports_progress(
             raise torch.OutOfMemoryError("injected admission capture OOM")
         captured.append(index)
 
-    model, _config = _model(monkeypatch, runtime=lambda: _rerun_runtime(on_capture))
+    model, _config = _model(
+        monkeypatch, runtime=lambda: _rerun_runtime(on_capture), served=served
+    )
     prepared = _track_capture_cells(monkeypatch)
     base = 1 << 34
     _free_memory(monkeypatch, _readings(base, base - 111_111_111))
@@ -3668,17 +4523,19 @@ def test_admission_oom_latches_and_reports_progress(
 
 
 @pytest.mark.cpu_test
-def test_serving_capture_rejects_too_few_usable_slots() -> None:
-    core = _core()
-    call = _call_bindings(core)
+@over_m
+def test_serving_capture_rejects_too_few_usable_slots(
+    monkeypatch: pytest.MonkeyPatch, served: _Served
+) -> None:
+    # @spec TXG-MEM-010
+    core, call, pools = _served_setup(monkeypatch, served, num_blocks=3)
     binding = tg.TransactionGraphBinding(
         populations=[3],
-        geometries=(GEOM_REG,),
+        geometries=(served.geometry,),
         maximum_population=3,
         vllm_config=object(),
         runtime=_rerun_runtime(),
     )
-    pools = _endpoint_pools(3)
     with pytest.raises(
         (RuntimeError, ValueError), match="transaction_graph_populations"
     ):
@@ -3688,13 +4545,15 @@ def test_serving_capture_rejects_too_few_usable_slots() -> None:
 
 
 @pytest.mark.cpu_test
-def test_serving_capture_requires_admission_on_cuda() -> None:
+@over_m
+def test_serving_capture_requires_admission_on_cuda(served: _Served) -> None:
     """Serving capture on CUDA requires admission; without it the binding latches.
 
     ``capture_transaction_graphs`` calls ``require_admission()`` before serving
     capture over CUDA pools; the CPU check runs that guard directly.
     """
-    binding = _admission_binding()
+    # @spec TXG-MEM-010
+    binding = _admission_binding(geometry=served.geometry)
     with pytest.raises(RuntimeError, match="transaction_graph_populations") as raised:
         binding.require_admission()
     assert "admission" in str(raised.value)
@@ -3709,12 +4568,15 @@ def test_serving_capture_requires_admission_on_cuda() -> None:
 
 
 @pytest.mark.cpu_test
+@over_m
 def test_serving_capture_runs_once_from_initialize_state_slots(
     monkeypatch: pytest.MonkeyPatch,
     cpu_readings: SimpleNamespace,
+    served: _Served,
 ) -> None:
+    # @spec TXG-LIFE-001
     cpu_readings.expected = 5
-    model, config = _model(monkeypatch)
+    model, config = _model(monkeypatch, served=served)
     model.prepare_execution_memory()
     binding = model._transaction_graph
     captures: list[int] = []
@@ -3747,12 +4609,15 @@ def test_serving_capture_runs_once_from_initialize_state_slots(
 
 
 @pytest.mark.cpu_test
+@over_m
 def test_identical_reinitialize_is_a_verified_no_op(
     monkeypatch: pytest.MonkeyPatch,
     cpu_readings: SimpleNamespace,
+    served: _Served,
 ) -> None:
+    # @spec TXG-LIFE-002
     cpu_readings.expected = 5
-    model, config = _model(monkeypatch)
+    model, config = _model(monkeypatch, served=served)
     model.prepare_execution_memory()
     state, slots = _model_state(model, config)
     _initialize(state, slots)
@@ -3780,13 +4645,15 @@ def _rebound(fn: Callable[..., Any]) -> Callable[..., Any]:
 
 @pytest.mark.cpu_test
 @pytest.mark.usefixtures("cpu_readings")
+@over_m
 @pytest.mark.parametrize(
     "change", ["pool-layout", "decode-callable", "transition-callable"]
 )
 def test_changed_pool_layout_on_reinitialize_is_fatal(
-    monkeypatch: pytest.MonkeyPatch, change: str
+    monkeypatch: pytest.MonkeyPatch, served: _Served, change: str
 ) -> None:
-    model, config = _model(monkeypatch)
+    # @spec TXG-LIFE-003
+    model, config = _model(monkeypatch, served=served)
     model.prepare_execution_memory()
     state, slots = _model_state(model, config, num_blocks=4)
     _initialize(state, slots)
@@ -3811,15 +4678,17 @@ def test_changed_pool_layout_on_reinitialize_is_fatal(
             call=_model_call(model),
             blocks=[1],
             fresh=[True],
+            geometry=served.geometry,
         )
 
 
 @pytest.mark.cpu_test
+@over_m
 def test_published_cell_retains_no_capture_context(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, served: _Served
 ) -> None:
-    core = _core()
-    call = _call_bindings(core)
+    # @spec TXG-LIFE-004
+    core, call, _pools = _served_setup(monkeypatch, served)
     stand_in = _StandIn()
     inputs = _track_capture_inputs(monkeypatch)
     prepared = _track_capture_cells(monkeypatch)
@@ -3845,7 +4714,7 @@ def test_published_cell_retains_no_capture_context(
         )(index),
         observe,
     )
-    binding = _admission_binding()
+    binding = _admission_binding(geometry=served.geometry)
     _admit(binding, core, call, stand_in)
     admission = list(prepared)
     assert admission
@@ -3889,9 +4758,12 @@ def test_published_cell_retains_no_capture_context(
 
 
 @pytest.mark.cpu_test
-def test_admission_holder_is_never_published(monkeypatch: pytest.MonkeyPatch) -> None:
-    core = _core()
-    call = _call_bindings(core)
+@over_m
+def test_admission_holder_is_never_published(
+    monkeypatch: pytest.MonkeyPatch, served: _Served
+) -> None:
+    # @spec TXG-LIFE-005
+    core, call, _pools = _served_setup(monkeypatch, served)
     stand_in = _StandIn()
     _free_memory(
         monkeypatch,
@@ -3899,7 +4771,7 @@ def test_admission_holder_is_never_published(monkeypatch: pytest.MonkeyPatch) ->
             stand_in.nbytes[0] if stand_in.nbytes else 0, 1 << 20, 1 << 20
         )(index),
     )
-    binding = _admission_binding()
+    binding = _admission_binding(geometry=served.geometry)
     _admit(binding, core, call, stand_in)
     assert not binding.ready
     assert binding._graphs == {} and binding._pool_signature is None
@@ -3907,22 +4779,27 @@ def test_admission_holder_is_never_published(monkeypatch: pytest.MonkeyPatch) ->
     assert counts["captured_cells"] == 0 and counts["replays"] == 0
     graph_pools = _pool_arguments(_transaction_view(_scratch(4)))
     eager_pools = _clone_pools(graph_pools)
-    kwargs = dict(core=core, call=call, blocks=[1], fresh=[True])
+    kwargs = dict(
+        core=core, call=call, blocks=[1], fresh=[True], geometry=served.geometry
+    )
     expected = _first_step(None, eager_pools, **kwargs)
     actual = _first_step(binding, graph_pools, **kwargs)
     _assert_records_equal([actual], [expected])
     _assert_pools_equal(graph_pools, eager_pools)
     counts = binding.counters()
     assert counts["replays"] == 0
-    assert counts["fallbacks:chunk-fresh:g0:b1:uncaptured"] == 1
+    label = served.label(tg.CELL_FRESH_CHUNK, 1)
+    assert counts[f"fallbacks:{label}:uncaptured"] == 1
 
 
 @pytest.mark.cpu_test
-def test_discard_leaves_no_published_cell_or_arena() -> None:
-    core = _core()
-    call = _call_bindings(core)
-    pools = _endpoint_pools(4)
-    binding = _binding(core, pools, call, _rerun_runtime())
+@over_m
+def test_discard_leaves_no_published_cell_or_arena(
+    monkeypatch: pytest.MonkeyPatch, served: _Served
+) -> None:
+    # @spec TXG-LIFE-006
+    core, call, pools = _served_setup(monkeypatch, served)
+    binding = _binding(core, pools, call, _rerun_runtime(), geometry=served.geometry)
     assert binding.ready
     owned = [
         weakref.ref(value)
@@ -3949,12 +4826,14 @@ def test_discard_leaves_no_published_cell_or_arena() -> None:
 
 @pytest.mark.cpu_test
 @pytest.mark.usefixtures("cpu_readings")
+@over_m
 @pytest.mark.parametrize(
     "case", ["served", "admitted-only", "option-off", "uninitialized"]
 )
 def test_model_state_shutdown_discards_the_binding(
-    monkeypatch: pytest.MonkeyPatch, case: str
+    monkeypatch: pytest.MonkeyPatch, served: _Served, case: str
 ) -> None:
+    # @spec TXG-LIFE-006 / TXG-LIFE-007
     if case == "uninitialized":
         # A model state whose construction did not complete.
         NemotronASRModelState.__new__(NemotronASRModelState).shutdown()
@@ -3962,7 +4841,7 @@ def test_model_state_shutdown_discards_the_binding(
     hf: dict[str, Any] = {}
     if case == "option-off":
         hf["transaction_graph_populations"] = []
-    model, config = _model(monkeypatch, **hf)
+    model, config = _model(monkeypatch, served=served, **hf)
     model.prepare_execution_memory()
     state, slots = _model_state(model, config)
     if case == "served":
@@ -4128,23 +5007,30 @@ class _ResidentWrites(TorchDispatchMode):
 
 
 @pytest.mark.cpu_test
-def test_serving_capture_requires_the_pool_layout() -> None:
+@over_m
+def test_serving_capture_requires_the_pool_layout(
+    monkeypatch: pytest.MonkeyPatch, served: _Served
+) -> None:
     """Serving capture records the pool layout post-warmup verification reads."""
-    core = _core()
-    call = _call_bindings(core)
-    binding = _admission_binding()
-    pools = _transaction_pools(_endpoint_pools(4))
+    # @spec TXG-VER-001
+    core, call, pools = _served_setup(monkeypatch, served)
+    binding = _admission_binding(geometry=served.geometry)
     with pytest.raises(TypeError, match="pool_layout"):
         binding.capture(
-            core, pools=pools, call=call, hidden_size=CARRIER_HIDDEN, device=CPU
+            core,
+            pools=_transaction_pools(pools),
+            call=call,
+            hidden_size=CARRIER_HIDDEN,
+            device=CPU,
         )
     assert not binding.serving_captured and not binding.ready
 
 
 @pytest.mark.cpu_test
 @pytest.mark.usefixtures("cpu_readings")
+@over_m
 def test_scatter_warmup_names_a_non_null_free_block(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, served: _Served
 ) -> None:
     """The admission and serving scatter warm-ups name a non-null block.
 
@@ -4159,8 +5045,9 @@ def test_scatter_warmup_names_a_non_null_free_block(
     def record(pools: Any, **kwargs: Any) -> None:
         named.append((int(pools.queue.shape[0]), kwargs.get("block_id")))
 
+    # @spec TXG-LIFE-008
     monkeypatch.setattr(nemotron_asr, "_warm_scatter", record)
-    model, config = _model(monkeypatch)
+    model, config = _model(monkeypatch, served=served)
     model.prepare_execution_memory()
     state, slots = _model_state(model, config)
     _initialize(state, slots)
@@ -4173,8 +5060,9 @@ def test_scatter_warmup_names_a_non_null_free_block(
 
 @pytest.mark.cpu_test
 @pytest.mark.usefixtures("cpu_readings")
+@over_m
 def test_capture_reaches_pools_only_through_the_startup_accessor(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, served: _Served
 ) -> None:
     """Capture reaches the pools only through startup access and stores nothing.
 
@@ -4184,7 +5072,8 @@ def test_capture_reaches_pools_only_through_the_startup_accessor(
     write into resident storage is caught even when it stores the bytes a
     page holds.
     """
-    model, config = _model(monkeypatch)
+    # @spec TXG-LIFE-008
+    model, config = _model(monkeypatch, served=served)
     model.prepare_execution_memory()
     state, slots = _model_state(model, config)
     resident = _seed_sentinels(model, slots)
@@ -4214,8 +5103,13 @@ def test_capture_reaches_pools_only_through_the_startup_accessor(
         monkeypatch.setattr(
             StateSlotViews, "_views", property(private_views), raising=False
         )
+        bucket = _bucket_counts(model._chunk_bucket_binding)
         _initialize(state, slots)
         assert model._transaction_graph.ready
+        # With the bucket on, each B1 CHUNK cell's eager reference launched the
+        # bucket graph inside the access window, under the observation above.
+        launched = _bucket_delta(bucket, _bucket_counts(model._chunk_bucket_binding))
+        assert bool(launched[0].get((1, 1))) == bool(served.bucket), launched
         assert len(accesses) == 1
         assert not _live(accesses), "the model kept its startup pool access"
         state.post_warmup()
@@ -4227,10 +5121,12 @@ def test_capture_reaches_pools_only_through_the_startup_accessor(
 
 @pytest.mark.cpu_test
 @pytest.mark.usefixtures("cpu_readings")
+@over_m
 def test_profiling_bindings_capture_and_retain_nothing(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, served: _Served
 ) -> None:
-    model, config = _model(monkeypatch)
+    # @spec TXG-LIFE-009
+    model, config = _model(monkeypatch, served=served)
     model.prepare_execution_memory()
     binding = model._transaction_graph
     admission = binding._admission
@@ -4268,15 +5164,22 @@ def test_profiling_bindings_capture_and_retain_nothing(
 
 
 def _verified_model(
-    monkeypatch: pytest.MonkeyPatch, *, num_blocks: int = 3, graphed: bool = False
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    num_blocks: int = 3,
+    graphed: bool = False,
+    served: _Served = G0,
+    before_capture: Callable[[Any], None] | None = None,
 ) -> tuple[Any, NemotronASRModelState, StateSlotBindings]:
     """A served model with every cell captured over resident slots.
 
     ``graphed`` serves the graphed encoder and decode arms over the CPU
-    re-executing runtime, so the outer body reads their entries' scratch.
+    re-executing runtime, so the outer body reads their entries' scratch; a
+    bucket-on ``served`` configuration always does. ``before_capture``
+    receives the prepared model before serving capture.
     """
     hf: dict[str, Any] = {}
-    if graphed:
+    if graphed and not served.bucket:
         from vllm.models.nemotron_asr import decode_graph, encoder_execution
 
         monkeypatch.setattr(encoder_execution, "platform_graph_runtime", _rerun_runtime)
@@ -4285,8 +5188,10 @@ def _verified_model(
             "encoder_execution_arm": "eager-graphed",
             "decode_dispatch_arm": "dense-graphed",
         }
-    model, config = _model(monkeypatch, **hf)
+    model, config = _model(monkeypatch, served=served, **hf)
     model.prepare_execution_memory()
+    if before_capture is not None:
+        before_capture(model)
     state, slots = _model_state(model, config, num_blocks=num_blocks)
     _initialize(state, slots)
     assert model._transaction_graph.ready
@@ -4319,6 +5224,135 @@ _VERIFY_MISMATCHES = (
 )
 #: The mismatches in nested-binding scratch, which need the graphed arms.
 _NESTED_MISMATCHES = ("relocated-encoder-entry", "relocated-decoder-entry")
+
+#: The owned outputs of a sealed CHUNK-bucket transition.
+_BUCKET_OUTPUTS = (
+    "token_ids",
+    "token_lengths",
+    "row_status",
+    "frame_emission_counts",
+    "frame_final_labels",
+    "frame_valid_lengths",
+    "valid_samples",
+    "geometry_id",
+    "final_tail",
+    "prompt_index",
+    "chunk_sequence",
+    "counter_invariant_bad",
+    "counter_delta_bad",
+)
+
+
+def _bucket_fields(layers: int) -> tuple[str, ...]:
+    """The inventory fields of one sealed bucket cell (Post-Warmup Verification).
+
+    Staged inputs, the state copy for ``layers`` encoder layers and the owned
+    outputs.
+    """
+    return (
+        "env",
+        "prompt",
+        "status",
+        "state.raw_tail",
+        "state.mel_tail",
+        "state.frontend_counters",
+        *(
+            f"state.{family}.{index}"
+            for index in range(layers)
+            for family in ("channel", "window_valid", "time")
+        ),
+        "state.h",
+        "state.c",
+        "state.last_label",
+        *(f"out.{name}" for name in _BUCKET_OUTPUTS),
+    )
+
+
+def _bucket_schema(model: Any) -> list[str]:
+    """Every inventory entry the served bucket populations' sealed cells must
+    report, at g1.
+
+    The schema derives from the served configuration, not from what the
+    binding reports or holds.
+    """
+    populations = sorted(model.config.chunk_bucket_graph_populations)
+    fields = _bucket_fields(int(model.config.n_layers))
+    return [
+        f"encoder.bucket.1.{population}.{field}"
+        for population in populations
+        for field in fields
+    ]
+
+
+#: Bucket-inventory changes, each of which the verification must reject while
+#: the CHUNK-bucket binding is on: a relocated or resized entry of each kind
+#: (the resize also as a same-address view of changed size), each missing
+#: field of the B1 cell, a missing B31 cell and an empty inventory after
+#: publication; an entry missing at publication only; and an entry missing,
+#: or the whole inventory empty, at both publication and verification.
+_BUCKET_MISMATCHES = (
+    "relocated-bucket-staged-input",
+    "resized-bucket-state-copy",
+    "narrowed-bucket-state-copy",
+    "relocated-bucket-owned-output",
+    *(f"missing-bucket-{field}" for field in _bucket_fields(N_LAYERS)),
+    "missing-bucket-cell",
+    "empty-bucket-inventory",
+    "recorded-missing-bucket-entry",
+    "both-missing-bucket-entry",
+    "both-empty-bucket-inventory",
+)
+#: The bucket cases whose inventory gap is injected before publication.
+_PUBLICATION_GAPS = (
+    "recorded-missing-bucket-entry",
+    "both-missing-bucket-entry",
+    "both-empty-bucket-inventory",
+)
+#: ``(served, mismatch)``: every kind over M, and the bucket kinds bucket-on.
+_VERIFICATION_CASES = [
+    *((served, kind) for served in M for kind in _VERIFY_MISMATCHES),
+    *((G1_BUCKET, kind) for kind in _BUCKET_MISMATCHES),
+]
+_verification_cases = pytest.mark.parametrize(
+    ("served", "mismatch"),
+    _VERIFICATION_CASES,
+    ids=[f"{served.name}-{kind}" for served, kind in _VERIFICATION_CASES],
+)
+#: The B1 entry whose omission the publication-gap cases inject.
+_RECORDED_GAP = "encoder.bucket.1.1.env"
+
+
+def _recorded_inventory_gap(
+    mismatch: str, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Callable[[Any], None] | None, dict[str, bool]]:
+    """A pre-capture hook that thins the bucket's reported inventory.
+
+    The ``recorded`` case hides ``_RECORDED_GAP`` until the returned flag is
+    cleared, so only the inventory recorded at publication lacks it. The
+    ``both`` cases hide ``_RECORDED_GAP``, or every entry, for the rest of the
+    test, so the recorded and the live inventory agree and only the schema
+    check can reject them. Returns ``None`` for every other ``mismatch``.
+    """
+    hidden = {"value": mismatch in _PUBLICATION_GAPS}
+    if not hidden["value"]:
+        return None, hidden
+    lasting = mismatch != "recorded-missing-bucket-entry"
+
+    def hide(model: Any) -> None:
+        bucket = model._chunk_bucket_binding
+        report = _seam(bucket, "external_tensors")
+
+        def reported() -> dict[str, torch.Tensor]:
+            tensors = dict(report())
+            if mismatch == "both-empty-bucket-inventory":
+                return {}
+            if hidden["value"] or lasting:
+                tensors.pop(_RECORDED_GAP, None)
+            return tensors
+
+        monkeypatch.setattr(bucket, "external_tensors", reported)
+
+    return hide, hidden
 
 
 def _verification_mismatch(
@@ -4354,6 +5388,8 @@ def _verification_mismatch(
         return check
 
     encoder = model.core.encoder
+    if "bucket" in kind:
+        return _bucket_mismatch(model, kind, monkeypatch, names)
     if kind == "resized-buffer":
         _resize_positional_buffer(model)
         return names("encoder.pos_enc.pe")
@@ -4415,18 +5451,90 @@ def _verification_mismatch(
     return names("buffer decode.graph.", ".enc_frames")
 
 
+def _bucket_mismatch(
+    model: Any,
+    kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+    names: Callable[..., Callable[[str], None]],
+) -> Callable[[str], None]:
+    """Change the live CHUNK-bucket inventory after publication, as ``kind``.
+
+    The bucket binding's inventory must already name every schema entry. A
+    relocated entry is a same-size copy, a resized one gains a row, a narrowed
+    one is a view at the same address with one element fewer, and a missing
+    one is absent from the live report. The publication-gap cases were
+    injected by ``_recorded_inventory_gap`` before capture.
+    """
+    bucket = model._chunk_bucket_binding
+    assert bucket is not None
+    schema = _bucket_schema(model)
+    if kind == "both-empty-bucket-inventory":
+        return names("encoder.bucket.")
+    if kind in _PUBLICATION_GAPS:
+        return names(_RECORDED_GAP)
+    report = _seam(bucket, "external_tensors")
+    live = dict(report())
+    missing = [name for name in schema if name not in live]
+    assert not missing, f"the bucket inventory lacks {missing}"
+    prefix = "encoder.bucket.1.1."
+    changed = dict(live)
+    if kind == "relocated-bucket-staged-input":
+        entry = prefix + "env"
+        changed[entry] = live[entry].clone()
+        expected = names(entry)
+    elif kind == "resized-bucket-state-copy":
+        entry = prefix + "state.h"
+        tensor = live[entry]
+        changed[entry] = torch.cat((tensor, tensor[:1]))
+        expected = names(entry)
+    elif kind == "narrowed-bucket-state-copy":
+        entry = prefix + "state.c"
+        tensor = live[entry]
+        narrowed = tensor.reshape(-1)[:-1]
+        assert narrowed.data_ptr() == tensor.data_ptr()
+        changed[entry] = narrowed
+        expected = names(entry)
+    elif kind == "relocated-bucket-owned-output":
+        entry = prefix + "out.token_ids"
+        changed[entry] = live[entry].clone()
+        expected = names(entry)
+    elif kind == "missing-bucket-cell":
+        cell = "encoder.bucket.1.31."
+        changed = {name: t for name, t in live.items() if not name.startswith(cell)}
+        expected = names(cell)
+    elif kind == "empty-bucket-inventory":
+        changed = {}
+        expected = names("encoder.bucket.")
+    else:
+        entry = prefix + kind.removeprefix("missing-bucket-")
+        del changed[entry]
+        expected = names(entry)
+    monkeypatch.setattr(bucket, "external_tensors", lambda: changed)
+    return expected
+
+
 @pytest.mark.cpu_test
-@pytest.mark.parametrize("mismatch", _VERIFY_MISMATCHES)
+@_verification_cases
 def test_post_warmup_verification_rejects_resized_external_buffer(
-    monkeypatch: pytest.MonkeyPatch, cpu_readings: SimpleNamespace, mismatch: str
+    monkeypatch: pytest.MonkeyPatch,
+    cpu_readings: SimpleNamespace,
+    served: _Served,
+    mismatch: str,
 ) -> None:
+    # @spec TXG-VER-001
     cpu_readings.expected = 5
+    before_capture, hidden = _recorded_inventory_gap(mismatch, monkeypatch)
     model, _state, slots = _verified_model(
-        monkeypatch, graphed=mismatch in _NESTED_MISMATCHES
+        monkeypatch,
+        graphed=mismatch in _NESTED_MISMATCHES,
+        served=served,
+        before_capture=before_capture,
     )
     verify = _seam(model, "verify_transaction_graphs")
     layer = model._persistent_state_layer.prefix
-    verify(slots.pool_layout(layer))
+    if before_capture is None:
+        verify(slots.pool_layout(layer))
+    hidden["value"] = False
     check = _verification_mismatch(model, slots, mismatch, monkeypatch)
     with pytest.raises(RuntimeError, match="transaction_graph_populations") as raised:
         verify(slots.pool_layout(layer))
@@ -4434,8 +5542,9 @@ def test_post_warmup_verification_rejects_resized_external_buffer(
 
 
 @pytest.mark.cpu_test
+@over_m
 def test_verification_keeps_no_resident_view(
-    monkeypatch: pytest.MonkeyPatch, cpu_readings: SimpleNamespace
+    monkeypatch: pytest.MonkeyPatch, cpu_readings: SimpleNamespace, served: _Served
 ) -> None:
     """No resident view outlives ``post_warmup`` and the slots while published.
 
@@ -4445,8 +5554,9 @@ def test_verification_keeps_no_resident_view(
     references, so an alias the views do not reach, such as a detached
     tensor, keeps it alive and is caught. ``discard()`` runs only afterwards.
     """
+    # @spec TXG-VER-001
     cpu_readings.expected = 5
-    model, state, slots = _verified_model(monkeypatch)
+    model, state, slots = _verified_model(monkeypatch, served=served)
     owner = slots.views[model._persistent_state_layer.prefix]
     resident = [weakref.ref(view) for view in owner._views.values()]
     resident.append(weakref.ref(owner._tensor))
@@ -4467,12 +5577,15 @@ def test_verification_keeps_no_resident_view(
 
 
 @pytest.mark.cpu_test
+@over_m
 def test_post_warmup_verifies_once_and_real_steps_check_the_latch(
     monkeypatch: pytest.MonkeyPatch,
     cpu_readings: SimpleNamespace,
+    served: _Served,
 ) -> None:
+    # @spec TXG-VER-002
     cpu_readings.expected = 5
-    model, state, slots = _verified_model(monkeypatch, num_blocks=4)
+    model, state, slots = _verified_model(monkeypatch, num_blocks=4, served=served)
     events: list[str] = []
     verify = _seam(model, "verify_transaction_graphs")
     prune = model._registry.prune
@@ -4500,7 +5613,7 @@ def test_post_warmup_verifies_once_and_real_steps_check_the_latch(
     assert events == ["verify", "prune", "prune"]
 
     binding = model._transaction_graph
-    graph = binding._graphs[tg.TransactionCell(tg.CELL_FRESH_CHUNK, GEOM_REG, 1)]
+    graph = binding._graphs[served.cell(tg.CELL_FRESH_CHUNK, 1)]
 
     def fail(*_args: Any) -> None:
         raise RuntimeError("replay failed")
@@ -4514,6 +5627,7 @@ def test_post_warmup_verifies_once_and_real_steps_check_the_latch(
             call=_model_call(model),
             blocks=[1],
             fresh=[True],
+            geometry=served.geometry,
         )
     with pytest.raises(RuntimeError, match="a fresh worker is required"):
         state.prepare_step(
@@ -4523,14 +5637,23 @@ def test_post_warmup_verifies_once_and_real_steps_check_the_latch(
 
 
 @pytest.mark.cpu_test
-@pytest.mark.parametrize("mismatch", _VERIFY_MISMATCHES)
+@_verification_cases
 def test_post_warmup_mismatch_is_fatal_before_any_state_change(
-    monkeypatch: pytest.MonkeyPatch, cpu_readings: SimpleNamespace, mismatch: str
+    monkeypatch: pytest.MonkeyPatch,
+    cpu_readings: SimpleNamespace,
+    served: _Served,
+    mismatch: str,
 ) -> None:
+    # @spec TXG-VER-003 / TXG-VER-004
     cpu_readings.expected = 5
+    before_capture, hidden = _recorded_inventory_gap(mismatch, monkeypatch)
     model, state, slots = _verified_model(
-        monkeypatch, graphed=mismatch in _NESTED_MISMATCHES
+        monkeypatch,
+        graphed=mismatch in _NESTED_MISMATCHES,
+        served=served,
+        before_capture=before_capture,
     )
+    hidden["value"] = False
     pruned: list[Any] = []
     monkeypatch.setattr(model._registry, "prune", pruned.append)
     resident = slots.views[model._persistent_state_layer.prefix]._tensor
@@ -4568,29 +5691,67 @@ def _owners(model: Any) -> dict[str, Any]:
 
 
 @pytest.mark.cpu_test
+@over_m
 def test_option_off_receipt_has_no_transaction_graph_entry(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, served: _Served
 ) -> None:
-    model, _config = _model(monkeypatch, transaction_graph_populations=[])
+    # @spec TXG-OBS-001
+    model, _config = _model(
+        monkeypatch, served=served, transaction_graph_populations=[]
+    )
     model.prepare_execution_memory()
     receipt = model.execution_profile_receipt()
     assert receipt["schema"] == "nemotron-execution-profile/1"
     assert "transaction" not in receipt
 
 
+#: Owners the counters cannot reach a model through; none depends on the
+#: served configuration.
+_UNREACHABLE = {
+    "foreign": object(),
+    "multiprocess-executor": SimpleNamespace(
+        model_executor=SimpleNamespace(workers=())
+    ),
+    "remote-worker": SimpleNamespace(
+        model_executor=SimpleNamespace(driver_worker=None)
+    ),
+}
+#: ``(served, option populations, unreachable target)``: a reachable model
+#: with the option on and off in every configuration of M, then each
+#: unreachable target once.
+_REACH_CASES = [
+    *((served, populations, None) for served in M for populations in ([1, 2], [])),
+    *((None, None, name) for name in _UNREACHABLE),
+]
+
+
 @pytest.mark.cpu_test
 @pytest.mark.parametrize(
-    "target",
-    [
-        object(),
-        SimpleNamespace(model_executor=SimpleNamespace(workers=())),
-        SimpleNamespace(model_executor=SimpleNamespace(driver_worker=None)),
+    ("served", "populations", "target"),
+    _REACH_CASES,
+    ids=[
+        target or f"{served.name}-option-{'on' if populations else 'off'}"
+        for served, populations, target in _REACH_CASES
     ],
-    ids=["foreign", "multiprocess-executor", "remote-worker"],
 )
-def test_counters_raise_when_the_model_is_unreachable(target: Any) -> None:
-    with pytest.raises(Exception, match=r"(?i)reach"):
-        tg.transaction_graph_counters(target)
+def test_counters_raise_when_the_model_is_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+    served: _Served | None,
+    populations: list[int] | None,
+    target: str | None,
+) -> None:
+    """Counters reach an in-process model in every configuration, option on or
+    off, and raise for every owner through which no model is reachable."""
+    # @spec TXG-OBS-003
+    if target is not None:
+        with pytest.raises(Exception, match=r"(?i)reach"):
+            tg.transaction_graph_counters(_UNREACHABLE[target])
+        return
+    model, _config = _model(
+        monkeypatch, served=served, transaction_graph_populations=populations
+    )
+    reachable = tg.transaction_graph_counters(model)
+    assert bool(reachable) == bool(populations)
 
 
 # ---- CUDA: real graph replay -----------------------------------------------
@@ -4625,25 +5786,37 @@ def exact_fp32() -> Iterator[None]:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.usefixtures("exact_fp32")
 @torch.inference_mode()
-def test_cuda_graph_replay_matches_eager_across_varied_plans() -> None:
-    _replay_parity(torch.device("cuda"), _cuda_runtime())
+@_over(M_AND_1_63)
+def test_cuda_graph_replay_matches_eager_across_varied_plans(
+    monkeypatch: pytest.MonkeyPatch, served: _Served
+) -> None:
+    # @spec TXG-REP-010
+    _replay_parity(torch.device("cuda"), _cuda_runtime(), monkeypatch, served)
 
 
 @pytest.mark.nemotron_gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.usefixtures("exact_fp32")
 @torch.inference_mode()
+@_over(M_AND_1_63)
 @pytest.mark.parametrize("endpoint", [True, False], ids=["endpoint", "no-endpoint"])
 @pytest.mark.parametrize(("population", "chunks"), _POPULATION_CHUNKS)
 def test_cuda_population_lockstep_replays_every_chunk(
-    population: int, chunks: int, endpoint: bool
+    monkeypatch: pytest.MonkeyPatch,
+    served: _Served,
+    population: int,
+    chunks: int,
+    endpoint: bool,
 ) -> None:
+    # @spec TXG-REP-010
     _population_parity(
         torch.device("cuda"),
         _cuda_runtime(),
         population,
         chunks=chunks,
         endpoint=endpoint,
+        monkeypatch=monkeypatch,
+        served=served,
     )
 
 
@@ -4651,49 +5824,89 @@ def test_cuda_population_lockstep_replays_every_chunk(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.usefixtures("exact_fp32")
 @torch.inference_mode()
+@over_m
 @pytest.mark.parametrize("population", [31, 63])
 def test_cuda_one_corrupt_row_in_a_population_is_rejected_alone(
-    population: int,
+    monkeypatch: pytest.MonkeyPatch, served: _Served, population: int
 ) -> None:
-    _corrupt_row_in_population(torch.device("cuda"), _cuda_runtime(), population)
+    # @spec TXG-REP-012
+    _corrupt_row_in_population(
+        torch.device("cuda"), _cuda_runtime(), population, monkeypatch, served
+    )
+
+
+#: Rejected rows per configuration; the oversized final tail exists at g1.
+_CORRUPTIONS = [
+    (served, corruption)
+    for served in M
+    for corruption in ("sequence", "echo", "book", "oversize")
+    if corruption != "oversize" or served.geometry == 1
+]
 
 
 @pytest.mark.nemotron_gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.usefixtures("exact_fp32")
 @torch.inference_mode()
-@pytest.mark.parametrize("corruption", ["sequence", "echo", "book"])
-def test_cuda_graph_replay_rejects_corrupt_rows_like_eager(corruption: str) -> None:
-    _corrupt_rows_parity(torch.device("cuda"), _cuda_runtime(), corruption)
+@pytest.mark.parametrize(
+    ("served", "corruption"),
+    _CORRUPTIONS,
+    ids=[f"{served.name}-{corruption}" for served, corruption in _CORRUPTIONS],
+)
+def test_cuda_graph_replay_rejects_corrupt_rows_like_eager(
+    monkeypatch: pytest.MonkeyPatch, served: _Served, corruption: str
+) -> None:
+    # @spec TXG-REP-012
+    _corrupt_rows_parity(
+        torch.device("cuda"), _cuda_runtime(), corruption, monkeypatch, served
+    )
 
 
 def _corrupt_rows_parity(
-    device: torch.device, runtime: GraphRuntime, corruption: str
+    device: torch.device,
+    runtime: GraphRuntime,
+    corruption: str,
+    monkeypatch: pytest.MonkeyPatch,
+    served: _Served = G0,
 ) -> None:
     """A corrupt row is rejected under replay exactly as under eager.
 
     Collection reports the same failed request in both arms, and the step
-    neither raises nor latches the binding.
+    neither raises nor latches the binding. ``oversize`` is a continuing final
+    tail of ``C·hop`` samples, which carries ``ROW_STATUS_FINAL_OVERSIZE``.
     """
-    core = _core(device)
-    call = _call_bindings(core)
-    eager_pools = _endpoint_pools(4, device)
+    geometry = served.geometry
+    core, call, eager_pools = _served_setup(monkeypatch, served, device=device)
     graph_pools = _clone_pools(eager_pools)
-    binding = _binding(core, graph_pools, call, runtime, device=device)
+    binding = _binding(
+        core, graph_pools, call, runtime, device=device, geometry=geometry
+    )
+    step = dict(core=core, call=call, geometry=geometry)
 
     def run(pools: Pools, graph: Any) -> tuple[list[Any], set[str]]:
-        records = [
-            _first_step(graph, pools, core=core, call=call, blocks=[2], fresh=[True])
-        ]
+        records = [_first_step(graph, pools, blocks=[2], fresh=[True], **step)]
         token = int(records[0][0][0, 0])
-        if corruption == "sequence":
-            embeds = _chunk(9, seq=5, geometry=GEOM_REG, final=False, prompt=0)
-            plan = _plan(prefills=[2], num_pool_blocks=4, has_initial=[True])
+        if corruption in ("sequence", "oversize"):
+            oversize = corruption == "oversize"
+            embeds = _chunk(
+                9,
+                seq=1 if oversize else 5,
+                geometry=geometry,
+                final=oversize,
+                prompt=0,
+                samples=G1_SAMPLES if oversize else None,
+            )
+            plan = _plan(
+                prefills=[2],
+                num_pool_blocks=4,
+                has_initial=[True],
+                geometries=[geometry],
+            )
             ids, rows = [PLACEHOLDER_ID], embeds.unsqueeze(0).to(device)
         else:
             if corruption == "book":
                 pools["book_pool"][2, _BOOK["queue_head"]] = CAP + 5
-            plan = _plan(decodes=[2], num_pool_blocks=4)
+            plan = _plan(decodes=[2], num_pool_blocks=4, geometries=[geometry])
             wrong = token + 1 if token + 1 < VOCAB else 0
             ids = [wrong if corruption == "echo" else token]
             rows = torch.zeros(1, CARRIER_HIDDEN, device=device)
@@ -4707,11 +5920,13 @@ def _corrupt_rows_parity(
     actual, actual_failed = run(graph_pools, binding)
     _assert_records_equal(actual, expected)
     assert int(expected[1][1][0]) != 0
+    if corruption == "oversize":
+        assert int(expected[1][1][0]) & ROW_STATUS_FINAL_OVERSIZE
     assert actual_failed == expected_failed == {"req-0"}
     _assert_pools_equal(graph_pools, eager_pools)
     counts = binding.counters()
     assert counts["fallbacks"] == 0
-    _first_step(binding, graph_pools, core=core, call=call, blocks=[3], fresh=[True])
+    _first_step(binding, graph_pools, blocks=[3], fresh=[True], **step)
     assert binding.counters()["replays"] == counts["replays"] + 1, "latched"
 
 
@@ -4719,15 +5934,20 @@ def _corrupt_rows_parity(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.usefixtures("exact_fp32")
 @torch.inference_mode()
-def test_cuda_replayed_rows_survive_another_cells_replay() -> None:
+@over_m
+def test_cuda_replayed_rows_survive_another_cells_replay(
+    monkeypatch: pytest.MonkeyPatch, served: _Served
+) -> None:
+    # @spec TXG-FAIL-003
     device = torch.device("cuda")
-    core = _core(device)
-    call = _call_bindings(core)
-    pools = _endpoint_pools(4, device)
-    binding = _binding(core, pools, call, _cuda_runtime(), device=device)
-    first = _first_step(binding, pools, core=core, call=call, blocks=[1], fresh=[True])
+    core, call, pools = _served_setup(monkeypatch, served, device=device)
+    binding = _binding(
+        core, pools, call, _cuda_runtime(), device=device, geometry=served.geometry
+    )
+    step = dict(core=core, call=call, geometry=served.geometry)
+    first = _first_step(binding, pools, blocks=[1], fresh=[True], **step)
     kept = first[0].clone()
-    _first_step(binding, pools, core=core, call=call, blocks=[2, 3], fresh=[True] * 2)
+    _first_step(binding, pools, blocks=[2, 3], fresh=[True] * 2, **step)
     torch.cuda.synchronize()
     torch.testing.assert_close(first[0], kept, atol=0, rtol=0)
     assert binding.counters()["replays"] == 2
@@ -4754,19 +5974,21 @@ def _cuda_inventories(
     monkeypatch: pytest.MonkeyPatch,
     *,
     on_read: Callable[[int], None] | None = None,
+    served: _Served = G0,
 ) -> SimpleNamespace:
     """Admit, then serve, populations ``(1, 2)`` with real CUDA graphs.
 
     Readings are the real normalized readings, observed by ``on_read``.
     Returns the binding, its runtime, core, call bindings and resident pools,
-    and every graph capture as ``(phase, stream, pool)``.
+    and every graph capture as ``(phase, stream, pool)``. With the bucket on,
+    the nested encoder, decode and bucket graphs are captured first, in phase
+    ``None``.
     """
     device = torch.device("cuda")
-    core = _core(device)
-    call = _call_bindings(core)
-    runtime = _cuda_runtime()
     phase: dict[str, str | None] = {"value": None}
     captures = _track_graph_captures(monkeypatch, phase)
+    core, call, _pools = _served_setup(monkeypatch, served, device=device)
+    runtime = _cuda_runtime()
     if on_read is not None:
         reading = _seam(tg, "normalized_free_memory")
         calls: list[int] = []
@@ -4778,7 +6000,7 @@ def _cuda_inventories(
             return value
 
         monkeypatch.setattr(tg, "normalized_free_memory", observed)
-    binding = _admission_binding(runtime=runtime)
+    binding = _admission_binding(runtime=runtime, geometry=served.geometry)
     phase["value"] = "admission"
     _admit(binding, core, call, _StandIn(device), device)
     resident = _transaction_view(_scratch(4, device))
@@ -4824,24 +6046,31 @@ def spawnable_module(monkeypatch: pytest.MonkeyPatch) -> None:
 @create_new_process_for_each_test(method="spawn")
 @_exact_fp32()
 @torch.inference_mode()
+@over_m
 def test_cuda_admission_and_serving_capture_share_cell_order(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, served: _Served
 ) -> None:
+    # @spec TXG-MEM-002
     from vllm.platforms import current_platform
 
-    served = _cuda_inventories(monkeypatch)
-    binding, captures = served.binding, served.captures
+    inventories = _cuda_inventories(monkeypatch, served=served)
+    binding, captures = inventories.binding, inventories.captures
     admission = [capture for capture in captures if capture[0] == "admission"]
     serving = [capture for capture in captures if capture[0] == "serving"]
     assert len(admission) == len(serving) == len(binding.cells)
-    assert len({stream for _phase, stream, _pool in captures}) == 1
+    assert len({stream for _phase, stream, _pool in admission + serving}) == 1
     admission_pools = {pool for _phase, _stream, pool in admission}
     serving_pools = {pool for _phase, _stream, pool in serving}
     assert len(admission_pools) == len(serving_pools) == 1
     assert admission_pools.isdisjoint(serving_pools)
+    # With the bucket on, the model's encoder, decode and bucket graphs were
+    # captured before admission, into their own runtimes' pools.
+    model_nested = {pool for phase, _stream, pool in captures if phase is None}
+    assert bool(model_nested) == bool(served.bucket)
     nested = {
         tuple(current_platform.get_global_graph_pool()),
-        tuple(served.runtime.wrapper_factory(lambda: None).graph_pool),
+        tuple(inventories.runtime.wrapper_factory(lambda: None).graph_pool),
+        *model_nested,
     }
     assert admission_pools.isdisjoint(nested)
     assert serving_pools.isdisjoint(nested)
@@ -4859,12 +6088,16 @@ def test_cuda_admission_and_serving_capture_share_cell_order(
 @create_new_process_for_each_test(method="spawn")
 @_exact_fp32()
 @torch.inference_mode()
+@over_m
 def test_cuda_serving_pool_is_distinct_from_released_admission_pool(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, served: _Served
 ) -> None:
+    # @spec TXG-MEM-005
     pools_at: dict[int, set[Any]] = {}
     captures = _cuda_inventories(
-        monkeypatch, on_read=lambda index: pools_at.setdefault(index, _segment_pools())
+        monkeypatch,
+        on_read=lambda index: pools_at.setdefault(index, _segment_pools()),
+        served=served,
     ).captures
     (admission,) = {pool for phase, _stream, pool in captures if phase == "admission"}
     (serving,) = {pool for phase, _stream, pool in captures if phase == "serving"}
@@ -4880,13 +6113,16 @@ def test_cuda_serving_pool_is_distinct_from_released_admission_pool(
 @create_new_process_for_each_test(method="spawn")
 @_exact_fp32()
 @torch.inference_mode()
+@over_m
 def test_cuda_receipt_reports_admission_and_serving_bytes(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, served: _Served
 ) -> None:
-    served = _cuda_inventories(monkeypatch)
-    binding = served.binding
+    # @spec TXG-OBS-002 / TXG-OBS-004
+    inventories = _cuda_inventories(monkeypatch, served=served)
+    binding = inventories.binding
     receipt = binding.receipt()
     assert receipt["ready"] is True
+    assert receipt["served_geometry"] == served.geometry
     assert all(receipt[name] is not None for name in _ADMISSION_FIELDS)
     admitted, serving = receipt["admission_bytes"], receipt["serving_bytes"]
     assert isinstance(admitted, int) and isinstance(serving, int)
@@ -4901,11 +6137,12 @@ def test_cuda_receipt_reports_admission_and_serving_bytes(
         assert isinstance(entry["capture_index"], int)
     _first_step(
         binding,
-        _pool_arguments(served.resident),
-        core=served.core,
-        call=served.call,
+        _pool_arguments(inventories.resident),
+        core=inventories.core,
+        call=inventories.call,
         blocks=[1],
         fresh=[True],
+        geometry=served.geometry,
     )
     model = SimpleNamespace(_transaction_graph=binding)
     previous = torch.cuda.get_sync_debug_mode()
@@ -4917,17 +6154,52 @@ def test_cuda_receipt_reports_admission_and_serving_bytes(
         }
     finally:
         torch.cuda.set_sync_debug_mode(previous)
+    label = served.label(tg.CELL_FRESH_CHUNK, 1)
     for role, value in counts.items():
-        assert value["replays:chunk-fresh:g0:b1"] == 1, role
+        assert value[f"replays:{label}"] == 1, role
+
+
+def _bucket_counts(bucket: Any) -> tuple[dict[Any, int], dict[Any, int]]:
+    """A CHUNK-bucket binding's replay and fallback counts per cell, from its
+    receipt; empty for no binding."""
+    if bucket is None:
+        return {}, {}
+    receipt = bucket.receipt()
+    replays = {
+        (cell["geometry"], cell["encoder_population"]): cell["successful_replays"]
+        for cell in receipt["cells"]
+    }
+    fallbacks = {
+        (cell["geometry"], cell["encoder_population"]): cell["successful_calls"]
+        for cell in receipt["fallbacks"]
+    }
+    return replays, fallbacks
+
+
+def _bucket_delta(
+    before: tuple[dict[Any, int], dict[Any, int]],
+    after: tuple[dict[Any, int], dict[Any, int]],
+) -> tuple[dict[Any, int], dict[Any, int]]:
+    """The nonzero per-cell changes from ``before`` to ``after`` counts."""
+    return tuple(  # type: ignore[return-value]
+        {
+            cell: count - old.get(cell, 0)
+            for cell, count in new.items()
+            if count != old.get(cell, 0)
+        }
+        for old, new in zip(before, after, strict=True)
+    )
 
 
 @pytest.mark.nemotron_gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.usefixtures("exact_fp32")
 @torch.inference_mode()
+@over_m
 def test_cuda_replay_freezes_nested_counters_and_counts_once(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, served: _Served
 ) -> None:
+    # @spec TXG-OBS-005
     from vllm.models.nemotron_asr import encoder_execution
 
     device = torch.device("cuda")
@@ -4936,6 +6208,7 @@ def test_cuda_replay_freezes_nested_counters_and_counts_once(
         monkeypatch,
         runtime=_cuda_runtime,
         device=device,
+        served=served,
         encoder_execution_arm="eager-graphed",
     )
     model.prepare_execution_memory()
@@ -4946,30 +6219,46 @@ def test_cuda_replay_freezes_nested_counters_and_counts_once(
     execution = model._encoder_execution
     pools = _pool_arguments(_resident(model, slots))
     call = _model_call(model)
-    label = "replays:chunk-fresh:g0:b1"
+    label = f"replays:{served.label(tg.CELL_FRESH_CHUNK, 1)}"
+    step = dict(core=model.core, call=call, geometry=served.geometry)
     advance.consume_batch_stats()
     invocations = execution._invocations
+    bucket = _bucket_counts(model._chunk_bucket_binding)
     before = binding.counters()
-    _first_step(binding, pools, core=model.core, call=call, blocks=[1], fresh=[True])
+    _first_step(binding, pools, blocks=[1], fresh=[True], **step)
     after = binding.counters()
     assert execution._invocations == invocations
+    assert _bucket_counts(model._chunk_bucket_binding) == bucket
     assert advance.consume_batch_stats() is not None
     assert after[label] == before[label] + 1
     assert after["replays"] == before["replays"] + 1
     assert after["fallbacks"] == before["fallbacks"]
-    _first_step(None, pools, core=model.core, call=call, blocks=[2], fresh=[True])
-    assert execution._invocations == invocations + 1
+    _first_step(None, pools, blocks=[2], fresh=[True], **step)
+    if served.bucket:
+        # The eager step's one-row bucket runs the sealed bucket graph, whose
+        # body calls the native encoder rather than the guarded transition.
+        assert execution._invocations == invocations
+        replays, fallbacks = _bucket_counts(model._chunk_bucket_binding)
+        assert replays[(1, 1)] == bucket[0][(1, 1)] + 1
+        assert fallbacks == bucket[1]
+    else:
+        assert execution._invocations == invocations + 1
 
 
 @pytest.mark.nemotron_gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @torch.inference_mode()
-def test_cuda_arena_reuses_pinned_buffers_after_async_upload() -> None:
+@over_m
+def test_cuda_arena_reuses_pinned_buffers_after_async_upload(
+    monkeypatch: pytest.MonkeyPatch, served: _Served
+) -> None:
+    # @spec TXG-REP-008
     device = torch.device("cuda")
-    core = _core(device)
-    call = _call_bindings(core)
-    pools = _endpoint_pools(4, device)
-    calls = [_fresh_chunk_inputs(core, pools, call, [block]) for block in (1, 3, 2, 1)]
+    core, call, pools = _served_setup(monkeypatch, served, device=device)
+    calls = [
+        _fresh_chunk_inputs(core, pools, call, [block], served.geometry)
+        for block in (1, 3, 2, 1)
+    ]
     arena = tg.TransactionArena(tg._arena_layout(calls[0]), device)
     assert all(buffer.is_pinned() for buffer in arena._host)
     uploaded = []
@@ -4983,9 +6272,14 @@ def test_cuda_arena_reuses_pinned_buffers_after_async_upload() -> None:
 
 
 def _control_trajectory(
-    core: Any, pools: Pools, call: tg.TransactionCallBindings, graph: Any
+    core: Any,
+    pools: Pools,
+    call: tg.TransactionCallBindings,
+    graph: Any,
+    geometry: int = GEOM_REG,
 ) -> tuple[list[Any], dict[str, int]]:
-    """One session through every accepted control row kind on slot 1.
+    """One session at ``geometry`` through every accepted control row kind on
+    slot 1.
 
     A fresh CHUNK drains to its park, then a park-echo and a forced-endpoint
     row; a final CHUNK drains to its park, then a FLUSH. Returns the records
@@ -5007,7 +6301,7 @@ def _control_trajectory(
             token = step(
                 [token],
                 torch.zeros(1, CARRIER_HIDDEN, device=device),
-                _plan(decodes=[1], num_pool_blocks=4),
+                _plan(decodes=[1], num_pool_blocks=4, geometries=[geometry]),
             )
         raise AssertionError("replay queue did not drain")
 
@@ -5015,12 +6309,17 @@ def _control_trajectory(
         embeds = _chunk(
             23 + seq,
             seq=seq,
-            geometry=GEOM_REG,
+            geometry=geometry,
             final=final,
             prompt=0,
-            samples=REG_SAMPLES // 2 if final else None,
+            samples=_CADENCE_SAMPLES[geometry] // 2 if final else None,
         )
-        plan = _plan(prefills=[1], num_pool_blocks=4, has_initial=[seq > 0])
+        plan = _plan(
+            prefills=[1],
+            num_pool_blocks=4,
+            has_initial=[seq > 0],
+            geometries=[geometry],
+        )
         echo(step([PLACEHOLDER_ID], embeds.unsqueeze(0).to(device), plan))
 
     def control(name: str, token: int) -> int | None:
@@ -5029,7 +6328,7 @@ def _control_trajectory(
         emitted = step(
             [token],
             torch.zeros(1, CARRIER_HIDDEN, device=device),
-            _plan(decodes=[1], num_pool_blocks=4),
+            _plan(decodes=[1], num_pool_blocks=4, geometries=[geometry]),
         )
         if int(records[-1][1][0]):
             _assert_pools_equal(pools, before)
@@ -5045,18 +6344,29 @@ def _control_trajectory(
 
 
 def _control_parity(
-    device: torch.device, runtime: GraphRuntime, endpoint: bool
+    device: torch.device,
+    runtime: GraphRuntime,
+    endpoint: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    served: _Served = G0,
 ) -> None:
     """Accepted control rows replay the ``replay`` cell bitwise exactly."""
-    core = _core(device)
-    call = _call_bindings(core, endpoint=endpoint)
-    eager_pools = _endpoint_pools(4, device, endpoint=endpoint)
+    geometry = served.geometry
+    core, call, eager_pools = _served_setup(
+        monkeypatch, served, device=device, endpoint=endpoint
+    )
     graph_pools = _clone_pools(eager_pools)
     binding = _binding(
-        core, graph_pools, call, runtime, populations=(1,), device=device
+        core,
+        graph_pools,
+        call,
+        runtime,
+        populations=(1,),
+        device=device,
+        geometry=geometry,
     )
-    expected, controls = _control_trajectory(core, eager_pools, call, None)
-    actual, _ = _control_trajectory(core, graph_pools, call, binding)
+    expected, controls = _control_trajectory(core, eager_pools, call, None, geometry)
+    actual, _ = _control_trajectory(core, graph_pools, call, binding, geometry)
     _assert_records_equal(actual, expected)
     _assert_pools_equal(graph_pools, eager_pools)
     statuses = {name: int(expected[index][1][0]) for name, index in controls.items()}
@@ -5072,9 +6382,15 @@ def _control_parity(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.usefixtures("exact_fp32")
 @torch.inference_mode()
+@over_m
 @pytest.mark.parametrize("endpoint", [True, False], ids=["endpoint", "no-endpoint"])
-def test_cuda_replay_cell_accepted_control_rows_match_eager(endpoint: bool) -> None:
-    _control_parity(torch.device("cuda"), _cuda_runtime(), endpoint)
+def test_cuda_replay_cell_accepted_control_rows_match_eager(
+    monkeypatch: pytest.MonkeyPatch, served: _Served, endpoint: bool
+) -> None:
+    # @spec TXG-REP-011
+    _control_parity(
+        torch.device("cuda"), _cuda_runtime(), endpoint, monkeypatch, served
+    )
 
 
 def _storage(tensor: torch.Tensor) -> int:
@@ -5151,16 +6467,25 @@ def _assert_on_stream(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.usefixtures("exact_fp32")
 @torch.inference_mode()
+@over_m
 def test_cuda_replay_runs_on_the_current_stream(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, served: _Served
 ) -> None:
+    # @spec TXG-REP-015
     device = torch.device("cuda")
-    core = _core(device)
-    call = _call_bindings(core)
-    eager_pools = _endpoint_pools(4, device)
+    core, call, eager_pools = _served_setup(monkeypatch, served, device=device)
     graph_pools = _clone_pools(eager_pools)
-    binding = _binding(core, graph_pools, call, _cuda_runtime(), device=device)
-    kwargs = dict(core=core, call=call, blocks=[1], fresh=[True])
+    binding = _binding(
+        core,
+        graph_pools,
+        call,
+        _cuda_runtime(),
+        device=device,
+        geometry=served.geometry,
+    )
+    kwargs = dict(
+        core=core, call=call, blocks=[1], fresh=[True], geometry=served.geometry
+    )
     expected = _first_step(None, eager_pools, **kwargs)
     torch.cuda.synchronize()
     graphs = list(binding._graphs.values())
@@ -5179,7 +6504,8 @@ def test_cuda_replay_runs_on_the_current_stream(
     _assert_pools_equal(graph_pools, eager_pools)
     required = {"replay", "arena", "static_ids", "static_embeds"}
     _assert_on_stream(log, side.cuda_stream, required)
-    assert binding.counters()["replays:chunk-fresh:g0:b1"] == 1
+    label = served.label(tg.CELL_FRESH_CHUNK, 1)
+    assert binding.counters()[f"replays:{label}"] == 1
 
     # The oracle fails on a resident write issued to another stream, whichever
     # operation issues it.
@@ -5215,19 +6541,26 @@ def _segment_pool(tensor: torch.Tensor) -> tuple[int, int]:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.usefixtures("exact_fp32")
 @torch.inference_mode()
+@over_m
 def test_cuda_owned_outputs_are_allocated_outside_the_graph_pool(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, served: _Served
 ) -> None:
+    # @spec TXG-REP-016
     device = torch.device("cuda")
-    core = _core(device)
-    call = _call_bindings(core)
-    pools = _endpoint_pools(4, device)
+    core, call, pools = _served_setup(monkeypatch, served, device=device)
     captures = _track_graph_captures(monkeypatch, {"value": "serving"})
-    binding = _binding(core, pools, call, _cuda_runtime(), device=device)
+    binding = _binding(
+        core, pools, call, _cuda_runtime(), device=device, geometry=served.geometry
+    )
     graph_pools = {pool for _phase, _stream, pool in captures}
     assert graph_pools and None not in graph_pools
     escaped = _advance(
-        core, pools, call, _rows([], [1], device=device), binding, _CommitRecorder()
+        core,
+        pools,
+        call,
+        _rows([], [1], device=device, geometry=served.geometry),
+        binding,
+        _CommitRecorder(),
     )
     for graph in binding._graphs.values():
         for name in ("rows_out", "status_out", "progress_out"):
@@ -5241,12 +6574,13 @@ def _drive_interleaved(
     call: tg.TransactionCallBindings,
     graph: Any,
     tier: Callable[[int], int],
+    geometry: int = GEOM_REG,
 ) -> list[Any]:
     """CHUNK steps that alternate replayed cells with eager fallbacks.
 
     Populations ``1`` and ``2`` are declared; a mixed-fresh step and a
     three-row step fall back. Every CHUNK step drains its echoes before the
-    next, through the same arm.
+    next, through the same arm. Every row serves ``geometry``.
     """
     device = pools["book_pool"].device
     sequence: dict[int, int] = {}
@@ -5260,7 +6594,7 @@ def _drive_interleaved(
                 _chunk(
                     31 * index + block,
                     seq=seq,
-                    geometry=GEOM_REG,
+                    geometry=geometry,
                     final=False,
                     prompt=block % 4,
                 )
@@ -5272,6 +6606,7 @@ def _drive_interleaved(
             num_pool_blocks=5,
             has_initial=[seq > 0 for seq in seqs],
             prompts=[block % 4 for block in blocks],
+            geometries=[geometry] * len(blocks),
             execution_tier=tier(len(blocks)),
         )
         records.append(
@@ -5288,6 +6623,7 @@ def _drive_interleaved(
                 decodes=active,
                 num_pool_blocks=5,
                 prompts=[block % 4 for block in active],
+                geometries=[geometry] * len(active),
                 execution_tier=tier(len(active)),
             )
             records.append(
@@ -5308,7 +6644,99 @@ def _drive_interleaved(
     return records
 
 
-def _interleaved_parity(model: Any, slots: StateSlotBindings) -> None:
+#: The bucket-on interleaving's sessions by block: 31 sessions ``A``, one
+#: session ``B`` and two sessions ``C``.
+_GROUP_A = list(range(1, 32))
+_GROUP_B = [32]
+_GROUP_C = [33, 34]
+
+
+def _drive_bucket_interleaved(
+    core: Any,
+    pools: Pools,
+    call: tg.TransactionCallBindings,
+    graph: Any,
+    geometry: int,
+) -> list[Any]:
+    """Replayed and eager CHUNK steps over one CHUNK-bucket binding.
+
+    Transaction populations ``2`` and ``31`` are declared and bucket
+    populations ``1``, ``31`` and ``63``. Replayed 31-row CHUNK steps record
+    the bucket's eager body; an eager ``mixed-roles`` step of 31 CHUNK rows
+    and one echo row launches the bucket graph at 31 over the same scratch;
+    eager ``undeclared`` one-row CHUNK steps launch it at 1; and replayed
+    two-row CHUNK steps resolve the bucket's eager path. Echoes drain through
+    the same arm after every CHUNK step. Under ``graph``, every replayed step
+    leaves the bucket's replay and fallback counts unchanged.
+    """
+    device = pools["book_pool"].device
+    blocks = _GROUP_A + _GROUP_B + _GROUP_C
+    num_pool_blocks = max(blocks) + 1
+    sequence: dict[int, int] = {}
+    tokens: dict[int, int] = {}
+    records: list[Any] = []
+
+    def step(echoes: list[int], chunks: list[int]) -> None:
+        seqs = [sequence.get(block, -1) + 1 for block in chunks]
+        sequence.update(zip(chunks, seqs, strict=True))
+        carriers = [torch.zeros(CARRIER_HIDDEN) for _ in echoes] + [
+            _chunk(
+                13 * seq + block,
+                seq=seq,
+                geometry=geometry,
+                final=False,
+                prompt=block % 4,
+            )
+            for block, seq in zip(chunks, seqs, strict=True)
+        ]
+        rows = [*echoes, *chunks]
+        plan = _plan(
+            decodes=echoes,
+            prefills=chunks,
+            num_pool_blocks=num_pool_blocks,
+            has_initial=[seq > 0 for seq in seqs],
+            prompts=[block % 4 for block in rows],
+            geometries=[geometry] * len(rows),
+        )
+        ids = [tokens[block] for block in echoes] + [PLACEHOLDER_ID] * len(chunks)
+        bucket = _bucket_counts(call.bucket_transition)
+        replays = None if graph is None else graph.counters()["replays"]
+        records.append(
+            _step(core, pools, call, ids, torch.stack(carriers).to(device), plan, graph)
+        )
+        if replays is not None and graph.counters()["replays"] > replays:
+            assert _bucket_counts(call.bucket_transition) == bucket, (
+                "a replayed transaction launched the bucket"
+            )
+        tokens.update(zip(rows, records[-1][0][:, 0].long().tolist(), strict=True))
+
+    def drain(group: list[int]) -> None:
+        for _ in range(CAP + 2):
+            active = [block for block in group if tokens[block] != PARK_ID]
+            if not active:
+                return
+            step(active, [])
+        raise AssertionError("replay queue did not drain")
+
+    step([], _GROUP_A)  # replayed chunk-fresh, 31 rows
+    drain(_GROUP_A)
+    step([], _GROUP_B)  # eager undeclared, bucket graph at 1
+    step(_GROUP_B, _GROUP_A)  # eager mixed-roles, bucket graph at 31
+    drain(_GROUP_A + _GROUP_B)
+    step([], _GROUP_C)  # replayed chunk-fresh, 2 rows, bucket eager path
+    drain(_GROUP_C)
+    step([], _GROUP_C)  # replayed chunk-continuing, 2 rows
+    drain(_GROUP_C)
+    step([], _GROUP_A)  # replayed chunk-continuing, 31 rows
+    drain(_GROUP_A)
+    step([], _GROUP_B)  # eager undeclared, bucket graph at 1
+    drain(_GROUP_B)
+    return records
+
+
+def _interleaved_parity(
+    model: Any, slots: StateSlotBindings, served: _Served = G0
+) -> None:
     """Fallbacks through the nested bindings interleave with exact replays."""
     binding = model._transaction_graph
     assert binding.ready
@@ -5321,17 +6749,58 @@ def _interleaved_parity(model: Any, slots: StateSlotBindings) -> None:
     def tier(rows: int) -> int:
         return 0 if decoder is None else decoder.execution_tier(rows)
 
-    expected = _drive_interleaved(model.core, eager_pools, call, None, tier)
-    actual = _drive_interleaved(model.core, graph_pools, call, binding, tier)
+    geometry = served.geometry
+    if served.bucket:
+        bucket = call.bucket_transition
+        start = _bucket_counts(bucket)
+        expected = _drive_bucket_interleaved(
+            model.core, eager_pools, call, None, geometry
+        )
+        middle = _bucket_counts(bucket)
+        actual = _drive_bucket_interleaved(
+            model.core, graph_pools, call, binding, geometry
+        )
+        # Eager: every 31-row CHUNK step launches the B31 bucket graph, every
+        # one-row step the B1 graph, and every two-row step takes the eager
+        # path. Replay: only the eager mixed-roles (B31) and one-row (B1)
+        # steps launch a bucket graph.
+        assert _bucket_delta(start, middle) == ({(1, 31): 3, (1, 1): 2}, {(1, 2): 2})
+        assert _bucket_delta(middle, _bucket_counts(bucket)) == (
+            {(1, 31): 1, (1, 1): 2},
+            {},
+        )
+    else:
+        expected = _drive_interleaved(
+            model.core, eager_pools, call, None, tier, geometry
+        )
+        actual = _drive_interleaved(
+            model.core, graph_pools, call, binding, tier, geometry
+        )
     _assert_records_equal(actual, expected)
     _assert_pools_equal(graph_pools, eager_pools)
     assert all(not bool(status.any()) for _rows, status, _progress in expected)
     counts = binding.counters()
-    assert counts["fallbacks:uncovered:mixed-fresh"] == 1
-    assert counts["fallbacks:chunk-continuing:g0:b3:undeclared"] == 1
-    assert counts["replays:chunk-fresh:g0:b2"] == 1
-    assert counts["replays:chunk-continuing:g0:b2"] == 1
-    assert counts["replays:chunk-fresh:g0:b1"] == 1
+
+    def label(kind: str, population: int) -> str:
+        return served.label(kind, population)
+
+    if served.bucket:
+        assert counts["fallbacks:uncovered:mixed-roles"] == 1
+        fresh_b1 = label(tg.CELL_FRESH_CHUNK, 1)
+        continuing_b1 = label(tg.CELL_CONTINUING_CHUNK, 1)
+        assert counts[f"fallbacks:{fresh_b1}:undeclared"] == 1
+        assert counts[f"fallbacks:{continuing_b1}:undeclared"] == 1
+        assert counts[f"replays:{label(tg.CELL_FRESH_CHUNK, 31)}"] == 1
+        assert counts[f"replays:{label(tg.CELL_CONTINUING_CHUNK, 31)}"] == 1
+        assert counts[f"replays:{label(tg.CELL_FRESH_CHUNK, 2)}"] == 1
+        assert counts[f"replays:{label(tg.CELL_CONTINUING_CHUNK, 2)}"] == 1
+    else:
+        assert counts["fallbacks:uncovered:mixed-fresh"] == 1
+        continuing_b3 = label(tg.CELL_CONTINUING_CHUNK, 3)
+        assert counts[f"fallbacks:{continuing_b3}:undeclared"] == 1
+        assert counts[f"replays:{label(tg.CELL_FRESH_CHUNK, 2)}"] == 1
+        assert counts[f"replays:{label(tg.CELL_CONTINUING_CHUNK, 2)}"] == 1
+        assert counts[f"replays:{label(tg.CELL_FRESH_CHUNK, 1)}"] == 1
     assert counts["replays"] + counts["fallbacks"] == len(expected)
 
 
@@ -5339,40 +6808,343 @@ def _interleaved_parity(model: Any, slots: StateSlotBindings) -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.usefixtures("exact_fp32")
 @torch.inference_mode()
+@over_m
 def test_cuda_interleaved_fallbacks_and_replays_match_eager(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, served: _Served
 ) -> None:
+    # @spec TXG-REP-017
     from vllm.models.nemotron_asr import decode_graph, encoder_execution
 
     device = torch.device("cuda")
     monkeypatch.setattr(encoder_execution, "platform_graph_runtime", _cuda_runtime)
     monkeypatch.setattr(decode_graph, "platform_graph_runtime", _cuda_runtime)
+    if served.bucket:
+        engine: dict[str, Any] = {}
+        hf: dict[str, Any] = {"transaction_graph_populations": [2, 31]}
+        num_blocks = max(_GROUP_C) + 1
+    else:
+        engine = {"max_num_seqs": 4}
+        hf = {}
+        num_blocks = 5
     model, config = _model(
         monkeypatch,
         runtime=_cuda_runtime,
         device=device,
-        engine={"max_num_seqs": 4},
+        engine=engine,
+        served=served,
         encoder_execution_arm="eager-graphed",
         decode_dispatch_arm="dense-graphed",
+        **hf,
     )
     model.prepare_execution_memory()
-    state, slots = _model_state(model, config, num_blocks=5)
+    state, slots = _model_state(model, config, num_blocks=num_blocks)
     _initialize(state, slots)
-    _interleaved_parity(model, slots)
+    _interleaved_parity(model, slots, served)
+
+
+def _drive_lookahead(
+    core: Any,
+    pools: Pools,
+    call: tg.TransactionCallBindings,
+    graph: Any,
+    case: str,
+    population: int,
+) -> SimpleNamespace:
+    """One g1 lookahead case over ``population`` lockstep sessions on blocks 1..P.
+
+    ``one-chunk``: a first CHUNK step whose row 0 is a one-chunk session, a
+    final tail of fewer than ``C·hop`` samples, beside regular first chunks.
+    ``continuing-final``: a first CHUNK step, then a continuing step whose row
+    0 is a final tail of fewer than ``C·hop`` samples beside regular rows.
+    ``final-replay-flush``: a first CHUNK step, then a step of final tails,
+    then lockstep REPLAY rows until every session parks, then one FLUSH row
+    per session. Echo steps keep the whole population: a parked session sends
+    park, a park-echo or, after its final tail, a FLUSH, so every step is a
+    declared cell.
+
+    Every echo row is checked against its book: an emitting REPLAY advances
+    the queue head and keeps its echo armed, a drained REPLAY emits park and
+    clears the pending echo, and a park-echo or FLUSH emits park and leaves
+    its book unchanged. Returns the records, the resident pages after every
+    step, the FLUSH steps' queue and book pages before and after, and the
+    emitting and drained REPLAY rows after the final CHUNK.
+    """
+    device = pools["book_pool"].device
+    blocks = list(range(1, population + 1))
+    out = SimpleNamespace(records=[], pages=[], flushes=[], emitted=0, drained=0)
+    num_pool_blocks = int(pools["book_pool"].shape[0])
+    head, echo = _BOOK["queue_head"], _BOOK["pending_echo"]
+
+    def run(ids: list[int], embeds: torch.Tensor, plan: Any) -> list[int]:
+        out.records.append(_step(core, pools, call, ids, embeds, plan, graph))
+        out.pages.append(_clone_pools(pools))
+        return out.records[-1][0][:, 0].long().tolist()
+
+    def chunks(seq: int, finals: list[bool]) -> list[int]:
+        carriers = torch.stack(
+            [
+                _chunk(
+                    17 * seq + block,
+                    seq=seq,
+                    geometry=1,
+                    final=final,
+                    prompt=block % 4,
+                    samples=G1_SAMPLES // 2 if final else None,
+                )
+                for block, final in zip(blocks, finals, strict=True)
+            ]
+        ).to(device)
+        plan = _plan(
+            prefills=blocks,
+            num_pool_blocks=num_pool_blocks,
+            has_initial=[seq > 0] * population,
+            prompts=[block % 4 for block in blocks],
+            geometries=[1] * population,
+        )
+        return run([PLACEHOLDER_ID] * population, carriers, plan)
+
+    def echoes(tokens: list[int], *, final: bool = False) -> None:
+        plan = _plan(
+            decodes=blocks,
+            num_pool_blocks=num_pool_blocks,
+            prompts=[block % 4 for block in blocks],
+            geometries=[1] * population,
+        )
+        zeros = torch.zeros(population, CARRIER_HIDDEN, device=device)
+        for _ in range(CAP + 2):
+            done = all(token == PARK_ID for token in tokens)
+            before = (pools["queue_pool"].clone(), pools["book_pool"].clone())
+            emitted = run(tokens, zeros, plan)
+            book = pools["book_pool"]
+            for row, block in enumerate(blocks):
+                old, new = before[1][block], book[block]
+                if tokens[row] == PARK_ID:
+                    assert emitted[row] == PARK_ID, (block, emitted[row])
+                    assert torch.equal(new, old), block
+                elif emitted[row] != PARK_ID:
+                    assert int(new[head]) == int(old[head]) + 1, block
+                    assert int(new[echo]) == 1, block
+                    out.emitted += final
+                else:
+                    assert int(new[head]) == int(old[head]), block
+                    assert int(new[echo]) == 0, block
+                    out.drained += final
+            if done:
+                if final:
+                    after = (pools["queue_pool"].clone(), pools["book_pool"].clone())
+                    out.flushes.append((before, after, emitted))
+                return
+            tokens = emitted
+        raise AssertionError("replay queues did not drain")
+
+    if case == "one-chunk":
+        echoes(chunks(0, [True] + [False] * (population - 1)))
+    elif case == "continuing-final":
+        echoes(chunks(0, [False] * population))
+        echoes(chunks(1, [True] + [False] * (population - 1)))
+    else:
+        assert case == "final-replay-flush"
+        echoes(chunks(0, [False] * population))
+        echoes(chunks(1, [True] * population), final=True)
+    return out
+
+
+#: TXG-REP-019 cases: ``(case, population)``.
+_LOOKAHEAD_CASES = [
+    ("one-chunk", 1),
+    ("one-chunk", 2),
+    ("one-chunk", 31),
+    ("continuing-final", 2),
+    ("continuing-final", 31),
+    ("final-replay-flush", 1),
+    ("final-replay-flush", 31),
+]
 
 
 @pytest.mark.nemotron_gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.usefixtures("exact_fp32")
 @torch.inference_mode()
-def test_cuda_replay_allocates_nothing_after_launch(
+@_over(G1_CONFIGURATIONS)
+@pytest.mark.parametrize(
+    ("case", "population"),
+    _LOOKAHEAD_CASES,
+    ids=[f"{case}-b{population}" for case, population in _LOOKAHEAD_CASES],
+)
+def test_cuda_g1_lookahead_rows_match_eager(
+    monkeypatch: pytest.MonkeyPatch, served: _Served, case: str, population: int
+) -> None:
+    """Accepted g1 lookahead rows replay their declared cells bitwise exactly.
+
+    Transaction populations ``[1, 2, 31]``. Fresh and final tails, continuing
+    final tails beside regular rows, and the REPLAY rows and FLUSH after a
+    final CHUNK replay with zero fallbacks; a FLUSH leaves the queue and book
+    unchanged.
+    """
+    # @spec TXG-REP-019
+    device = torch.device("cuda")
+    core, call, eager_pools = _served_setup(
+        monkeypatch, served, device=device, num_blocks=32
+    )
+    graph_pools = _clone_pools(eager_pools)
+    binding = tg.TransactionGraphBinding(
+        populations=[1, 2, 31],
+        geometries=(1,),
+        maximum_population=31,
+        vllm_config=object(),
+        runtime=_cuda_runtime(),
+    )
+    advance.warmup_advance_model_rows_scatter(**graph_pools, block_id=WARM_BLOCK)
+    _serve(binding, core, call, _transaction_pools(graph_pools), device)
+    eager = _drive_lookahead(core, eager_pools, call, None, case, population)
+    replayed = _drive_lookahead(core, graph_pools, call, binding, case, population)
+    expected = eager.records
+    _assert_records_equal(replayed.records, expected)
+    assert len(replayed.pages) == len(eager.pages)
+    for got, want in zip(replayed.pages, eager.pages, strict=True):
+        _assert_pools_equal(got, want)
+    assert all(not bool(status.any()) for _rows, status, _progress in expected)
+    final = case == "final-replay-flush"
+    for arm in (eager, replayed):
+        assert len(arm.flushes) == int(final)
+        for before, after, emitted in arm.flushes:
+            assert all(token == PARK_ID for token in emitted), emitted
+            for old, new in zip(before, after, strict=True):
+                assert torch.equal(old, new), "a FLUSH changed the queue or book"
+        if final:
+            # After the final CHUNK, REPLAY rows emit queued labels, then
+            # drain and park.
+            assert arm.emitted > 0 and arm.drained > 0
+    assert (replayed.emitted, replayed.drained) == (eager.emitted, eager.drained)
+    counts = binding.counters()
+    assert counts["fallbacks"] == 0
+    assert counts["replays"] == len(expected)
+    chunk_kind = (
+        tg.CELL_FRESH_CHUNK if case == "one-chunk" else tg.CELL_CONTINUING_CHUNK
+    )
+    assert counts[f"replays:{served.label(chunk_kind, population)}"] == 1
+    assert counts[f"replays:replay:b{population}"] > 0
+
+
+@pytest.mark.nemotron_gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("exact_fp32")
+@torch.inference_mode()
+def test_cuda_bucket_counts_record_eager_invocations(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Bucket counts record eager invocations only, as deltas after startup.
+
+    With transaction populations ``[2]`` and bucket ``[1, 31, 63]``, an eager
+    one-row CHUNK step replays the B1 bucket graph, whose body calls the native
+    encoder; an eager three-row CHUNK step takes the bucket's eager path and
+    the guarded encoder transition; an eager REPLAY step invokes no bucket;
+    and a replayed two-row CHUNK step advances none of these counts.
+    """
+    # @spec TXG-OBS-006
     device = torch.device("cuda")
-    core = _core(device)
-    call = _call_bindings(core)
-    pools = _endpoint_pools(4, device)
-    binding = _binding(core, pools, call, _cuda_runtime(), device=device)
+    served = G1_BUCKET
+    model, config = _model(
+        monkeypatch,
+        runtime=_cuda_runtime,
+        device=device,
+        served=served,
+        transaction_graph_populations=[2],
+    )
+    model.prepare_execution_memory()
+    state, slots = _model_state(model, config, num_blocks=7)
+    _initialize(state, slots)
+    state.post_warmup()
+    binding = model._transaction_graph
+    assert binding.ready
+    execution = model._encoder_execution
+    pools = _pool_arguments(_resident(model, slots))
+    call = _model_call(model)
+    geometry = served.geometry
+
+    def baseline() -> tuple[dict[Any, int], dict[Any, int], int]:
+        replays, fallbacks = _bucket_counts(model._chunk_bucket_binding)
+        return replays, fallbacks, execution._invocations
+
+    def delta(before: Any) -> tuple[dict[Any, int], dict[Any, int], int]:
+        after = baseline()
+        replays, fallbacks = _bucket_delta(before[:2], after[:2])
+        return replays, fallbacks, after[2] - before[2]
+
+    start = baseline()
+    one = _first_step(
+        binding,
+        pools,
+        core=model.core,
+        call=call,
+        blocks=[1],
+        fresh=[True],
+        geometry=geometry,
+        num_pool_blocks=7,
+    )
+    assert delta(start) == ({(1, 1): 1}, {}, 0)
+    three = baseline()
+    _first_step(
+        binding,
+        pools,
+        core=model.core,
+        call=call,
+        blocks=[2, 3, 4],
+        fresh=[True] * 3,
+        geometry=geometry,
+        num_pool_blocks=7,
+    )
+    assert delta(three) == ({}, {(1, 3): 1}, 1)
+    echo = baseline()
+    token = int(one[0][0, 0])
+    _step(
+        model.core,
+        pools,
+        call,
+        [token],
+        torch.zeros(1, CARRIER_HIDDEN, device=device),
+        _plan(decodes=[1], num_pool_blocks=7, geometries=[geometry]),
+        binding,
+    )
+    assert delta(echo) == ({}, {}, 0)
+    replayed = baseline()
+    before = binding.counters()
+    _first_step(
+        binding,
+        pools,
+        core=model.core,
+        call=call,
+        blocks=[5, 6],
+        fresh=[True] * 2,
+        geometry=geometry,
+        num_pool_blocks=7,
+    )
+    assert delta(replayed) == ({}, {}, 0)
+    label = served.label(tg.CELL_FRESH_CHUNK, 2)
+    assert binding.counters()[f"replays:{label}"] == before[f"replays:{label}"] + 1
+    for cell in ("chunk-fresh", "chunk-continuing"):
+        for population in (1, 3):
+            key = f"fallbacks:{served.label(cell, population)}:undeclared"
+            assert binding.counters().get(key, 0) == (
+                1 if cell == "chunk-fresh" else 0
+            ), key
+
+
+@pytest.mark.nemotron_gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("exact_fp32")
+@torch.inference_mode()
+@over_m
+def test_cuda_replay_allocates_nothing_after_launch(
+    monkeypatch: pytest.MonkeyPatch, served: _Served
+) -> None:
+    # @spec TXG-FAIL-003
+    device = torch.device("cuda")
+    geometry = served.geometry
+    core, call, pools = _served_setup(monkeypatch, served, device=device)
+    binding = _binding(
+        core, pools, call, _cuda_runtime(), device=device, geometry=geometry
+    )
     allocated: list[int] = []
     replay = torch.cuda.CUDAGraph.replay
 
@@ -5386,7 +7158,7 @@ def test_cuda_replay_allocates_nothing_after_launch(
         core,
         pools,
         call,
-        _rows([], [1], device=device),
+        _rows([], [1], device=device, geometry=geometry),
         binding,
         _TrackedSink(rows=1, device=device),
     )
@@ -5411,7 +7183,7 @@ def test_cuda_replay_allocates_nothing_after_launch(
         core,
         pools,
         call,
-        _rows([], [2], device=device),
+        _rows([], [2], device=device, geometry=geometry),
         binding,
         _TrackedSink(rows=1, device=device),
     )
@@ -5424,32 +7196,41 @@ def test_cuda_replay_allocates_nothing_after_launch(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.usefixtures("exact_fp32")
 @torch.inference_mode()
-def test_cuda_status_and_progress_survive_another_cells_replay() -> None:
+@over_m
+def test_cuda_status_and_progress_survive_another_cells_replay(
+    monkeypatch: pytest.MonkeyPatch, served: _Served
+) -> None:
+    # @spec TXG-FAIL-003
     device = torch.device("cuda")
-    core = _core(device)
-    call = _call_bindings(core)
-    eager_pools = _endpoint_pools(4, device)
+    core, call, eager_pools = _served_setup(monkeypatch, served, device=device)
     graph_pools = _clone_pools(eager_pools)
-    binding = _binding(core, graph_pools, call, _cuda_runtime(), device=device)
+    binding = _binding(
+        core,
+        graph_pools,
+        call,
+        _cuda_runtime(),
+        device=device,
+        geometry=served.geometry,
+    )
     for pools in (eager_pools, graph_pools):
         pools["book_pool"][1:, _BOOK["last_label"]] = core.blank_id
     first, second = (
-        dict(blocks=[1], fresh=[True]),
-        dict(blocks=[2, 3], fresh=[True] * 2),
+        dict(blocks=[1], fresh=[True], geometry=served.geometry),
+        dict(blocks=[2, 3], fresh=[True] * 2, geometry=served.geometry),
     )
     expected = _first_step(None, eager_pools, core=core, call=call, **first)
     _first_step(None, eager_pools, core=core, call=call, **second)
     _first_step(binding, graph_pools, core=core, call=call, **first)
     _first_step(binding, graph_pools, core=core, call=call, **second)
     torch.cuda.synchronize()
-    cell = binding._graphs[tg.TransactionCell(tg.CELL_FRESH_CHUNK, GEOM_REG, 1)]
+    cell = binding._graphs[served.cell(tg.CELL_FRESH_CHUNK, 1)]
     torch.testing.assert_close(cell.status_out.cpu(), expected[1].cpu(), atol=0, rtol=0)
     torch.testing.assert_close(
         cell.progress_out.cpu(), expected[2].cpu(), atol=0, rtol=0
     )
     counts = binding.counters()
-    assert counts["replays:chunk-fresh:g0:b1"] == 1
-    assert counts["replays:chunk-fresh:g0:b2"] == 1
+    assert counts[f"replays:{served.label(tg.CELL_FRESH_CHUNK, 1)}"] == 1
+    assert counts[f"replays:{served.label(tg.CELL_FRESH_CHUNK, 2)}"] == 1
 
 
 class _ScatterLaunches:
@@ -5492,8 +7273,9 @@ class _ScatterLaunches:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.usefixtures("exact_fp32")
 @torch.inference_mode()
+@over_m
 def test_cuda_startup_access_stores_no_resident_page(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, served: _Served
 ) -> None:
     """The scatter warm-up, serving capture and ``post_warmup`` store no page.
 
@@ -5503,11 +7285,14 @@ def test_cuda_startup_access_stores_no_resident_page(
     capture, the warm-up's included, must pass rejected rows on non-null
     blocks.
     """
+    # @spec TXG-LIFE-008
     from vllm.models.nemotron_asr import nemotron_asr, state_scatter
     from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
     device = torch.device("cuda")
-    model, config = _model(monkeypatch, runtime=_cuda_runtime, device=device)
+    model, config = _model(
+        monkeypatch, runtime=_cuda_runtime, device=device, served=served
+    )
     model.prepare_execution_memory()
     state, slots = _model_state(model, config, num_blocks=4)
     resident = _seed_sentinels(model, slots)
@@ -5528,7 +7313,12 @@ def test_cuda_startup_access_stores_no_resident_page(
             kernel.phase = "startup"
 
     monkeypatch.setattr(nemotron_asr, "_warm_scatter", warming)
+    bucket = _bucket_counts(model._chunk_bucket_binding)
     _initialize(state, slots)
+    # With the bucket on, each B1 CHUNK cell's eager reference launched the
+    # bucket graph inside the access window.
+    launched = _bucket_delta(bucket, _bucket_counts(model._chunk_bucket_binding))
+    assert bool(launched[0].get((1, 1))) == bool(served.bucket), launched
     state.post_warmup()
     torch.cuda.synchronize()
     assert model._transaction_graph.ready

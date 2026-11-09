@@ -312,18 +312,34 @@ def _registry_state(registry: Any) -> dict[str, Any]:
     }
 
 
+#: Served configurations by ``test_transaction_graph`` name: the model paths
+#: run each, with the option on and off.
+_SERVED = ("g0", "g1", "g1-bucket")
+
+
 @pytest.mark.parametrize("fresh", [True, False])
-@pytest.mark.parametrize("path", ["registry", "model-option-on", "model-option-off"])
+@pytest.mark.parametrize(
+    ("path", "served"),
+    [("registry", "g0")]
+    + [
+        (path, served)
+        for path in ("model-option-on", "model-option-off")
+        for served in _SERVED
+    ],
+)
 def test_bind_rows_rejects_geometry_outside_served_set(
-    monkeypatch: pytest.MonkeyPatch, path: str, fresh: bool
+    monkeypatch: pytest.MonkeyPatch, path: str, served: str, fresh: bool
 ) -> None:
     """A header geometry outside the configured set fails before any commit.
 
-    Geometry 1 is a published cadence index, so only the served set excludes
-    it: ``(0, 2)`` given to ``bind_rows`` directly, or the model's configured
-    g0 set through its plan context with the option on or off. The step's
-    valid fresh row is not registered and no session's metadata changes.
+    The other of g0 and g1 is a published cadence index, so only the served
+    set excludes it: ``(0, 2)`` given to ``bind_rows`` directly, or the
+    model's configured g0 or g1 set, with the CHUNK-bucket binding on or off,
+    through its plan context with the option on or off. The step's valid fresh
+    row is not registered and no session's metadata changes.
     """
+    # @spec TXG-ENV-008
+    geometry, unserved = 0, 1
     if path == "registry":
         registry = plan_mod.SessionRegistry()
 
@@ -338,9 +354,11 @@ def test_bind_rows_rejects_geometry_outside_served_set(
     else:
         from tests.models.nemotron_asr import test_transaction_graph as txg
 
+        configuration = {s.name: s for s in txg.M}[served]
+        geometry, unserved = configuration.geometry, 1 - configuration.geometry
         model, _config = txg._model(
             monkeypatch,
-            supported_num_lookahead_tokens=[0],
+            served=configuration,
             transaction_graph_populations=[1, 2] if path == "model-option-on" else [],
         )
         registry = model._registry
@@ -348,15 +366,17 @@ def test_bind_rows_rejects_geometry_outside_served_set(
         def bind(rows: list[Any]) -> Any:
             return model._stage_plan(rows, resident_request_ids=("a", "b", "c"))
 
-    bind([_row("a", 3, chunk=True, prior=False)])
+    valid = 1_280 * (geometry + 1)
+    served_header = _header(geometry=geometry, valid=valid)
+    bind([_row("a", 3, chunk=True, prior=False, header=served_header)])
     offending = (
-        _row("c", 5, chunk=True, prior=False, header=_header(geometry=1))
+        _row("c", 5, chunk=True, prior=False, header=_header(geometry=unserved))
         if fresh
-        else _row("a", 3, chunk=True, header=_header(geometry=1, seq=1))
+        else _row("a", 3, chunk=True, header=_header(geometry=unserved, seq=1))
     )
     before = _registry_state(registry)
-    with pytest.raises(ValueError, match="geometry 1"):
-        bind([_row("b", 4, chunk=True, prior=False), offending])
+    with pytest.raises(ValueError, match=f"geometry {unserved}"):
+        bind([_row("b", 4, chunk=True, prior=False, header=served_header), offending])
     assert _registry_state(registry) == before
     assert registry.live_block_ids() == [3]
 

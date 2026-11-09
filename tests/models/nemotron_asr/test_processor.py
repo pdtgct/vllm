@@ -134,34 +134,58 @@ def test_core_profiling_constructs_raw_audio_carriers(
         assert torch.count_nonzero(audio) == 0
 
 
-@pytest.mark.parametrize("populations", [None, [1]])
+#: Served configurations: ``(hf overrides, served geometry, unserved geometry)``.
+_SERVED_SETS = {
+    "g0": ({"supported_num_lookahead_tokens": [0]}, 0, 1),
+    "g1": ({"supported_num_lookahead_tokens": [1]}, 1, 0),
+    "g1-bucket": (
+        {
+            "supported_num_lookahead_tokens": [1],
+            "chunk_bucket_graph_populations": [1, 31, 63],
+        },
+        1,
+        0,
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("overrides", "served", "unserved"),
+    list(_SERVED_SETS.values()),
+    ids=list(_SERVED_SETS),
+)
+@pytest.mark.parametrize("populations", [None, [1]], ids=["option-off", "option-on"])
 def test_envelope_outside_served_geometries_is_rejected(
-    tmp_path, monkeypatch, populations
+    tmp_path, monkeypatch, populations, overrides, served, unserved
 ):
     """An envelope naming an unserved geometry fails in the processor.
 
-    The served set is g0 only; geometry 3 is a published cadence outside it.
-    The check holds with and without ``transaction_graph_populations``.
+    The served set is one geometry, g0 or g1; the other is a published cadence
+    outside it, and geometry 3 is too. The check holds with and without
+    ``transaction_graph_populations`` and the CHUNK-bucket binding.
     """
+    # @spec TXG-ENV-007
     from vllm.multimodal.processing import ProcessorInputs, TimingContext
 
-    overrides: dict[str, object] = {"supported_num_lookahead_tokens": [0]}
+    overrides = dict(overrides)
     if populations is not None:
         overrides["transaction_graph_populations"] = populations
     _, processor = _registry_processor(tmp_path, monkeypatch, overrides)
 
     def apply(geometry: int):
-        header = torch.tensor([2, 1_280, geometry, 0, 0, 0, 1], dtype=torch.float32)
-        envelope = torch.cat((header, torch.zeros(1_280)))
+        samples = 1_280 * (geometry + 1)
+        header = torch.tensor([2, samples, geometry, 0, 0, 0, 1], dtype=torch.float32)
+        envelope = torch.cat((header, torch.zeros(samples)))
         items = processor.data_parser.parse_mm_data({"audio": envelope.numpy()})
         return processor.apply(
             ProcessorInputs(prompt=[_CARRIER_ID], mm_data_items=items),
             TimingContext(),
         )
 
-    assert apply(0)["prompt_token_ids"] == [_CARRIER_ID]
-    with pytest.raises(ValueError, match="geometry"):
-        apply(3)
+    assert apply(served)["prompt_token_ids"] == [_CARRIER_ID]
+    for geometry in (unserved, 3):
+        with pytest.raises(ValueError, match="geometry"):
+            apply(geometry)
 
 
 def _apply_envelope(processor: NemotronASRMultiModalProcessor, geometry: float):

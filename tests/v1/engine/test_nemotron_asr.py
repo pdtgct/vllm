@@ -230,17 +230,47 @@ _G0_BASE_OVERRIDES = {
     "experimental_native_burst": False,
     "supported_num_lookahead_tokens": [0],
 }
+#: The serving bases of the test configurations M: g0; g1 with the
+#: CHUNK-bucket binding off; and g1 with ``chunk_bucket_graph_populations``
+#: ``[1, 31, 63]``. Both arms of a configuration share its base.
+_SERVED_OVERRIDES = {
+    "g0": _G0_BASE_OVERRIDES,
+    "g1": {**_G0_BASE_OVERRIDES, "supported_num_lookahead_tokens": [1]},
+    "g1-bucket": {
+        **_G0_BASE_OVERRIDES,
+        "supported_num_lookahead_tokens": [1],
+        "chunk_bucket_graph_populations": [1, 31, 63],
+    },
+}
+_over_m = pytest.mark.parametrize("served", list(_SERVED_OVERRIDES))
+#: The bucket-on configuration captures ``eager-graphed`` encoder cells for
+#: populations 1 to 64 and profiles a 64-row transaction beside the admission
+#: inventory. This utilization is a trial setting, not verified capacity; a
+#: capacity failure at startup fails the test.
+_BUCKET_GPU_MEMORY_UTILIZATION = 0.6
 
 
-def _run_g0_stream(hf_overrides, num_chunks, sessions=1, inject=None):
-    """Feed ``sessions`` fresh g0 sessions ``num_chunks`` CHUNKs in lockstep.
+def _served_label(hf_overrides, kind, population):
+    """The transaction cell label of ``kind`` at ``population`` when served."""
+    if kind == "replay":
+        return f"replay:b{population}"
+    (lookahead,) = hf_overrides["supported_num_lookahead_tokens"]
+    return f"{kind}:g{lookahead}:b{population}"
+
+
+def _run_stream(hf_overrides, num_chunks, sessions=1, inject=None):
+    """Feed ``sessions`` fresh sessions ``num_chunks`` CHUNKs in lockstep.
 
     Every session's CHUNK is queued before the step that carries them, and the
     next CHUNKs wait until every session has parked, so each CHUNK step holds
-    the whole population. Returns per-chunk output tokens per session, the
-    resident state storage after each park, the model's transaction graph
-    counters and the number of executed steps after each CHUNK step.
-    ``inject`` receives the model after admission, before the first CHUNK.
+    the whole population. Every CHUNK names the one served geometry, g0 or g1.
+    Returns per-chunk output tokens per session, the resident state storage
+    after each park, the model's transaction graph counters and the number of
+    executed steps after each CHUNK step. ``inject`` receives the model after
+    admission, before the first CHUNK. With the CHUNK-bucket binding on, the
+    engine keeps ``max_num_seqs`` 64, sizes ``num_gpu_blocks_override`` to the
+    sessions plus one and prints its non-KV memory and the receipt's ``A``
+    and ``S``; a capacity failure at startup fails the test.
     """
     import gc
     from dataclasses import replace
@@ -267,16 +297,29 @@ def _run_g0_stream(hf_overrides, num_chunks, sessions=1, inject=None):
     from vllm.v1.executor.uniproc_executor import UniProcExecutor
     from vllm.v1.request import RequestStatus
 
+    (geometry,) = hf_overrides["supported_num_lookahead_tokens"]
+    bucket = bool(hf_overrides.get("chunk_bucket_graph_populations"))
     args = replace(
         _engine_args(),
-        max_num_seqs=sessions,
+        max_num_seqs=64 if bucket else sessions,
+        max_num_batched_tokens=256,
         num_gpu_blocks_override=sessions + 1,
-        gpu_memory_utilization=0.4,
+        gpu_memory_utilization=_BUCKET_GPU_MEMORY_UTILIZATION if bucket else 0.4,
         hf_overrides=hf_overrides,
     )
     config = args.create_engine_config()
     core = EngineCore(config, UniProcExecutor, log_stats=False)
     try:
+        if bucket:
+            worker = core.model_executor.driver_worker.worker
+            receipt = _resolve_model(core).execution_profile_receipt()
+            transaction = receipt.get("transaction", {})
+            print(
+                "bucket-on startup memory: "
+                f"non_kv={worker.total_consumed + worker.peak_activation_memory} "
+                f"A={transaction.get('admission_bytes')} "
+                f"S={transaction.get('serving_bytes')}"
+            )
         runner = core.model_executor.driver_worker.worker.model_runner
         view = next(iter(runner.state_slots.views.values()))
         hf = config.model_config.hf_config
@@ -302,7 +345,7 @@ def _run_g0_stream(hf_overrides, num_chunks, sessions=1, inject=None):
             assert core.admit_stream(request(name)).accepted
         if inject is not None:
             inject(_resolve_model(core))
-        size = RAW_SAMPLES_PER_CHUNK["80ms"]
+        size = RAW_SAMPLES_PER_CHUNK["160ms" if geometry else "80ms"]
         generators = [torch.Generator().manual_seed(i) for i in range(sessions)]
         tokens, pages, echo_steps = [], [], []
         for sequence in range(num_chunks):
@@ -314,7 +357,8 @@ def _run_g0_stream(hf_overrides, num_chunks, sessions=1, inject=None):
                 envelope = torch.cat(
                     (
                         torch.tensor(
-                            [2, size, 0, 0, 0, sequence, 1], dtype=torch.float32
+                            [2, size, geometry, 0, 0, sequence, 1],
+                            dtype=torch.float32,
                         ),
                         samples,
                     )
@@ -329,7 +373,7 @@ def _run_g0_stream(hf_overrides, num_chunks, sessions=1, inject=None):
                     MultiModalFeatureSpec(
                         data=items["audio"][0],
                         modality="audio",
-                        identifier=f"g0-{name}-{sequence}",
+                        identifier=f"g{geometry}-{name}-{sequence}",
                         mm_position=PlaceholderRange(0, 1),
                     )
                 ]
@@ -353,7 +397,7 @@ def _run_g0_stream(hf_overrides, num_chunks, sessions=1, inject=None):
                 ):
                     break
             else:
-                pytest.fail("g0 chunk did not park within its emission bound")
+                pytest.fail("chunk did not park within its emission bound")
             for name in names:
                 assert received[name] and received[name][-1] == hf.eos_token_id
             tokens.append([received[name] for name in names])
@@ -370,9 +414,10 @@ def _run_g0_stream(hf_overrides, num_chunks, sessions=1, inject=None):
         torch.accelerator.empty_cache()
 
 
+@_over_m
 @create_new_process_for_each_test(method="spawn")
-def test_nemotron_engine_transaction_graph_matches_eager(monkeypatch):
-    """A fresh g0 B1 session replays its whole transactions bitwise exactly.
+def test_nemotron_engine_transaction_graph_matches_eager(monkeypatch, served):
+    """A fresh B1 session replays its whole transactions bitwise exactly.
 
     The eager arm runs first, then the replay arm adds only the transaction
     graph option. Tokens, echo counts and the resident storage after every
@@ -380,7 +425,10 @@ def test_nemotron_engine_transaction_graph_matches_eager(monkeypatch):
     Startup verifies the published cells once, before the first step, and
     ``EngineCore.shutdown`` discards them once.
     """
+    # @spec TXG-REP-013 / TXG-LIFE-007 / TXG-VER-004 / TXG-OBS-001
     from vllm.models.nemotron_asr.transaction_graph import TransactionGraphBinding
+
+    base = _SERVED_OVERRIDES[served]
 
     events = []
     verify = TransactionGraphBinding.verify_after_warmup
@@ -397,14 +445,14 @@ def test_nemotron_engine_transaction_graph_matches_eager(monkeypatch):
     monkeypatch.setattr(TransactionGraphBinding, "verify_after_warmup", verified)
     monkeypatch.setattr(TransactionGraphBinding, "discard", discarded)
     num_chunks = 12
-    eager_tokens, eager_pages, eager_counters, eager_echoes = _run_g0_stream(
-        dict(_G0_BASE_OVERRIDES), num_chunks
+    eager_tokens, eager_pages, eager_counters, eager_echoes = _run_stream(
+        dict(base), num_chunks
     )
     assert eager_counters == {}
     assert events == []
     before_first_step = []
-    tokens, pages, counters, echoes = _run_g0_stream(
-        {**_G0_BASE_OVERRIDES, "transaction_graph_populations": [1]},
+    tokens, pages, counters, echoes = _run_stream(
+        {**base, "transaction_graph_populations": [1]},
         num_chunks,
         inject=lambda _model: before_first_step.extend(events),
     )
@@ -416,15 +464,18 @@ def test_nemotron_engine_transaction_graph_matches_eager(monkeypatch):
         assert torch.equal(actual, expected)
     assert counters["captured_cells"] == 3
     assert counters["fallbacks"] == 0
-    assert counters["replays:chunk-fresh:g0:b1"] == 1
-    assert counters["replays:chunk-continuing:g0:b1"] == num_chunks - 1
+    fresh = _served_label(base, "chunk-fresh", 1)
+    continuing = _served_label(base, "chunk-continuing", 1)
+    assert counters[f"replays:{fresh}"] == 1
+    assert counters[f"replays:{continuing}"] == num_chunks - 1
     echo_steps = sum(len(chunk[0]) for chunk in tokens) - num_chunks
     assert counters["replays:replay:b1"] >= echo_steps
 
 
+@_over_m
 @create_new_process_for_each_test(method="spawn")
-def test_nemotron_engine_transaction_graph_b31_lockstep_matches_eager():
-    """31 lockstep g0 sessions replay every CHUNK step bitwise exactly.
+def test_nemotron_engine_transaction_graph_b31_lockstep_matches_eager(served):
+    """31 lockstep sessions replay every CHUNK step bitwise exactly.
 
     Every CHUNK step holds all 31 rows (fresh once, then continuing) and must
     replay the B31 cell. Echo steps replay ``replay:b31`` while every row still
@@ -432,13 +483,15 @@ def test_nemotron_engine_transaction_graph_b31_lockstep_matches_eager():
     eager path, counted. Tokens and the resident storage after every park
     match the eager arm.
     """
+    # @spec TXG-REP-013
+    base = _SERVED_OVERRIDES[served]
     num_chunks, sessions = 6, 31
-    eager_tokens, eager_pages, eager_counters, eager_echoes = _run_g0_stream(
-        dict(_G0_BASE_OVERRIDES), num_chunks, sessions
+    eager_tokens, eager_pages, eager_counters, eager_echoes = _run_stream(
+        dict(base), num_chunks, sessions
     )
     assert eager_counters == {}
-    tokens, pages, counters, echoes = _run_g0_stream(
-        {**_G0_BASE_OVERRIDES, "transaction_graph_populations": [sessions]},
+    tokens, pages, counters, echoes = _run_stream(
+        {**base, "transaction_graph_populations": [sessions]},
         num_chunks,
         sessions,
     )
@@ -447,8 +500,10 @@ def test_nemotron_engine_transaction_graph_b31_lockstep_matches_eager():
     for actual, expected in zip(pages, eager_pages, strict=True):
         assert torch.equal(actual, expected)
     assert counters["captured_cells"] == 3
-    assert counters[f"replays:chunk-fresh:g0:b{sessions}"] == 1
-    assert counters[f"replays:chunk-continuing:g0:b{sessions}"] == num_chunks - 1
+    fresh = _served_label(base, "chunk-fresh", sessions)
+    continuing = _served_label(base, "chunk-continuing", sessions)
+    assert counters[f"replays:{fresh}"] == 1
+    assert counters[f"replays:{continuing}"] == num_chunks - 1
     fallbacks = {
         key: value
         for key, value in counters.items()
@@ -463,7 +518,7 @@ def test_nemotron_engine_transaction_graph_b31_lockstep_matches_eager():
     )
 
 
-def _fail_first_replayed_step(inject_failure):
+def _fail_first_replayed_step(inject_failure, served="g0"):
     """Run one option-on B1 CHUNK whose replayed step fails as injected.
 
     Returns the exception ``EngineCore.step`` raised, the committed progress
@@ -477,8 +532,8 @@ def _fail_first_replayed_step(inject_failure):
         seen["model"] = model
 
     with pytest.raises(RuntimeError, match="injected") as raised:
-        _run_g0_stream(
-            {**_G0_BASE_OVERRIDES, "transaction_graph_populations": [1]},
+        _run_stream(
+            {**_SERVED_OVERRIDES[served], "transaction_graph_populations": [1]},
             num_chunks=1,
             inject=inject,
         )
@@ -486,11 +541,13 @@ def _fail_first_replayed_step(inject_failure):
     return raised.value, model.consume_committed_progress(), model
 
 
+@_over_m
 @create_new_process_for_each_test(method="spawn")
 def test_nemotron_engine_transaction_graph_replay_failure_propagates_from_step(
-    monkeypatch,
+    monkeypatch, served
 ):
     """A replay failure leaves ``EngineCore.step`` and publishes no progress."""
+    # @spec TXG-FAIL-005
 
     def fail_replay(model):
         def replay():
@@ -499,16 +556,18 @@ def test_nemotron_engine_transaction_graph_replay_failure_propagates_from_step(
         for graph in model._transaction_graph._graphs.values():
             monkeypatch.setattr(graph, "replay", replay)
 
-    error, progress, _ = _fail_first_replayed_step(fail_replay)
+    error, progress, _ = _fail_first_replayed_step(fail_replay, served)
     assert str(error) == "injected replay failure"
     assert progress == {}
 
 
+@_over_m
 @create_new_process_for_each_test(method="spawn")
 def test_nemotron_engine_transaction_graph_collection_failure_propagates_from_step(
-    monkeypatch,
+    monkeypatch, served
 ):
     """A commit-sink collection failure after a replay publishes no progress."""
+    # @spec TXG-FAIL-006
     from vllm.models.nemotron_asr.transaction_graph import (
         transaction_graph_counters,
     )
@@ -520,10 +579,11 @@ def test_nemotron_engine_transaction_graph_collection_failure_propagates_from_st
         sink = model._ensure_commit_sink(next(model.parameters()).device)
         monkeypatch.setattr(sink, "collect", collect)
 
-    error, progress, model = _fail_first_replayed_step(fail_collection)
+    error, progress, model = _fail_first_replayed_step(fail_collection, served)
     assert str(error) == "injected collection failure"
     assert progress == {}
-    assert transaction_graph_counters(model)["replays:chunk-fresh:g0:b1"] == 1
+    label = _served_label(_SERVED_OVERRIDES[served], "chunk-fresh", 1)
+    assert transaction_graph_counters(model)[f"replays:{label}"] == 1
 
 
 def _read_where_admission_reads(monkeypatch):
@@ -637,8 +697,9 @@ def _startup_memory(
         torch.accelerator.empty_cache()
 
 
+@_over_m
 @create_new_process_for_each_test(method="spawn")
-def test_nemotron_engine_transaction_graph_admission_is_charged(monkeypatch):
+def test_nemotron_engine_transaction_graph_admission_is_charged(monkeypatch, served):
     """Admitted graph memory is charged before resident capacity is fixed.
 
     Option-on minus option-off at equal utilization must cover ``A`` in retained
@@ -654,19 +715,20 @@ def test_nemotron_engine_transaction_graph_admission_is_charged(monkeypatch):
     memory-bound run sized from the option-on figures must hold exactly the
     pages core derives from its reduced budget.
     """
+    # @spec TXG-MEM-007
     # Zero cudagraph estimate: peak_activation_memory is then the peak headroom.
     monkeypatch.setenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "0")
     # Room above the target page count so memory, not max_num_seqs + 1, binds
     # even though later engines in one process consume tens of MiB less.
     max_num_seqs = 64
-    option = {**_G0_BASE_OVERRIDES, "transaction_graph_populations": [1]}
+    base = _SERVED_OVERRIDES[served]
+    requested = _BUCKET_GPU_MEMORY_UTILIZATION if served == "g1-bucket" else 0.4
+    option = {**base, "transaction_graph_populations": [1]}
     first, off = [
-        _startup_memory(
-            dict(_G0_BASE_OVERRIDES), 0.4, max_num_seqs, admission_readings=True
-        )
+        _startup_memory(dict(base), requested, max_num_seqs, admission_readings=True)
         for _ in range(2)
     ]
-    on = _startup_memory(option, 0.4, max_num_seqs)
+    on = _startup_memory(option, requested, max_num_seqs)
     admitted = on["admitted"]
     charged = ("non_kv", "total_consumed", "headroom")
     figures = {
