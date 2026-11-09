@@ -10,7 +10,7 @@ import math
 from collections import Counter
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field, fields, replace
-from enum import Enum, IntEnum
+from enum import IntEnum, StrEnum
 from fractions import Fraction
 from functools import cached_property
 from math import prod
@@ -171,7 +171,7 @@ def kv_cache_uses_per_token_head_scales(kv_cache_dtype: str) -> bool:
     return get_kv_quant_mode(kv_cache_dtype).is_per_token_head
 
 
-class KVCacheSpecKind(str, Enum):
+class KVCacheSpecKind(StrEnum):
     FULL_ATTENTION = "full_attention"
     MLA_ATTENTION = "mla_attention"
     SLIDING_WINDOW = "sliding_window"
@@ -184,7 +184,7 @@ class KVCacheSpecKind(str, Enum):
     UNKNOWN = "unknown"
 
 
-class SparseCacheRole(str, Enum):
+class SparseCacheRole(StrEnum):
     SPARSE = "sparse"
     INDEXER = "indexer"
 
@@ -345,6 +345,21 @@ class KVCacheSpec:
         take no slot mapping row.
         """
         return True
+
+
+def get_block_table_width(
+    max_num_blocks: int,
+    block_size: int,
+    *,
+    token_alignment: int | None = 128,
+) -> int:
+    """Return the width after optional alignment."""
+    if token_alignment is not None:
+        if token_alignment <= 0:
+            raise ValueError("token_alignment must be positive")
+        block_alignment = token_alignment // math.gcd(token_alignment, block_size)
+        max_num_blocks = cdiv(max_num_blocks, block_alignment) * block_alignment
+    return max_num_blocks
 
 
 def group_kernel_blocks(cache: torch.Tensor, num_blocks: int) -> torch.Tensor:
@@ -1025,6 +1040,8 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
     alignment: int | None = None  # Default to None for no padding.
     model_version: str | None = None
     bounded_replay: bool = False
+    # See MLAAttentionSpec.non_causal_multi_token_decode (windowed DSpark drafts).
+    non_causal_multi_token_decode: bool = False
 
     # MLA stores a single latent vector per state; there is no separate V.
     head_size_v: int = 0
@@ -1057,6 +1074,8 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         extra_retained_set = set(spec.extra_retained_tokens for spec in specs)
         bounded_replay_set = set(spec.bounded_replay for spec in specs)
         block_stride_alignment_set = {spec.block_stride_alignment for spec in specs}
+        kv_quant_mode_set = {spec.kv_quant_mode for spec in specs}
+        alignment_set = {spec.alignment for spec in specs}
         assert len({spec.dcp_sharded for spec in specs}) == 1
         assert len({spec.max_tp_shards for spec in specs}) == 1
         assert (
@@ -1067,10 +1086,13 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             and len(extra_retained_set) == 1
             and len(bounded_replay_set) == 1
             and len(block_stride_alignment_set) == 1
+            and len(kv_quant_mode_set) == 1
+            and len(alignment_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
             "quantization method, tokens per state, model version, sliding "
-            "window size, retained token count, and replay policy."
+            "window size, retained token count, replay policy, KV quant mode "
+            "and alignment."
         )
         return cls(
             block_size=specs[0].block_size,
@@ -1080,7 +1102,6 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             dtype=specs[0].dtype,
             dcp_sharded=specs[0].dcp_sharded,
             max_tp_shards=specs[0].max_tp_shards,
-            kv_quant_mode=specs[0].kv_quant_mode,
             page_size_padded=specs[0].page_size_padded,
             num_head_slots=specs[0].num_head_slots,
             state_content_bytes=specs[0].state_content_bytes,
@@ -1091,6 +1112,11 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             tokens_per_state=tokens_per_state_set.pop(),
             model_version=model_version_set.pop(),
             bounded_replay=bounded_replay_set.pop(),
+            kv_quant_mode=kv_quant_mode_set.pop(),
+            alignment=alignment_set.pop(),
+            non_causal_multi_token_decode=any(
+                spec.non_causal_multi_token_decode for spec in specs
+            ),
         )
 
     def is_uniform_with_collection(
@@ -1557,6 +1583,9 @@ class PersistentStateSpec(KVCacheSpec):
     persistence_class: str
     schema_id: str = field(compare=True)
     _page_size_bytes: int = field(compare=True, repr=False)
+    # Model options that also consume device memory, named in capacity errors.
+    # Diagnostic only: not part of the layout, the schema or equality.
+    memory_contributors: tuple[str, ...] = field(default=(), compare=False)
 
     def __init__(
         self,
@@ -1566,8 +1595,10 @@ class PersistentStateSpec(KVCacheSpec):
         block_size: int = 1,
         state_name: str,
         persistence_class: str = "resident",
+        memory_contributors: Sequence[str] = (),
     ) -> None:
         descriptor_tuple = tuple(descriptors)
+        contributors = self._validate_memory_contributors(memory_contributors)
         if block_size != 1:
             raise ValueError("persistent state requires block_size=1")
         if not state_name:
@@ -1581,6 +1612,7 @@ class PersistentStateSpec(KVCacheSpec):
         object.__setattr__(self, "state_name", state_name)
         object.__setattr__(self, "persistence_class", persistence_class)
         object.__setattr__(self, "_page_size_bytes", page_size_bytes)
+        object.__setattr__(self, "memory_contributors", contributors)
         object.__setattr__(
             self,
             "schema_id",
@@ -1591,6 +1623,21 @@ class PersistentStateSpec(KVCacheSpec):
                 persistence_class,
             ),
         )
+
+    @staticmethod
+    def _validate_memory_contributors(names: Sequence[str]) -> tuple[str, ...]:
+        if isinstance(names, str):
+            raise TypeError("persistent-state memory contributors must not be a str")
+        contributors = tuple(names)
+        if not all(isinstance(name, str) for name in contributors):
+            raise TypeError("persistent-state memory contributor names must be str")
+        if not all(contributors):
+            raise ValueError(
+                "persistent-state memory contributor names must be nonempty"
+            )
+        if len(set(contributors)) != len(contributors):
+            raise ValueError("persistent-state memory contributor names must be unique")
+        return contributors
 
     @staticmethod
     def _validate_layout(
@@ -1622,7 +1669,7 @@ class PersistentStateSpec(KVCacheSpec):
             )
             for descriptor in descriptors
         )
-        for start, end, name in intervals:
+        for _start, end, name in intervals:
             if end > page_size_bytes:
                 raise ValueError(
                     f"persistent-state descriptor {name!r} exceeds its page"
@@ -1730,7 +1777,10 @@ class PersistentStateSpec(KVCacheSpec):
     def merge(cls, specs: list[PersistentStateSpec]) -> PersistentStateSpec:
         # The spec is immutable; sharing it keeps the initializer objects, whose
         # copies (e.g. of a functools.partial) would not compare equal.
-        if any(spec != specs[0] for spec in specs[1:]):
+        if any(
+            spec != specs[0] or spec.memory_contributors != specs[0].memory_contributors
+            for spec in specs[1:]
+        ):
             raise AssertionError("All persistent-state layers must be the same.")
         return specs[0]
 
@@ -1779,7 +1829,7 @@ class KVCacheTensor:
     host_resident: bool = False
 
 
-class KVCacheGroupRole(str, Enum):
+class KVCacheGroupRole(StrEnum):
     DEFAULT = "default"
     HISPARSE_SOURCE = "hisparse_source"
     HISPARSE_INDEXER = "hisparse_indexer"

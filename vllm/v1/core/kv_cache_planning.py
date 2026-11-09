@@ -14,7 +14,10 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import get_dtype_size
-from vllm.v1.core.kv_cache_config_builder import KVCacheConfigBuilder
+from vllm.v1.core.kv_cache_config_builder import (
+    KVCacheConfigBuilder,
+    get_kv_cache_config_builder,
+)
 from vllm.v1.core.kv_cache_utils import (
     _kv_cache_device_name,
     update_kv_cache_capacity,
@@ -53,7 +56,14 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _more_kv_cache_memory_hint(vllm_config: VllmConfig) -> str:
+# Auto-fit warns when it reduces max_model_len below this many tokens, since
+# common requests may not fit.
+AUTO_FIT_SHORT_MAX_MODEL_LEN = 8192
+
+
+def _more_kv_cache_memory_hint(
+    vllm_config: VllmConfig, kv_cache_groups: Iterable[KVCacheGroupSpec] = ()
+) -> str:
     """How the user can make room for the KV cache, for error messages."""
     if vllm_config.cache_config.enable_extensible_kv_cache:
         return (
@@ -61,10 +71,35 @@ def _more_kv_cache_memory_hint(vllm_config: VllmConfig) -> str:
             "the model and its activations; decrease `max_model_len` or "
             "`max_num_seqs`, or the model needs a device with more memory."
         )
-    return (
+    hint = (
         "Try increasing `gpu_memory_utilization` when initializing the engine "
         "(this flag also controls CPU memory reservation on the CPU backend, "
         "despite its name)."
+    )
+    if contributors := describe_memory_contributors(kv_cache_groups):
+        hint += f" {contributors}"
+    return hint
+
+
+def describe_memory_contributors(kv_cache_groups: Iterable[KVCacheGroupSpec]) -> str:
+    """Name the options a persistent-state model says also use device memory.
+
+    Returns an empty string when the groups declare none.
+    """
+    from vllm.v1.kv_cache_interface import PersistentStateSpec
+
+    names = [
+        name
+        for group in kv_cache_groups
+        if isinstance(group.kv_cache_spec, PersistentStateSpec)
+        for name in group.kv_cache_spec.memory_contributors
+    ]
+    if not names:
+        return ""
+    return (
+        "The model reports that these options also use device memory: "
+        + ", ".join(f"`{name}`" for name in names)
+        + "."
     )
 
 
@@ -812,8 +847,9 @@ def _promote_local_kv_cache_specs(
                 spec,
                 target_cls,
                 # Promoted specs allocate blocks for all tokens and never free
-                # below the window, so the trailing-edge extension is moot.
-                drop=("extra_retained_tokens",),
+                # below the window, so the trailing-edge extension and replay
+                # bound are moot.
+                drop=("extra_retained_tokens", "bounded_replay"),
                 block_size=block_size,
                 page_size_padded=promoted_page_size_padded(spec, block_size),
             )
@@ -830,20 +866,24 @@ def _promote_local_kv_cache_specs(
 def _try_get_full_allocation_fallback_groups(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec] | None:
-    """Try a supported full-allocation fallback for local-attention layers."""
+    """Try a supported full-allocation fallback for local-attention layers.
+
+    Full attention is never worse here: without a common page size, a separate
+    sliding-window group still pays for every layer's page on each block ID, so
+    freeing out-of-window blocks saves no memory.
+    """
     if any(isinstance(spec, HiddenStateCacheSpec) for spec in kv_cache_spec.values()):
         return None
     if any(
-        isinstance(spec, (SlidingWindowMLASpec, ChunkedLocalAttentionSpec))
-        for spec in kv_cache_spec.values()
+        isinstance(spec, ChunkedLocalAttentionSpec) for spec in kv_cache_spec.values()
     ):
         return None
 
     has_mla = any(isinstance(spec, MLAAttentionSpec) for spec in kv_cache_spec.values())
-    has_regular_swa = any(
+    has_swa = any(
         isinstance(spec, SlidingWindowSpec) for spec in kv_cache_spec.values()
     )
-    if not (has_mla and has_regular_swa):
+    if not (has_mla and has_swa):
         return None
 
     try:
@@ -1353,6 +1393,7 @@ def _auto_fit_max_model_len(
     vllm_config: VllmConfig,
     projected_groups_per_worker: list[list[KVCacheGroupSpec]],
     available_memory: list[int],
+    after_warmup: bool = False,
 ) -> None:
     """When max_model_len is set to -1, this function estimates the largest
     context length that can be supported with the available GPU memory.
@@ -1365,6 +1406,8 @@ def _auto_fit_max_model_len(
         projected_groups_per_worker: KV cache groups projected to each worker.
         available_memory: Memory available for KV cache in bytes for each
             worker.
+        after_warmup: Whether this re-fits a length fitted before CUDA graph
+            capture and warmup to the memory measured after them.
 
     """
     original_max = vllm_config.model_config.max_model_len
@@ -1392,9 +1435,20 @@ def _auto_fit_max_model_len(
             limiting_worker_mem = avail_mem
 
     if auto_fit_max <= 0:
+        hint = (
+            "CUDA graph capture and warmup left no memory for the KV cache. "
+            "Increase `gpu_memory_utilization`, reduce the memory CUDA graphs "
+            "take (fewer or smaller capture sizes in the compilation config), "
+            "or use more GPUs."
+            if after_warmup
+            else _more_kv_cache_memory_hint(
+                vllm_config,
+                (g for groups in projected_groups_per_worker for g in groups),
+            )
+        )
         raise ValueError(
             "Cannot auto-fit max_model_len: not enough GPU memory available "
-            f"to serve even a single token. {_more_kv_cache_memory_hint(vllm_config)}"
+            f"to serve even a single token. {hint}"
         )
 
     kv_cache_memory = (
@@ -1404,24 +1458,68 @@ def _auto_fit_max_model_len(
         host_pool_gib = format_gib(get_hisparse_host_pool_bytes(vllm_config))
         kv_cache_memory += f" + {host_pool_gib} GiB host"
 
+    # Under the extensible KV cache the length is fitted again once CUDA graphs
+    # and warmup have taken their memory; say so, and log the final length then.
+    tentative = vllm_config.cache_config.enable_extensible_kv_cache and not after_warmup
+    tentative_note = (
+        "; the final length is set after CUDA graph capture and warmup"
+        if tentative
+        else ""
+    )
     if auto_fit_max >= original_max:
+        if after_warmup:
+            logger.info(
+                "Auto-fit max_model_len: using max_model_len=%d, which fits in "
+                "the KV cache memory left after CUDA graph capture and warmup (%s).",
+                original_max,
+                kv_cache_memory,
+            )
+            return
         # The model's full context length fits in memory
         logger.info_once(
             "Auto-fit max_model_len: full model context length %d fits in "
-            "available KV cache memory (%s)",
+            "available KV cache memory (%s)%s",
             original_max,
             kv_cache_memory,
+            tentative_note,
         )
-    else:
-        # Need to reduce max_model_len to fit in memory
-        vllm_config.model_config.max_model_len = auto_fit_max
+        return
+
+    # Need to reduce max_model_len to fit in memory
+    vllm_config.model_config.max_model_len = auto_fit_max
+    if tentative:
         logger.info_once(
             "Auto-fit max_model_len: reduced from %d to %d to fit in "
-            "available KV cache memory (%s)",
+            "available KV cache memory (%s)%s",
             original_max,
             auto_fit_max,
             kv_cache_memory,
+            tentative_note,
         )
+        return
+
+    left = (
+        f"{kv_cache_memory} left for the KV cache after CUDA graph capture and warmup"
+        if after_warmup
+        else f"{kv_cache_memory} available for the KV cache"
+    )
+    if auto_fit_max >= AUTO_FIT_SHORT_MAX_MODEL_LEN:
+        logger.info(
+            "--max-model-len auto reduced max_model_len from %d to %d (%s).",
+            original_max,
+            auto_fit_max,
+            left,
+        )
+        return
+    logger.warning(
+        "--max-model-len auto reduced max_model_len from %d to %d (%s). "
+        "Requests longer than %d tokens will be rejected. Increase "
+        "`gpu_memory_utilization` or set --max-model-len explicitly.",
+        original_max,
+        auto_fit_max,
+        left,
+        auto_fit_max,
+    )
 
 
 def _project_kv_cache_groups_to_worker(
@@ -1509,7 +1607,6 @@ def get_kv_cache_configs(
         The generated KVCacheConfigs for each worker.
 
     """
-    from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
     from vllm.v1.kv_cache_interface import PersistentStateSpec
 
     if any(
@@ -1548,10 +1645,13 @@ def get_kv_cache_configs(
                 get_max_num_blocks(vllm_config, groups) is not None
                 and override * bytes_per_block > avail_mem
             ):
-                raise ValueError(
+                message = (
                     f"num_gpu_blocks_override={override} exceeds the KV budget "
                     f"of {avail_mem // bytes_per_block} blocks"
                 )
+                if contributors := describe_memory_contributors(groups):
+                    message += f". {contributors}"
+                raise ValueError(message)
             logger.info(
                 "Overriding num_gpu_blocks=%d with num_gpu_blocks_override=%d",
                 avail_mem // bytes_per_block,
@@ -1586,7 +1686,7 @@ def get_kv_cache_configs(
             partial(_max_memory_usage_bytes_from_groups, builder, vllm_config, groups),
             vllm_config.model_config.max_model_len,
             partial(_estimate_max_model_len_from_groups, builder, vllm_config, groups),
-            _more_kv_cache_memory_hint(vllm_config),
+            _more_kv_cache_memory_hint(vllm_config, groups),
         )
 
     kv_cache_configs: list[KVCacheConfig] = []
@@ -1682,8 +1782,6 @@ def get_global_kv_cache_groups(
     kv_cache_specs: list[dict[str, KVCacheSpec]],
 ) -> list[KVCacheGroupSpec]:
     """Group the layers of the whole model (all workers' specs merged)."""
-    from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
-
     builder = get_kv_cache_config_builder(vllm_config)
 
     # Merge the KV cache specs of all workers. Different PP stages may have
@@ -1798,8 +1896,6 @@ def shrink_kv_cache_configs(
     tensors' size follows (their strides and offsets keep describing the
     reservation). Raises if max_model_len no longer fits.
     """
-    from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
-
     builder = get_kv_cache_config_builder(vllm_config)
     for kv_cache_config in kv_cache_configs:
         assert num_blocks <= kv_cache_config.num_blocks
@@ -1851,6 +1947,21 @@ def finalize_extensible_kv_cache(
     )
     num_blocks = min(block_counts, default=scheduler_kv_cache_config.num_blocks)
     num_blocks = min(num_blocks, scheduler_kv_cache_config.num_blocks)
+    if vllm_config.model_config.original_max_model_len == -1:
+        # The context length was fitted to the reserved capacity, before CUDA
+        # graphs and warmup took their share; fit it again to the measured one.
+        builder = get_kv_cache_config_builder(vllm_config)
+        groups_per_worker = [config.kv_cache_groups for config in kv_cache_configs]
+        available_memory = [
+            (num_blocks - 1)
+            * _pool_bytes_per_block_from_builder(builder, vllm_config, groups)
+            if groups
+            else 0
+            for groups in groups_per_worker
+        ]
+        _auto_fit_max_model_len(
+            builder, vllm_config, groups_per_worker, available_memory, after_warmup=True
+        )
     shrink_kv_cache_configs(
         vllm_config, kv_cache_configs + [scheduler_kv_cache_config], num_blocks
     )
