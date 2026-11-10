@@ -462,7 +462,7 @@ access to unowned slots, outside the per-step access to scheduled handles that
 models otherwise get. The model reaches the pools for it only through
 `StateSlotBindings.startup_pool_access(layer).component_pools`, which core
 makes valid only inside the runner's `initialize_state_slots` call
-(`vllm/v1/worker/gpu/model_runner.py:896-898`). The access grants no slot
+(`vllm/v1/worker/gpu/model_runner.py:898-900`). The access grants no slot
 ownership and authorizes no store to any resident page, the null page
 included. Capture, its warm-ups and its self-check therefore run only rows the
 transaction rejects, on non-null free blocks, and store no page (Capture and
@@ -492,11 +492,12 @@ recaptured outside startup.
 Runner shutdown discards the binding's graphs, admission inventory, arenas and
 owned buffers. After a device synchronize, `GPUModelRunner.shutdown` calls
 `ModelState.shutdown()` before it releases the state bindings and the KV cache
-(`model_runner.py:2531-2542`). The model state's override calls
-`TransactionGraphBinding.discard()` and tolerates a model state whose
-initialization did not complete and a binding that never captured. Core logs
-an exception from the hook and continues its cleanup, and never calls the
-hook twice.
+(`model_runner.py:2542-2556`). The model state's override takes the resident
+reading `Cx` and logs the growth figures (Memory growth after startup), then
+calls `TransactionGraphBinding.discard()`; it tolerates a model state whose
+initialization did not complete and a binding that never captured, and a
+failed reading does not prevent the discard. Core logs an exception from the
+hook and continues its cleanup, and never calls the hook twice.
 
 ### Process constants and excluded paths
 
@@ -538,6 +539,15 @@ reload after execution materialization (`nemotron_asr.py:649-653`).
   by the outer graph and the eager-path nested launches. It is fully written
   before it is read within a call, and its addresses and sizes are checked
   after the warmups (Post-Warmup Verification, check 6).
+- Binding-owned memory is fixed at publication: the serving graph pool, the
+  arenas, static inputs, owned outputs and graph entries are allocated before
+  `Ns1` and never again, and a replay allocates only the caller-owned escaped
+  row tensor (Memory growth after startup).
+- The serving thread executes no growth-tracking code: no device
+  synchronize, `gc.collect()`, `empty_cache()`, allocator snapshot, clock
+  read or memory reading runs in `execute`, `prepare_step`,
+  `postprocess_state` or the commit path on account of this option; the
+  periodic reading runs on a daemon thread (Memory growth after startup).
 
 ## Memory Admission
 
@@ -552,7 +562,15 @@ reload after execution materialization (`nemotron_asr.py:649-653`).
   window, before it enters the allocator split scope that covers the dummy
   run (`GPUModelRunner.prepare_execution_memory`; `profile_run` then skips it).
   That hook retains the nested inventory and runs eager profile transactions
-  alongside it (`nemotron_asr.py:902-969`).
+  alongside it (`nemotron_asr.py:908-975`). The split scope
+  (`_scoped_allocator_max_split(20)`) wraps only `profile_run` and restores
+  the configured allocator settings on exit, and serving capture runs from
+  `initialize_state_slots` after `determine_available_memory` has returned.
+  Both captures therefore run at the worker's configured allocator settings,
+  neither under the splitting limit: the **equal allocator scope** that makes
+  the serving and admission figures comparable (Normalized measurement). When
+  `kv_cache_memory_bytes` is set there is no window and no split scope; the
+  hook runs from `profile_run` at the same configured settings.
 - The budget is the memory left after `non_kv_cache_memory`, or
   `kv_cache_memory_bytes` when that is set. Resident capacity for persistent
   state is `count = min(budget // page_size_bytes, max_num_seqs + 1)` pages.
@@ -567,7 +585,7 @@ reload after execution materialization (`nemotron_asr.py:649-653`).
 - Resident pools exist only inside `initialize_kv_cache`. The KV allocation
   precedes `initialize_state_slots`, and the capture hook runs from
   `initialize_state_slots` after the pools are allocated
-  (`model_runner.py:869`, `:896-898`; `model_state_v2.py:109-122`).
+  (`model_runner.py:869`, `:898-900`; `model_state_v2.py:109-122`).
 
 Graphs bake in resident pool addresses, and those addresses do not exist until
 capacity is fixed. The inventory that serves therefore cannot be the inventory
@@ -577,13 +595,88 @@ that is measured.
 
 `N()` denotes a normalized free-memory reading. It is taken after a device
 synchronize, `gc.collect()` and an allocator `empty_cache()`, with no other
-allocation in flight, using `mem_get_info`. Every admission figure is a
+allocation in flight, using `mem_get_info`. Every startup admission figure is a
 difference of two `N()` readings. This includes memory the torch allocator does
 not track: instantiated graphs and fragmentation. Only the admission release
 check reads the allocator itself (Ordering): free memory does not rise when a
 release leaves its block in a segment the allocator keeps, so the check
 compares the allocator's allocated bytes, which are exact for storage of any
 size.
+
+Three startup figures are measured. Each is a free-memory difference, so a
+drop in free memory is positive and a rise is written as the later reading
+minus the earlier one:
+
+- **`A = N0 - N1`**, the free-memory drop across admission. It counts the
+  admission inventory together with first-time process state created between
+  the two readings (graph instantiation, module loads, the stand-in scatter
+  warm-up), which later engines in a process do not pay again. It can also
+  undercount, when admission's regular-pool blocks land in segments the
+  allocator already held. `A` is reported and is never a fit bound.
+- **`R = Ns0 - Nr`**, the free memory that releasing the admission holder and
+  its graph pool returns, from one normalized reading immediately before the
+  release and one immediately after. `R` is the net device memory the release
+  returned: the graph-pool segments, instantiated graphs, arenas, static
+  inputs and owned outputs whose segments became empty. It does not count a
+  released block whose segment a surviving foreign block keeps, and it does
+  count a segment that existed before `N0` if admission held its last live
+  block. `R <= A` is therefore an expectation, not a guarantee; `R > A` is
+  reported, never a failure, because capacity never used `A`.
+- **`S = Ns0 - Ns1`**, the free-memory drop across serving capture, the
+  memory serving retains, measured the same way as `R`.
+
+The fit check is **`S <= R`** with zero tolerance: serving may retain no more
+device memory than admission's release returned. Equivalently,
+`free(Ns1) >= free(Nr)`: serving capture never takes the device below the
+free memory committed at `Nr`, so the memory serving occupies was held, and
+charged, when capacity was fixed. `R` is preferred to `A` as the bound because
+it is measured by the same release the budget chain relies on and is not
+inflated by first-time process state; it is not a tighter bound in every
+process history, which is why `A - R` is reported rather than assumed
+non-negative. The budget chain is closed by the window (Budget mechanics):
+`non_kv_cache_memory` was measured with the holder alive, so it includes at
+least `R`, and the KV budget never counts memory serving will occupy.
+
+Per-stream lazy state the inventory depends on must belong to the inventory,
+or it falls between `R` and `S`. The binding's eager warm-ups and both
+captures run on the binding's one capture stream, so the stream's lazily
+created cuBLAS workspace (8,519,680 bytes at the default
+`CUBLAS_WORKSPACE_CONFIG` below sm90, one per handle and stream) is created by
+admission's warm-up, observed to be returned with admission's release, and
+created again by serving's warm-up, so it appears in `A`, `R` and `S` alike
+(the C++ owner of that free is unverified; Open Question 2 names the owed
+run). A capture on another stream leaves the warm-up stream's workspace
+outside the inventory and `R` short by its segment.
+
+The reported differences are `A - R` (first-time process state, absorbed
+blocks and anything admission left behind; negative when the release returned
+more than admission's drop) and `R - S` (the slack serving left). Both appear
+in every receipt, beside the raw readings they come from (Observability).
+
+`S` and `R` compare like with like only at **equal allocator scope**: the
+allocator's block-splitting limit changes how many segments a capture
+retains, so a capture under the profiling run's `max_split_size_mb:20` is not
+comparable with one at the configured settings. Both captures run at the
+worker's configured settings (Budget mechanics). The model records the
+allocator settings in force with `N0` and with `Nr` and fails startup if they
+differ, which can only happen through a core integration change.
+
+Beside the free-memory readings the model records the allocator's reserved
+bytes `rsv(·)` at `N0`, `N1`, `Nr` and `Ns0`. The aggregate
+`rsv(N1) - rsv(N0)` (admission's reserved growth) and `rsv(Nr) - rsv(Ns0)`
+(the release's reserved drop) are **diagnostics**: they are reported and
+carried in the `S > R` error, and they never fail startup, because
+process-wide reserved bytes include regular-pool segments that later
+allocations can pin and unrelated releases can free. What is asserted at
+release is ownership-scoped (Ordering, step 6).
+
+`M()` denotes a **resident reading**, used after startup (Memory growth after
+startup): free device memory from `mem_get_info` together with the allocator's
+reserved, allocated and peak-reserved bytes, with no `gc.collect()` or
+`empty_cache()`, so that it records the footprint as serving leaves it instead
+of changing it. A resident reading at a startup or shutdown point follows a
+device synchronize; the periodic reading `Cp` takes none (Memory growth after
+startup).
 
 ### Capture-lifetime rule
 
@@ -607,7 +700,9 @@ makes the binding ready.
 1. **Construction.** The binding is built and the envelope is validated.
 2. **Admission (inside the profile window).** In `prepare_execution_memory`,
    after the nested inventory is ready and before the eager profile
-   transactions: read `N0`; allocate stand-in storage of `max(populations) +
+   transactions: draw the binding's capture stream, with a handle distinct
+   from the runner stream and from the nested bindings' recorded capture
+   streams (TXG-MEM-018); read `N0`; allocate stand-in storage of `max(populations) +
    1` slots with the real layout (`build_nemotron_persistent_state_spec`,
    `allocate_state_scratch`, one raw allocation, `state_profile.py:240-263`);
    capture the complete declared inventory over it into a dedicated graph pool
@@ -624,10 +719,12 @@ makes the binding ready.
    storage remains (checked separately through a weak reference), else
    startup fails. Admitted bytes are `A = N0 - N1`, a free-memory difference:
    stand-in storage released into a segment the allocator keeps stays in `A`,
-   which can only over-charge. Stand-in
+   which over-charges, while admission blocks absorbed into segments the
+   allocator already held under-charge; `A` is reported, never a bound
+   (Normalized measurement). Stand-in
    storage provides capture indices and matching component strides, not
    proven-identical allocator or graph-exec bytes; the final check is the
-   authority.
+   authority. The allocator settings in force are recorded with `N0`.
 3. **Eager profiles.** The existing CHUNK-cell and `max_num_seqs` profile
    transactions run with both inventories alive, the retained nested inventory
    (encoder, decode and, when on, CHUNK-bucket graphs) and the admission
@@ -637,12 +734,67 @@ makes the binding ready.
    (graph-pool segments, instantiated graphs, arenas, owned outputs). The peak
    headroom includes the preparation and capture peak.
 5. **Capacity fixed** from the remaining budget, by the formula above.
-6. **Serving capture.** In `capture_transaction_graphs`: release the admission
-   holder and its pool; read `Ns0`; capture over the resident pools into a
-   fresh dedicated pool; clear the capture contexts; read `Ns1`. Serving
-   retained bytes are `S = Ns0 - Ns1`.
-7. **Admission check.** Startup succeeds only if every cell is published and
-   `S <= A`.
+6. **Serving capture.** In `capture_transaction_graphs`, after the serving
+   scatter warm-up (which therefore precedes `Nr` and is in neither `R` nor
+   `S`): read `Nr`, with the allocator settings in force and `rsv(Nr)` as
+   host-side reads beside it; release the admission holder and its pool;
+   read `Ns0` and `rsv(Ns0)`, with no allocation or device work between `Nr`
+   and `Ns0` other than the release and the `Ns0` reading's own
+   normalization; capture over the resident pools into a
+   fresh dedicated pool; clear the capture contexts; read `Ns1`. Released
+   bytes are `R = Ns0 - Nr` and serving retained bytes are `S = Ns0 - Ns1`.
+   The **admission release check** is storage-aware and enforced at startup.
+   Before the release the binding records, outside the holder, every
+   admission-owned storage (`untyped_storage().data_ptr()` and `nbytes` of
+   each arena, static input and owned output) and the admission pool's id,
+   and holds weak references to those tensors and to the admission
+   `torch.cuda.CUDAGraph` objects. The order is fixed: the holder release;
+   `Ns0`'s normalization (device synchronize, `gc.collect()`,
+   `empty_cache()`, which is what returns a dead graph pool's segments and
+   collects cycle-held buffers); the `Ns0` and `rsv(Ns0)` readings; one
+   startup-only `torch.cuda.memory_snapshot(include_traces=False)` filtered
+   to the worker device; then the first serving-capture allocation. The
+   snapshot verifies that no segment carries the admission pool id and that
+   no active block overlaps a recorded storage range; either finding fails
+   startup with an error naming the option and the surviving pool or
+   storage. Startup is single-threaded on the device through the snapshot:
+   the serving thread is inside `initialize_state_slots`, and the periodic
+   thread starts only after `Cw`, so nothing else allocates in the window
+   and no address is reused by a foreign allocation; a `gc.collect()`
+   finalizer that allocated device memory in that window fails startup if
+   its block lands on a recorded range, and otherwise lowers `R`, which is
+   conservative; neither outcome is masked. Host allocations are
+   unrestricted. The weak references
+   are an early diagnostic (a live one is reported in the same error); the
+   snapshot is the proof. Its cost is host-side and startup-only, linear in
+   segments and blocks without traces; Phase 6 records its wall time and host
+   memory. The aggregate reserved figures are reported, not checked.
+7. **Admission check.** Startup succeeds only if every cell is published,
+   the allocator settings recorded with `N0` and `Nr` are equal, and
+   `S <= R`. When the checks pass, publication takes the resident reading
+   `Cs` and logs `A`, `R`, `S`, `A - R` and `R - S` once. When they fail, the
+   same diagnostics (every raw reading and operand) are logged and carried in
+   the error before `initialize_kv_cache` raises.
+8. **Warm-ups and post-warmup baseline.** The worker's warm-ups run; after
+   post-warmup verification passes, the model takes the resident reading
+   `Cw`, the serving baseline for growth tracking, and then resets the
+   allocator's peak statistics so the later peak-reserved figure is the
+   served high-water mark (Memory growth after startup).
+9. **Serving.** The serving thread executes no growth-tracking code. A
+   daemon thread, started after `Cw` only when its start condition holds
+   (the measurement switch, or stats logging enabled together with a
+   recorded latency qualification; Memory growth after startup), takes the
+   periodic resident reading `Cp` once per stats interval without an
+   explicit synchronize; a harness reads on demand through
+   `transaction_graph_memory` (`Cn`). Until the thread qualifies and core
+   delivers the stats-logging setting, production records served growth
+   only at `Cx`.
+10. **Shutdown.** `ModelState.shutdown()` sets the periodic thread's
+    cancellation flag, wakes it and joins it with a bounded timeout,
+    reporting `joined` or `abandoned after timeout`; takes the resident
+    reading `Cx` and logs the growth figures; then discards the binding
+    unconditionally. An abandoned sampler that later resumes sees the flag
+    and exits without reading or publishing.
 
 **Escaped outputs.** The per-call escaped row buffer is at most `population ×
 hidden_size` float32. It is allocated from the headroom reserved by the
@@ -661,11 +813,24 @@ the profiled remainder, which includes `A`, or `kv_cache_memory_bytes` when
 both are set. An override that exceeds that budget is rejected before
 allocation (Failure modes and diagnostics).
 
-Budget-derived capacity from the profiled remainder (Ordering step 5)
-applies only without either override. Under either override, admission is
-still measured and reported and `S <= A` still checked, but neither changes
-the count the overrides determine. If serving capture then raises or runs out
-of memory, the model reports an admission failure naming the option. A
+Three guarantees have different scopes. The **charge** (`non_kv_cache_memory`
+includes the retained inventory and so at least `R`, with the peak headroom
+left to the profiler) holds whenever `kv_cache_memory_bytes` is unset, with
+or without `num_gpu_blocks_override`, because the window runs in both cases
+and core validates an override against the profiled remainder. The **holder
+lifetime** (alive from admission through the eager profiles and the window
+close until serving capture) holds in every configuration. **Automatic
+block-count selection** from the remaining budget (Ordering step 5) applies
+only when neither override is set. Under either override, `A`, `R` and `S`
+are still measured and reported and `S <= R` still checked, but neither
+changes the count the overrides determine. Under `kv_cache_memory_bytes` no
+window exists, so nothing charges `R` against the budget and core's planner
+cannot see it: the fixed budget must leave room for `R` itself, and a budget
+that does not surfaces as a KV-allocation failure (TXG-MEM-012) or a serving
+capture failure (TXG-MEM-008), not as a planner rejection; a successful
+allocation under a fixed budget does not establish transient serving
+headroom, which only the profiled path measures. If serving capture raises or
+runs out of memory, the model reports an admission failure naming the option. A
 failure of the KV allocation itself happens before `initialize_state_slots`,
 outside any model hook, so core names the option there from the state spec's
 memory contributors (Core Obligations, item 5).
@@ -680,7 +845,7 @@ while the option is on (Core Obligations, items 4 and 5).
 
 - Admission does not fit (capture failure or OOM in the window):
   `prepare_execution_memory` fails and latches `_execution_memory_failed`
-  (`nemotron_asr.py:964-968`).
+  (`nemotron_asr.py:970-974`).
 - Release not verified, or too few usable slots.
 - No capacity: core budget validation rejects the persistent-state budget,
   because fewer than two pages fit, a `num_gpu_blocks_override` exceeds the
@@ -696,24 +861,250 @@ while the option is on (Core Obligations, items 4 and 5).
   (`model_runner.py:207-220`, `:865-867`). The note is in the worker's logged
   traceback, not in the exception's message; the multiprocess executor sends
   the engine only the message.
-- Serving capture raises, or `S > A`: every graph is discarded and
-  `initialize_kv_cache` raises.
+- Serving capture raises, or `S > R`, or an admission-owned reference
+  survives the release, or the allocator settings recorded with `N0` and
+  `Nr` differ: every graph is discarded and `initialize_kv_cache` raises. The
+  `S > R` error reports `S`, `R` and `A`, the six raw readings, the reserved
+  and allocated operands and the stand-in bytes, so the operator sees the
+  overrun, the slack admission had and the figures behind them.
 
 A capture OOM reports the normalized bytes admitted so far, the cells
 captured, the failing cell, and the device's free and total memory. The full
 required size of an unfinished inventory is not known and is not reported.
 
+Every failure above is a startup failure whose recovery is a fresh worker;
+none can outlive its cause, because nothing is latched past the process. An
+`S > R` failure depends on the build, the device, the configuration and the
+process's allocator history, not on a retry of the same process: if it
+reproduces in a fresh process, recovery is a configuration or code change.
+Under the current policy the measured engine sample at B1/g1 with the bucket
+off (`S` 60,817,408 > `R` 58,720,256, the third engine in one process after
+two option-off engines, on the pinned A40 reproducer of Open Question 2)
+fails startup; the tests assert the outcome rule, never that pair; whether
+that one-granule overrun should be absorbed by design is Open Question 2.
+
 **Cost.** Capture runs twice per startup (about twice the single-inventory figure, plus
-eager warm-ups). Admitted bytes come out of resident capacity when memory
+eager warm-ups). Retained bytes come out of resident capacity when memory
 binds. The peak headroom may count part of the retained inventory twice, which
-errs toward fewer slots.
+errs toward fewer slots. Post-startup growth tracking costs three device
+synchronizes per worker lifetime (publication, post-warmup, shutdown), one per
+harness read, and one unsynchronized reading per stats interval on a daemon
+thread; the serving thread executes none of it, and the thread's contention
+cost is measured before it is called acceptable (Memory growth after
+startup).
+
+## Memory growth after startup
+
+The startup accounting fixes what the option retains. Serving must not grow
+it unaccounted, and growth must be visible while the worker serves, not only
+at a clean shutdown. Growth is tracked at defined points with no device
+synchronize and no per-step reading on the serving path.
+
+**Readings.** Each point takes one resident reading `M()` (Normalized
+measurement): free device memory, allocator reserved, allocated and
+peak-reserved bytes, with no collection or cache release. The points are:
+
+| Point | Where | Synchronize | Baseline for growth |
+|---|---|---|---|
+| `Cs` | Publication, after the admission checks pass | yes | none (anchor) |
+| `Cw` | `post_warmup`, after every verification check passes; the allocator's peak statistics are reset after the reading | yes | `Cs`: the worker's warm-up growth, reported only |
+| `Cp` | Periodic: on a worker daemon thread, every `VLLM_LOG_STATS_INTERVAL` (default 10 s), started only under the start condition below (the measurement switch, or stats logging enabled together with a recorded latency qualification); one `INFO` line each | no | `Cw` |
+| `Cn` | each `transaction_graph_memory` call (harness, on demand), labelled `served` with the total replay count | yes | `Cw` |
+| `Cx` | `ModelState.shutdown()`, after the periodic thread has been cancelled and joined or abandoned, before `discard()` | yes (the runner already synchronized) | `Cw` |
+
+**The periodic thread.** `Cp` runs off the serving thread. After `Cw`, when
+its **start condition** holds, the model starts one daemon thread. The
+condition has one switch and one production rule, in that precedence: the
+environment variable `VLLM_NEMOTRON_TXG_MEMORY_THREAD`, the
+measurement-and-test switch, starts the thread whatever the stats-logging
+setting and the qualification record say, and is set only by the Phase 6
+measurement and by the tests that name it; without the switch, the thread
+starts only when the engine's stats logging is enabled (Core Obligations,
+item 8) and the latency qualification (below) is recorded as passed in the
+module constant `PERIODIC_THREAD_QUALIFIED` of `transaction_graph.py`,
+which a Phase 6 commit citing the A40 result flips from `False` to `True`
+(whether one A40 result qualifies every device is the owner's call, recorded
+with that commit). Until both hold, production starts no thread and records
+served growth only at `Cx`; under the switch, `Cp` runs and logs its `INFO`
+lines even with stats logging off, which is what a measurement needs.
+
+The switch is a registered vLLM environment variable: declared in
+`vllm/envs.py` with a `TYPE_CHECKING` annotation as a `bool` and an
+`environment_variables` entry whose lazy getter returns `True` only for the
+literal value `1` (unset, `0` or any other value falls back to the
+production rule), carrying a registry comment that explains the
+measurement-only bypass of the latency qualification, listed in
+`compile_factors()`'s `ignored_factors` so that the on and off arms of the
+Phase 6 comparison share one `torch.compile` cache key, and read only
+through `vllm.envs`, never through `os.environ`. An undeclared `VLLM_*`
+variable would log as unknown or fail environment validation. The value is
+frozen once the engine enables the environment cache, so a test sets it
+before initialization or resets the cache with `disable_envs_cache()`; a
+spawned engine reads it fresh. The variable is user-visible and so carries
+the registry comment the generated documentation renders
+(`docs/contributing/README.md`, "Documenting User-Visible Changes").
+
+On each interval the thread takes one **sample**: a
+`torch.cuda.memory_stats()` call, one `mem_get_info` (`cudaMemGetInfo`)
+reading, then a second `memory_stats()` call. The sample is **consistent**
+only if the reserved bytes are equal in both statistics reads; the figures
+are then computed against `Cw` from the free memory and the first
+statistics. Serving allocates concurrently, so every `Cp` sample is an
+approximate reading, not an atomic observation: a segment allocated before
+`mem_get_info` and freed before the second statistics read leaves both
+reserved totals equal and `ΔX` spuriously positive. Consistency detects a
+changed total; **persistence** is the defence against an equal-total spike.
+An **inconsistent** sample (reserved bytes changed between the reads) is
+recorded as `inconsistent` with both reserved values, never warns, moves
+neither the synchronized watermark nor the `Cp` mark, clears the pending
+spike, and the thread re-arms. The thread records
+each sample as one immutable record, logs one `INFO` line, catches every
+exception, records the point as `error` with the reason, re-arms for the
+next interval and never latches.
+
+The latest-record pointer, the synchronized watermark, the `Cp` suppression
+mark, the pending-spike record and the cancellation flag are the only state
+shared across threads; one lock guards them, written by the daemon (`Cp`),
+the harness thread (`Cn`) and the serving thread at `Cw`, `Cx` and
+`shutdown()`, and read by the same three and by the receipt. Device calls
+run outside the lock. The thread sleeps on an event and checks the
+**cancellation flag** before every device call and, under the lock, before
+every publication, so that a sampler preempted mid-sample cannot publish
+after `Cx`. `shutdown()` sets the flag under the lock, wakes the thread and
+joins it with a bounded timeout (the interval, at most 5 s), then reports
+`joined`, or `abandoned after timeout` when a driver call is blocked; in
+the latter case `shutdown()` still takes `Cx` and completes, and the
+sampler, when it resumes, sees the flag and exits without reading or
+publishing. Its guarantee is stated precisely:
+
+- The serving thread executes no added code: no gate, no clock read, no
+  reading.
+- The thread issues no explicit synchronize, collection or cache release.
+  CUDA does not rule out driver-level blocking inside any runtime call, so
+  "no device synchronization" is not claimed; what is claimed, and tested
+  by instrumenting the thread (TXG-MEM-014), is that it calls no
+  synchronizing API. The public `cudaMemGetInfo` entry documents no
+  synchronizing behaviour; it documents that the call may return an error
+  from an earlier asynchronous launch. Such an error is sticky and
+  device-wide: `Cp` records it as `error` with the CUDA error string,
+  attributes it to no point, and the serving thread's next device call
+  surfaces the same error through the existing worker-fatal path. `Cp`
+  neither masks nor causes it.
+- The residual contention is the interpreter lock, held for the three calls
+  and the log line, the allocator mutex `memory_stats()` takes while it
+  copies the counters, during which a serving-thread allocation waits, and
+  any lock the driver takes inside `cudaMemGetInfo`.
+- **Latency qualification.** The cost is measured, not argued. Phase 6
+  measures it on the A40: the B31 lockstep workload with the thread on at a
+  short interval (many samples per run) and off, in at least five
+  alternating on/off pairs. The noise band is the spread of the off runs'
+  p50 and p99 step latencies; the thread qualifies when the on runs' p50 and
+  p99 lie inside that band. Until the comparison qualifies, the thread
+  starts only through the measurement-and-test switch, never from the
+  stats-enabled condition alone; in production the switch is unset, so
+  stats logging and the qualification record must both hold. A failed
+  qualification is a design cascade (another placement or sample), not a
+  runtime option.
+
+`Cp` is the production record of served growth under `EngineCoreProc`, where
+no harness reads the receipt, once it has qualified and core delivers the
+stats-logging setting.
+
+**Growth figures.** Against the baseline `B` of a point `P`: the allocator
+reserved growth `ΔR = rsv(P) - rsv(B)`; the allocator live growth
+`ΔA = allocated(P) - allocated(B)`; the cached slack `ΔR - ΔA`, segments the
+allocator holds but no live block uses; the device growth
+`ΔF = free(B) - free(P)`; and the unexplained device-wide residual growth
+`ΔX = ΔF - ΔR`. `ΔR` is the caching allocator's segment growth, which the
+eager fallback path and the per-replay escaped rows drive until the working
+set plateaus; the `max_num_seqs` eager profile transaction measured the live
+working set inside the window, so its allocated-bytes peak is charged in the
+peak headroom, while segment rounding and fragmentation are not. `ΔX` is
+device memory that changed outside the torch allocator: a graph
+instantiation, a module load, a cuFFT plan or cuBLAS handle, a driver
+allocation, or another process's use of the same device. The figures assume
+the device is not shared with another process during the measurement; where
+it is, `ΔX` includes that process's changes. After `Cw` the design predicts
+no residual growth from this option, because the binding never captures
+after startup (Lifetime: one serving capture per worker) and the nested
+bindings are sealed before the worker serves; core's own lazy loads can still
+produce it (Open Question 11).
+
+**Binding-owned memory is fixed at publication.** The serving graph pool's
+segments, the arenas, static inputs, owned outputs and graph entries are
+allocated before `Ns1` and never again, and a replay allocates only the
+caller-owned escaped row tensor (Escaped outputs). This is the unconditional
+invariant the model owns. A plateau of the process's allocator statistics
+across replays is not unconditional: a caller may keep escaped rows alive
+across later replays (Failure Containment, output lifetime), and a larger
+cell's output can extend reservations. The plateau is therefore asserted only
+in the **isolated-replay experiment**: binding level, every cell warmed and
+replayed once before measurement, the escaped rows of each replay dropped
+and the device synchronized before each reading. Engine tests report the
+figures and assert their presence, not their values.
+
+**Status schema.** Every reading and figure carries one of four statuses.
+A read that raised (for example a `mem_get_info` error) is `error`, with the
+exception text as its reason. A `Cp` sample whose two statistics reads
+disagree is `inconsistent`, with both reserved values. A point that was never
+reached (`Cs` and `Cw` after a startup failure, `Cw` after a failed
+verification) is `unavailable`.
+A derived figure whose baseline or point is `error`, `inconsistent` or
+`unavailable` is `unavailable`, naming the operand; no baseline is ever
+substituted. A failed
+read changes no outcome: it does not alter a startup error already raised,
+`post_warmup` and `shutdown` return as they would have, `discard()` runs
+unconditionally, the periodic thread re-arms, and the next point is read on
+its own. The raw values a point did obtain are reported even when a figure
+is unavailable.
+
+**Severity.** Growth tracking reports; it never latches the binding, fails a
+step or changes serving behaviour. `Cw`, `Cp` and `Cx` each log one `INFO`
+line with the reading and its growth figures; the `Cp` line, like the thread
+that produces it, exists only while the thread runs. The `ΔX`
+tracker keeps two marks, both starting at zero at `Cw`. The **synchronized
+watermark** is compared and updated only at `Cn` and `Cx`, synchronized
+readings taken with the serving thread idle (`Cx` by construction; `Cn` by
+the harness's contract of reading between steps, a concurrent call giving an
+approximate reading): when such a reading's `ΔX` is greater than zero and
+strictly greater than the watermark, the model logs a `WARNING` with the
+figures and raises the watermark under the lock. A `Cp` sample never moves
+the watermark. The **`Cp` suppression mark** is separate: `Cp` samples are
+approximate, so they need persistence, and the model warns from `Cp` only
+when two consecutive consistent samples both have `ΔX` greater than zero
+and strictly greater than the `Cp` mark, then raises the `Cp` mark to the
+smaller of the two and consumes the pair; a single such sample is held as a
+pending spike that moves nothing; an `error` or `inconsistent` sample
+clears the pending spike, and so does any `Cn` or `Cx` reading that falls
+between the two samples. At every synchronized reading, after the watermark
+has been compared and updated, the `Cp` mark is reset to the updated
+watermark: that reset is its recovery, so a run of false `Cp` spikes can
+raise only the `Cp` mark, and smaller genuine growth seen at `Cn` or `Cx`
+still warns against the watermark. Production takes no `Cn` reading, so
+between startup and `Cx` the `Cp` mark also recovers on its own: a later
+consistent pair whose `ΔX` values both lie below the `Cp` mark lowers it to
+the smaller of that pair, never below the watermark. The line names the
+option as the tracker that observed the growth and says the figure is
+device-wide and unexplained, not that the option caused it. `ΔR`, `ΔA` and the cached slack are
+reported, not judged, because their bound (the profiler's peak headroom) is
+a core figure the model does not hold. Running out of memory during serving
+remains the existing worker-fatal path, whose recovery is a fresh worker.
+
+**Hot-path cost.** The serving thread executes no code on account of growth
+tracking: no device synchronize, `gc.collect()`, `empty_cache()`, allocator
+snapshot, clock read or reading runs in `execute`, `prepare_step`,
+`postprocess_state` or the commit path. The periodic thread's contention
+with the serving thread is named above and measured in Phase 6.
+`transaction_graph_counters` keeps its no-synchronization contract;
+`transaction_graph_memory` is a separate reader that synchronizes once per
+call and is documented as such.
 
 ## Post-Warmup Verification
 
 Worker warmups run after serving capture and can resize workspaces:
 `kernel_warmup`, `warmup_kernels` and the compile dummy runs. Core calls
 `ModelState.post_warmup()` once, after every warmup stage and before the
-worker serves (`vllm/v1/worker/gpu_worker.py:1207`); an exception from it fails
+worker serves (`vllm/v1/worker/gpu_worker.py:1215`); an exception from it fails
 engine startup. The model state's override runs the post-warmup verification
 there, over its current serving bindings.
 
@@ -767,7 +1158,13 @@ dtype, and projected as the resident pools are. It checks, in order:
    it finds and does not check it; verification is the one failure point, and
    its failure latches the binding as worker-fatal.
 
-A mismatch is worker-fatal: it latches the binding and fails startup.
+A mismatch is worker-fatal: it latches the binding and fails startup. When
+every check passes, the model takes the resident reading `Cw`, the serving
+baseline for growth tracking, and then resets the allocator's peak statistics
+so that the peak-reserved figure at later points is the served high-water
+mark rather than the startup peak the profiler already consumed (Memory
+growth after startup); the reading comes after the checks so that a failed
+verification reports its own error and leaves `Cw` unavailable.
 Verification does not run again at serving time. Every non-dummy
 `prepare_step` checks the binding's failed latch before its registry pruning
 (`model_state_v2.py:190`), and therefore before `state_slots.begin_step`,
@@ -867,11 +1264,45 @@ cell's next replay. The commit sink consumes them earlier in the step.
   mistaken for off.
 - The execution profile receipt includes readiness and, per cell, arena bytes,
   reserved-memory growth, warm-up and capture seconds, and capture order. It
-  also includes `A`, `S`, the release check, and the admission and serving
-  capture seconds, and the served geometry. Cell labels stay as they are
-  (`transaction_graph.py:76-77`): a `replay` label names no geometry, so the
-  receipt's served geometry is what distinguishes evidence from g0 and g1
-  engines.
+  also includes the complete startup accounting: the six raw readings `N0`,
+  `Na`, `N1`, `Nr`, `Ns0`, `Ns1`; the allocated bytes read with `Na` and
+  `N1` and the stand-in bytes (the release check's operands); `rsv(N0)`,
+  `rsv(N1)`, `rsv(Nr)`, `rsv(Ns0)` and the two aggregate reserved
+  diagnostics; the derived `A`, `R`, `S`, `A - R` and `R - S`; the release
+  check result; the allocator settings recorded with `N0` and `Nr`; the
+  admission and serving capture seconds; the resident readings `Cs`, `Cw`
+  (once `post_warmup` has run) and the latest `Cp`, each with its growth
+  figures; and the served geometry. Every value carries a status: present,
+  `error` with the exception text, `inconsistent` with both reserved values
+  (a `Cp` sample), or `unavailable` for a point not reached or a figure with
+  such an operand. The receipt is readable after a failed startup too, before anything
+  is published, with the readings startup did obtain. Cell labels stay as
+  they are (`transaction_graph.py:76-77`): a `replay` label names no
+  geometry, so the receipt's served geometry is what distinguishes evidence
+  from g0 and g1 engines.
+- `transaction_graph_memory` (beside the counters reader) takes the same
+  targets, takes one resident reading labelled `served` with the total replay
+  count at the time, and returns it with the recorded readings and the growth
+  figures of Memory growth after startup. Unlike the counters it synchronizes
+  the device once per call; it is a harness facility read between steps,
+  never on the serving path. With the option off it returns an empty mapping;
+  an unreachable model raises, as for the counters.
+- Startup logs one `INFO` line at publication with `A`, `R`, `S`, `A - R` and
+  `R - S`, and one line with every raw reading when startup fails;
+  `post_warmup`, each periodic `Cp` (while the thread runs, which under the
+  measurement-and-test switch includes runs with stats logging off) and
+  `shutdown` log one `INFO` line with their reading and growth figures; a
+  new high-water mark of unexplained device-wide residual growth, above
+  zero, logs a `WARNING`: against the synchronized watermark at `Cn` and
+  `Cx`, and against the separate `Cp` mark over two consecutive consistent
+  samples at `Cp`. These lines are the
+  production record under `EngineCoreProc`, where no harness reads the
+  receipt, and `Cp` is what makes served growth visible before shutdown.
+  Production takes no `Cn` reading, so the `Cp` mark recovers before
+  shutdown only through a later lower consistent pair; a false pair can
+  therefore suppress `Cp` `WARNING` lines for smaller genuine growth until
+  such a pair or `Cx` arrives, while every `Cp` `INFO` line still carries
+  `ΔX` and the `Cx` warning is judged against the untouched watermark.
 
 ## Core Dependency: Persistent-State Warmup
 
@@ -891,7 +1322,7 @@ Non-state models are unchanged.
 This design places the obligations below on the core persistent-state design
 (`docs/design/persistent_state.md`, "Model hooks", "Profiling and serving
 bindings", "Startup pool access" and "Memory contributors", criteria M1 to
-M8). Core delivers all six obligations. Core-side criteria name a model-supplied
+M8). Core has delivered seven obligations and owes the eighth. Core-side criteria name a model-supplied
 contributor label rather than this model's option, so core tests stay
 independent of the out-of-tree model.
 
@@ -900,11 +1331,11 @@ independent of the out-of-tree model.
    (`vllm/v1/worker/gpu/warmup.py:157-162`; M1). TXG-CORE-001, TXG-CORE-002.
 2. **Post-warmup hook.** Delivered: `ModelState.post_warmup()`, called once
    through `GPUModelRunner.post_warmup` after every worker warmup and before
-   the worker serves (`gpu_worker.py:1207`, `model_runner.py:2527-2529`; M2).
+   the worker serves (`gpu_worker.py:1215`, `model_runner.py:2538-2540`; M2).
    The model verifies there (Post-Warmup Verification). TXG-VER-004.
 3. **Shutdown hook.** Delivered: `ModelState.shutdown()`, called first in
    `GPUModelRunner.shutdown`, while the state bindings and the KV cache exist
-   (`model_runner.py:2531-2542`; M3). The model discards there (Lifetime: one
+   (`model_runner.py:2542-2556`; M3). The model discards there (Lifetime: one
    serving capture per worker). TXG-LIFE-007.
 4. **Option-attributed capacity rejection.** Delivered:
    `PersistentStateSpec.memory_contributors` names the model options that
@@ -926,6 +1357,28 @@ independent of the out-of-tree model.
    `model_runner.py:892-898`; M4 to M6). Capture uses the first, post-warmup
    verification the second, and the profiling guard the third. TXG-LIFE-008,
    TXG-LIFE-009.
+7. **Execution-memory hook at configured allocator settings.** Delivered:
+   `determine_available_memory` calls `prepare_execution_memory` inside the
+   `memory_profiling` window and before it enters
+   `_scoped_allocator_max_split`, which covers only `profile_run`
+   (`gpu_worker.py:721-743`); under `kv_cache_memory_bytes`, `profile_run`
+   calls it with no split limit. The hook's retained memory is counted by the
+   window and both captures run at equal allocator scope (Budget mechanics).
+   TXG-CORE-003.
+8. **Stats-logging flag in the worker.** Owed: `EngineCore` receives
+   `log_stats` as a constructor argument and passes it only to the
+   scheduler; no field of `vllm_config` carries it to the worker. The model
+   state needs it to start the periodic reading thread only while stats
+   logging is enabled (Memory growth after startup). The source of truth is
+   the `log_stats` constructor argument, which `EngineArgs` derives from
+   `disable_log_stats` and which direct construction (as the tests do with
+   `log_stats=False`) passes outright; `EngineCore` writes it into
+   `vllm_config` (an `ObservabilityConfig` field) before it constructs the
+   executor (`core.py:172`), overriding any value the configuration already
+   carried, so that every worker reads the engine's setting. Until core
+   delivers it, the model reads the setting as disabled and starts no
+   thread except under the measurement-and-test switch, and production sees
+   served growth only at `Cx`. TXG-CORE-004.
 
 ## Default-On Gate (future intent)
 
@@ -956,7 +1409,20 @@ Serving g0 and g1 in one engine is not a prerequisite.
 | Host inputs | Persistent double-buffered pinned arena, one copy | Per-call `HostStaging`; captured host-to-device copies | Captured copies replay frozen sources; per-call staging adds launches |
 | Served geometries | Exactly one per engine, g0 or g1; any other set rejected at configuration and its rows at row admission; CHUNK cells declared, and `replay` cells captured, at the served geometry | (a) g0 and g1 together in one engine; (b) a general geometry set over every published cadence; (c) other geometries captured but unvalidated, or left uncaptured and counted | g1 is the default cadence, and one served geometry keeps the inventory at three cells per population; (a) has no mixed-geometry use yet, raises the inventory to five cells per population, makes `multi-geometry` reachable, may need a geometry key on `replay` cells (Open Question 6), and cannot run with the CHUNK-bucket binding, which accepts only `[1]`; (b) adds the costs of (a) for cadences with no accepted-row evidence; (c) `replay` cells key no geometry, so an unvalidated or uncaptured geometry still reaches replay through its echo rows |
 | CHUNK-bucket binding at g1 | Composes with the option: flat capture records the bucket's eager body, while eager steps launch its graph; accepted-row bitwise equality between the two is a test obligation, with the bucket on and off and at a population outside its set; its scratch joins post-warmup verification | Require it off; require it on; nest its graph launch inside the outer graph | Both arms are served g1 configurations, and the bucket graph is the eager reference when it is on; flat capture already covers its kernels, and a nested launch keeps its per-region cost and separate pool (Capture shape); because replay and eager run different nested paths and neither self-check covers accepted rows, equivalence must be tested rather than inferred |
-| Admission method | Model-local: retain the full admission inventory over stand-in storage through the profile window, then check `S <= A` | (a) Reserved-memory delta of serving capture; (b) placeholder tensor of the measured size; (c) extrapolate from one cell; (d) core graph estimator; (e) measure the admission capture's normalized delta and peak, release it, and charge both through a core accounting hook before capacity selection | (a) and (b) miss graph-exec memory, fragmentation and peak; (c) is unsound without reuse; (d) does not see model graphs; (e) is viable but needs a new core hook and an explicit composition of the measured peak with the profile peak, while retention reuses the existing window unchanged |
+| Admission method | Model-local: retain the full admission inventory over stand-in storage through the profile window, then check serving against what the inventory held | (a) Reserved-memory delta of serving capture; (b) placeholder tensor of the measured size; (c) extrapolate from one cell; (d) core graph estimator; (e) measure the admission capture's normalized delta and peak, release it, and charge both through a core accounting hook before capacity selection | (a) and (b) miss graph-exec memory, fragmentation and peak; (c) is unsound without reuse; (d) does not see model graphs; (e) is viable but needs a new core hook and an explicit composition of the measured peak with the profile peak, while retention reuses the existing window unchanged |
+| Fit basis | `S <= R`, zero tolerance, where `R` is the free memory the holder's release returns; `A` is reported, never a bound | (a) `S <= A`; (b) `S <= A` within one allocator granule; (c) compare allocator reserved-memory deltas of the two captures; (d) compare per-cell `retained_bytes` sums | `A` counts first-time process state and depends on allocator history, so (a) passes a serving overrun that lands in retained state and fails when a leftover segment absorbs admission's blocks; (b) is a fitted tolerance with no bound on when one granule becomes two; (c) and (d) miss graph-exec memory and memory the allocator does not track, and (d) samples only the capture loop; `R` is measured by the same release the budget chain relies on (`non_kv_cache_memory >= R`), so the fit bound and the charge are the same quantity |
+| Release reading | One normalized reading (`Nr`) immediately before the holder release and `Ns0` immediately after, in `capture_transaction_graphs` | (a) Derive `R` from the allocator's reserved-bytes drop at release; (b) read `R` at window close in the worker | (a) misses instantiated-graph memory outside the allocator; (b) needs a core hook and the holder must stay alive past the window (TXG-MEM-007), so the release, and therefore `R`, can only be read in serving capture |
+| Equal allocator scope | Both captures at the worker's configured allocator settings; the settings in force are recorded with `N0` and `Nr` and a difference fails startup | (a) Run serving capture under the same split limit as the profiling run; (b) trust the worker's call order without a check | (a) inflates serving retention for mid-size buffers the same way the limit inflated admission, and the limit exists for the dummy run's workspaces, not for captures; (b) leaves the fit check silently incomparable after a core integration change, which is what the recorded settings detect |
+| Per-stream lazy state | The binding's eager warm-ups and both captures run on the binding's one capture stream, verified by stream handle inside each capture and with a handle distinct from the nested bindings' capture streams, so the stream's cuBLAS workspace is created and re-created with each inventory and appears in `A`, `R` and `S` alike (observed on the A40; the C++ owner of the free is unverified and an owed run confirms it) | (a) Create the workspace before `N0` so no reading counts it; (b) clear cuBLAS workspaces (`torch._C._cuda_clearCublasWorkspaces`) at every `N()` reading; (c) capture on torch's default capture stream and leave the warm-up stream's workspace outside both figures; (d) compare stream objects, not handles | (a) does not help if destroying the graphs captured on a stream frees that stream's workspace, as observed; (b) hides from `S` a workspace serving re-creates on its first GEMM, so it would reappear as unaccounted growth; (c) is what a test runtime did and left `R` 20 MiB short of the inventory; (d) misses aliasing through torch's per-device stream pool, under which a binding stream can be the stream a nested graph was captured on and the release would free that graph's lazy state |
+| Release ownership check | Storage-aware and startup-enforced: recorded storage ranges and the admission pool id checked against one startup-only `memory_snapshot(include_traces=False)` on the worker device, taken after the release and `Ns0`'s normalization and before the first serving allocation (no admission-pool segment, no active block over a recorded range), fatal on either; weak references over the tensors and `CUDAGraph` objects, held outside the holder, as an early diagnostic; the aggregate `rsv(N1) - rsv(N0)` and `rsv(Nr) - rsv(Ns0)` reported only | (a) Fail startup when the aggregate reserved drop is below admission's reserved growth; (b) weak references alone; (c) an allocated-bytes drop across the release at least the owned storage bytes, as the stand-in check does; (d) no release check beyond the stand-in check | (a) rejects healthy engines: process-wide reserved growth includes regular-pool segments that later allocations (the KV allocation precedes the release) can pin, and unrelated releases can mask a retained segment; (b) proves that Python objects died, not that storage did, because a retained `detach()` alias or a graph object held outside its entry keeps the storage or the pool alive; (c) is sound for bytes but names nothing and cannot see a retained pool segment with no live block; (d) leaves a retained admission buffer to surface only as an opaque `S > R`; the snapshot is startup-only, runs once off the serving path, and names the survivor |
+| Growth-tracking points | Synchronized resident readings at publication (`Cs`), post-warmup (`Cw`), shutdown (`Cx`) and on demand (`Cn`, harness), plus an unsynchronized periodic reading (`Cp`) on a daemon thread at the stats interval; growth figures `ΔR`, `ΔA`, cached slack, `ΔF`, `ΔX` against `Cw` | (a) Per-step host-only `memory_reserved` high-water read; (b) per-step normalized reading; (c) publication and shutdown only | (a) and (b) add serving-thread code, (b) a device synchronize and cache release per step; (c) cannot place growth in time and makes served growth visible only at a clean shutdown, which the owner's requirement to track growth excludes; the chosen points cost three synchronizes per worker lifetime, one per harness read and one unsynchronized reading per interval off the serving thread |
+| Periodic reading placement | A worker daemon thread, started after `Cw` only under its start condition (the measurement-and-test switch `VLLM_NEMOTRON_TXG_MEMORY_THREAD=1`, or stats logging enabled with `PERIODIC_THREAD_QUALIFIED` true), one sample per `VLLM_LOG_STATS_INTERVAL`, every exception caught and reported as `error`, cancelled and joined with a bounded timeout at shutdown; latency measured in Phase 6 before the cost is called acceptable | (a) An interval gate in `prepare_step`: one clock comparison per served step and the reading inside one step per interval; (b) the on-demand reader only (`Cn`), no periodic reading | (a) puts code on the serving thread on every step and a driver call inside a step, departing from the settled zero-cost rule without a measurement; the thread puts no code on the serving thread, and its residual contention (interpreter lock, allocator mutex in `memory_stats()`) is named and measured; (b) gives production under `EngineCoreProc` no view of served growth before shutdown, which the owner's requirement excludes; the thread needs the stats-logging flag in the worker, a small core conduit (Core Obligations, item 8), while (a) needs none, which is the one argument for (a) |
+| Periodic sample consistency | A `memory_stats()`, `mem_get_info`, `memory_stats()` triple; consistent only when both statistics reads agree on reserved bytes; an inconsistent sample is reported, never warns, moves neither the synchronized watermark nor the `Cp` mark and clears the pending spike; the residual is stated to be approximate |
+| Two marks | A synchronized watermark, compared and updated only at `Cn` and `Cx`, and a separate `Cp` suppression mark that the approximate periodic samples move under the two-consecutive-consistent rule, reset to the watermark after every synchronized update and lowered by a later lower consistent pair, never below the watermark | (a) One shared mark moved by every point; (b) `Cp` warnings only, no `Cp` mark (report `Cp` figures without judging them) | (a) lets a false spike from two equal-total interleaved `Cp` samples raise the one mark and suppress a later genuine, smaller warning at `Cn` or `Cx`, which are the synchronized readings and the production shutdown record; (b) drops the only warning production sees before shutdown; two marks keep the synchronized record immune to periodic noise while `Cp` still warns on persistent growth, and the reset and lowering rules bound how long a false pair suppresses `Cp` warnings | (a) One statistics read and one `mem_get_info`; (b) pause the serving thread around the sample; (c) drop `ΔX` from `Cp` | (a) lets a segment freed between the two reads appear as positive `ΔX`, a spurious warning that also raises the mark and hides later growth; (b) puts code and a wait on the serving thread; (c) loses the one figure that sees growth outside the allocator; the triple detects the interleaving at the cost of one more host-side counter copy per interval |
+| Periodic reading contents | Allocator statistics (host-side counters, two `memory_stats()` calls bracketing the sample) and `mem_get_info` (`cudaMemGetInfo`, documented without synchronizing behaviour, may surface a sticky error from an earlier asynchronous launch) | (a) Allocator statistics only; (b) the frontend stats logger's interval; (c) a `collective_rpc` from the engine core on an interval; (d) extend `SchedulerStats` with worker memory figures | (a) loses `ΔF` and `ΔX`, the only figures that see growth outside the allocator; (b) runs in the frontend process, which cannot read the worker's device; (c) and (d) need core plumbing the Default-On Gate may later add for the reader; the driver call's cost is not assumed, it is measured (Memory growth after startup) |
+| Resident reading kind | Raw: `mem_get_info`, allocator reserved, allocated and peak reserved; no `gc.collect()` or `empty_cache()`; synchronized at startup, harness and shutdown points, unsynchronized at the periodic point | Normalized `N()` readings after startup | A cache release at `post_warmup` or in a harness read changes the allocator state serving runs with (the first steps re-map segments), so the reading would alter what it measures; the raw reading records the footprint as serving leaves it, `ΔA` and the cached slack separate live growth from caching, and `ΔX` separates the device-wide residual without a release |
+| Peak statistics at `Cw` | Reset the allocator's peak statistics immediately after the `Cw` reading, so the peak-reserved figure at `Cp`, `Cn` and `Cx` is the served high-water mark | (a) No reset: report the process peak; (b) drop the peak figure | (a) reports the startup peak the profiler already consumed at window entry (`mem_utils.py:301`), which tells nothing about serving; (b) loses the only figure that sees transient served growth between readings; the reset follows every core warm-up and the profiler's own use of the peaks, and TXG-MEM-007's no-reset clause covers `prepare_execution_memory` only |
+| Growth severity | Report `ΔR`, `ΔA`, cached slack, `ΔF`, `ΔX`; `WARNING` on a new high-water mark of `ΔX` after warm-up, worded as device-wide growth the tracker observed; never latch, fail a step or change serving | (a) Report only; (b) fatal on any growth; (c) `WARNING` when `ΔR + ΔX` exceeds the profiler's peak headroom; (d) `WARNING` on `ΔR` beyond a fixed fraction of `S`; (e) `WARNING` on every `ΔX > 0` | (b) is a fail-forever state with no recovery path for growth the model does not own (core warm-ups, eager working set, lazy module loads, another process on the device); (c) needs the headroom figure, a new core hook, and the headroom bounds allocated bytes, not reserved; (d) is a fitted constant; (e) repeats the same warning on every periodic and harness read against the fixed `Cw` baseline; `ΔX` after `Cw` is the one figure the design predicts the option contributes nothing to, so its growth is worth one line per new level, and (a) would hide it in a receipt nobody reads in production |
 | Graph pool | One dedicated pool per inventory | Platform global pool shared with nested graphs | Releasing admission must return exactly its segments, whatever stream serving capture uses |
 | Failure boundary | All step allocations before replay; any failure from the launch on is worker-fatal with a latch | Roll back pages; fall back to eager after a replay error | Body and scatters are one launch, so partial mutation is unknowable; rollback needs hot-path snapshots |
 | Signature mismatch | Count and run eager; no serving-time recapture | Recapture on demand; raise | Recapture needs unadmitted memory and stalls; eager is the exact reference |
@@ -986,13 +1452,73 @@ Serving g0 and g1 in one engine is not a prerequisite.
    `consume_batch_stats()` after each cell. Reuse predicts a total near the
    largest cell's growth plus small per-cell residue; otherwise attribute the
    live pool blocks by allocation trace.
-2. **Exactness of `S <= A`.** Allocator rounding against different pool
-   addresses may make `S` differ slightly from `A`. **Probe:** across 10
-   startups per configuration, record `A - S` and the per-cell growth. Zero
-   tolerance stays unless a nonzero, bounded spread is observed.
-3. **Double-counted peak.** **Probe:** compare admitted non-KV memory with
+2. **Absorbing a one-granule overrun at equal scope.** `S <= R` is the fit
+   check with zero tolerance, and a tolerance is not a design. At equal
+   allocator scope a serving inventory can still retain one allocator granule
+   (2 MiB) more than admission's release returned, when a serving-side
+   allocation rounds into a segment of its own that admission's equivalent
+   shared. One engine sample at B1/g1 with the bucket off (population `[1]`,
+   `max_num_seqs` 64) shows `S = 60,817,408 > R = 58,720,256`: serving's
+   small-segment class holds four 2 MiB segments where admission's held
+   three, with identical live bytes, so the overrun is allocator segment
+   rounding, not retained data. **Under the current policy that sample fails
+   startup**, and the Phase 5 tests expect that failure for that case
+   through the outcome rule (startup fails if and only if `S > R`), never
+   through the byte pair. The pair is evidence with a pin: NVIDIA A40
+   (driver 595.91.07), torch 2.14.0+cu130, core build `46d051eca5`, default
+   allocator configuration (`PYTORCH_CUDA_ALLOC_CONF` and
+   `CUBLAS_WORKSPACE_CONFIG` unset), process history of two option-off
+   engines then the option-on engine. **Re-registration:** the first Phase 6
+   A40 run after any pin changes (device, torch, CUDA driver, core build,
+   allocator configuration, or the stream and ledger changes of TXG-MEM-017
+   and TXG-MEM-018) re-records the pair and its pin here; a pair that no
+   longer shows `S > R` closes this question's reproducer. The question
+   stays open until the A40 segment-reuse case below has run; nothing in the
+   policy changes before then. In that sample `R` equals the bytes of every
+   segment admission created, and `A - R` (66 MiB) is one-time process state
+   outside the allocator, which supports `S <= R` with `A - R` reported. (A
+   binding-level `S = 22 MiB` against `R = 2 MiB` was a test-harness
+   artifact: the test runtime captured on torch's default capture stream
+   instead of the binding's stream, so the warm-up stream's cuBLAS workspace
+   never joined the inventory; TXG-MEM-018 and its test fix close it.)
+   **Owner's stated direction, as a candidate, not a decision:** "take the
+   max of memory used": the charge should bound the maximum of admission's
+   and serving's use. The guard `S <= R` cannot be dropped under any
+   realization, because the KV budget is fixed before the serving inventory
+   exists, so serving can only be checked against what was charged. Two
+   realizations sit under the direction: (a) a **structural maximum**:
+   serving captures into the graph pool admission releases (admission's
+   graphs destroyed, the pool kept alive for serving capture), or the
+   binding-owned small buffers (arenas, static inputs, owned outputs) are
+   allocated from the inventory's own pool, so release and re-creation are
+   segment-exact and the fourth small segment cannot arise; this touches
+   TXG-MEM-005's distinct-pool rule and leaves `S <= R` as the guard; (b) a
+   **bounded maximum**: the charge is `A` plus a fixed segment-rounding
+   allowance per pool (one small-segment granule per pool the inventory
+   uses), retained by the admission holder so the window charges it and `R`
+   includes it, with `S <= R` as the guard. Other candidates: (c) find the
+   serving-side allocation that rounds into the fourth small segment and
+   make admission's warm-up or capture allocate its equivalent; (d) keep the
+   failure and treat a reproducible overrun as a defect fixed by (a) to (c).
+   None is a test tolerance. **The deciding A40 case:** whether the
+   allocator reuses the released admission segments for serving capture
+   when the pool is kept (realization (a)) or re-maps new ones; if it
+   reuses them, (a) makes `S <= R` hold by construction and (b) is
+   unnecessary; if it does not, (b) is the only bounded realization.
+   **Probe:** across 10 fresh startups per configuration in M, record `A`,
+   `R`, `S`, `R - S` and the segments created between `Ns0` and `Ns1` with
+   their pools, streams and allocation sites, with C++ frames in the
+   allocation history; the realization chosen must make the spread of
+   `R - S` non-negative with a stated reason, not a margin. A control with
+   `CUBLAS_WORKSPACE_CONFIG=:16:8` shrinks every workspace block to 131,072
+   bytes and shows which segments are workspace. The same run confirms the
+   C++ owner of the workspace free and checks the binding's capture stream
+   handle for collisions with the nested bindings' streams (TXG-MEM-018).
+3. **Double-counted peak.** `A - R` now measures the first-time process
+   state admission pays once. **Probe:** compare admitted non-KV memory with
    `N()` after startup and after a sustained B63 run, to measure how much
-   retained inventory the peak headroom counts twice.
+   retained inventory the peak headroom counts twice, and report `A - R`
+   beside it.
 4. **Module globals across same-process engines.** `_batch_stats_slot`
    (`advance.py:2514`) and the class-level platform graph pool
    (`vllm/platforms/interface.py:1330-1335`) persist into a second engine in the
@@ -1042,9 +1568,35 @@ Serving g0 and g1 in one engine is not a prerequisite.
    is a singleton, and `bind_rows` rejects any other geometry before the
    registry mutates. Mixed geometry stays under Open Question 6.
 10. **Admission per CHUNK-bucket arm.** With the bucket on, the transaction
-    captures record the bucket's eager-body intermediates, so `A` and `S`
-    differ between the two arms. Admission is per configuration, so `S <= A`
-    is unaffected. **Probe:** report `A` and `S` for each arm.
+    captures record the bucket's eager-body intermediates, so `A`, `R` and
+    `S` differ between the two arms. Admission is per configuration, so
+    `S <= R` is unaffected. **Probe:** report `A`, `R` and `S` for each arm.
+11. **Served growth plateau.** The design predicts that allocator growth
+    `ΔR` after `Cw` plateaus at the eager working set and that this option
+    contributes nothing to `ΔX`. CUDA lazy module loading can create
+    unexplained device-wide residual growth the first time an eager fallback
+    launches a kernel the warm-ups did not; the `ΔX` warning reports it as
+    device-wide growth, attributed to no owner, and never latches (decided).
+    Open is only whether the warm-ups should launch those kernels so that the
+    figure stays flat. **Probe:** a staggered-session run over M with
+    `transaction_graph_memory` read after warm-up, after the first fallback
+    and at the end, and the `Cp` lines over the run.
+12. **Sensitivity of the charge check.** TXG-MEM-007's engine check is
+    `total_consumed(on) - total_consumed(off) >= R`. In the recorded A40
+    sample `A - R` is 66 MiB of one-time process state that the option-on
+    engine pays and the option-off arm does not; where that state persists
+    to the window close, the difference exceeds `R` (56 MiB) even if the
+    holder were released early and nothing were charged, so the check
+    cannot detect a missing charge for that arm. This limit predates this
+    design. Candidate detectors, none decided: (a) a mutation control: an
+    option-on engine with the holder released before the window close must
+    show `on_mut - off < R`, proving the check can fail; (b) a second
+    option-on engine in the same process, which no longer pays the one-time
+    state, compared with the option-off arm; (c) a window-internal figure
+    from the model, the reserved bytes of the admission pool at the window
+    close, compared with `R` directly. **Probe:** run (a) and (b) on the A40
+    beside the existing check and report which separates the charged from
+    the uncharged run.
 
 ## Acceptance Criteria
 
@@ -1092,7 +1644,43 @@ tests use the real stack. Every criterion's "Configurations" entry names the con
 tests run in. A criterion whose behaviour can be exercised under a g1 engine,
 with or without the CHUNK-bucket binding, is tested over M; an entry narrower
 than M states why the behaviour does not apply in the omitted
-configurations.
+configurations. Memory terms: `N()` is a normalized free-memory reading
+(`mem_get_info` after a device synchronize, `gc.collect()` and
+`empty_cache()`); `rsv(X)` is the allocator's reserved bytes read beside
+reading `X`; `A = N0 - N1` is the admission drop, `R = Ns0 - Nr` the free
+memory the admission holder's release returns, and `S = Ns0 - Ns1` the memory
+serving capture retains (Normalized measurement); `S <= R` is equivalent to
+`free(Ns1) >= free(Nr)`. A **resident reading** `M()` is free device memory
+with the allocator's reserved, allocated and peak-reserved bytes and no
+collection or cache release; `Cs`, `Cw`, `Cn` and `Cx` are the synchronized
+resident readings at publication, after post-warmup verification, on a
+harness read and at shutdown, and `Cp` the unsynchronized periodic reading;
+`ΔR`, `ΔA`, `ΔF` and `ΔX` are the reserved, allocated, device and unexplained
+device-wide residual growth figures between two resident readings, and the
+cached slack is `ΔR - ΔA` (Memory growth after startup). Status schema: a
+read that raised is **error** with its reason; a `Cp` sample whose two
+statistics reads disagree is **inconsistent**; a point never reached is
+**unavailable**; a derived figure with an `error`, `inconsistent` or
+`unavailable` operand is **unavailable**, naming the operand.
+"Serving path" means `execute`, `prepare_step`, `postprocess_state` and the
+commit path of a served step. `S <= R` is a runtime startup gate in every
+process; no test bypasses it. Two experiments establish the memory criteria:
+the **fresh-start experiment** spawns a fresh process for each measurement
+arm (each engine or each admit-and-serve binding run) and is the qualifying
+`S <= R` evidence over M; the **repeated-engine experiment** runs successive
+engines in one process, as the admission-charge test does, where allocator
+history can make `S > R`; there, as everywhere, the oracle is that startup
+fails if and only if `S > R`, with both figures in the error and equal to
+the receipt's, and the figures are recorded; a case the recorded evidence
+predicts will fail is named by its process history and reported beside
+that evidence, never asserted as a byte pair, never a blanket `xfail` and
+never masked. Binding-level and model-level CUDA tests that admit and
+serve in order to assert a non-memory property run spawned, one process per
+test case, so that their pass is fresh-start evidence and their property is
+not conditioned on allocator history. The **isolated-replay
+experiment** is a binding-level CUDA run with every cell warmed and replayed
+once before measurement, each replay's escaped rows dropped and the device
+synchronized before each reading.
 
 ### Configuration and envelope (ENV)
 
@@ -1155,29 +1743,29 @@ configurations.
   - Design: Ordering
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_admission_captures_full_inventory_before_eager_profiles` (call order and captured-cell inventory) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_cuda_admission_and_serving_capture_share_cell_order` (capture stream identical across both inventories and the admission graph pool handle distinct from the platform and nested pools) [CUDA]
   - Configurations: M; with the bucket on, the call-order test also asserts that bucket publication precedes admission
-- **TXG-MEM-003**: When `transaction_graph_populations` is non-empty, every admission reading `N()` (`N0`, `Na`, `N1`, `Ns0`, `Ns1`) shall be a `mem_get_info` free-memory value taken after a device synchronize, `gc.collect()` and an allocator `empty_cache()`; `Na` shall be read after every capture-only temporary (page snapshots, expected outputs, capture and verify callbacks, capture inputs) is cleared and while the admission holder still retains the stand-in storage, and `N1` after that storage is released; the model shall read the allocator's allocated bytes on the device (`torch.cuda.memory_allocated`) immediately after the `Na` and the `N1` readings, `Na` being the settled point at which the allocated-bytes reading for the release check is taken, and no admitted figure shall use `Na`'s free memory; and the model shall compute `A = N0 - N1` and `S = Ns0 - Ns1` from free memory alone.
+- **TXG-MEM-003**: When `transaction_graph_populations` is non-empty, every admission reading `N()` (`N0`, `Na`, `N1`, `Nr`, `Ns0`, `Ns1`) shall be a `mem_get_info` free-memory value taken after a device synchronize, `gc.collect()` and an allocator `empty_cache()`; `Na` shall be read after every capture-only temporary (page snapshots, expected outputs, capture and verify callbacks, capture inputs) is cleared and while the admission holder still retains the stand-in storage, and `N1` after that storage is released; `Nr` shall be read in `capture_transaction_graphs`, after the serving scatter warm-up and immediately before the admission holder and its graph pool are released, and `Ns0` immediately after, with no allocation or device work between the two readings other than that release and the `Ns0` reading's own normalization (host-side reads of the allocator settings and reserved bytes may sit beside them); the model shall read the allocator's allocated bytes on the device (`torch.cuda.memory_allocated`) immediately after the `Na` and the `N1` readings, `Na` being the settled point at which the allocated-bytes reading for the release check is taken, and no admitted figure shall use `Na`'s free memory; the model shall read the allocator's reserved bytes `rsv(·)` beside `N0`, `N1`, `Nr` and `Ns0`; and the model shall compute `A = N0 - N1`, `R = Ns0 - Nr` (the release raises free memory, so the later reading comes first) and `S = Ns0 - Ns1` from free memory alone, so that `S <= R` holds exactly when `free(Ns1) >= free(Nr)`.
   - Design: Normalized measurement; Ordering
-  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_normalized_readings_synchronize_collect_and_empty_first` (also the order: temporaries cleared, `Na` and its allocated-bytes reading, stand-in release, `N1` and its allocated-bytes reading; release verified with no free-memory rise at release) [CPU, patched device calls]
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_normalized_readings_synchronize_collect_and_empty_first` (also the order: temporaries cleared, `Na` and its allocated-bytes reading, stand-in release, `N1` and its allocated-bytes reading; release verified with no free-memory rise at release; `Nr` read after the scatter warm-up and before the holder release, `Ns0` after it with no allocation between; the four `rsv(·)` reads; `A`, `R` and `S` computed from the injected readings with the signs the criterion states, so that an injected release that raises free memory yields a positive `R`) [CPU, patched device calls]
   - Configurations: M
 - **TXG-MEM-004**: When `transaction_graph_populations` is non-empty, if the allocator's allocated bytes drop by less than the stand-in storage bytes between the readings taken with `Na` and `N1`, or any owning reference to the stand-in storage survives its release, then startup shall fail with an error naming `transaction_graph_populations` and reporting both figures (the allocated-bytes drop and the stand-in bytes).
   - Design: Ordering
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_unverified_admission_release_fails_startup` (injected allocated-bytes readings one byte short while free memory rises past the stand-in bytes, and a weak reference to the stand-in storage kept alive by an injected owner) [CPU]
   - Configurations: M
-- **TXG-MEM-005**: When `transaction_graph_populations` is non-empty, `capture_transaction_graphs` shall release the admission holder and its graph pool before reading `Ns0`, and shall capture the serving inventory into a fresh dedicated graph pool distinct from the admission pool.
+- **TXG-MEM-005**: When `transaction_graph_populations` is non-empty, `capture_transaction_graphs` shall read `Nr`, then release the admission holder and its graph pool, then read `Ns0`, all before any serving-capture allocation, and shall capture the serving inventory into a fresh dedicated graph pool distinct from the admission pool.
   - Design: Ordering
-  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_serving_capture_releases_admission_before_measuring` (release before the `Ns0` read, call order) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_cuda_serving_pool_is_distinct_from_released_admission_pool` (pool handles differ, `Ns0` read after the admission pool is released) [CUDA]
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_serving_capture_releases_admission_before_measuring` (call order: `Nr` read, release, `Ns0`'s synchronize, `gc.collect()` and `empty_cache()`, the `Ns0` and `rsv(Ns0)` reads, the TXG-MEM-017 snapshot with `include_traces=False` on the worker device, then the first capture allocation) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_cuda_serving_pool_is_distinct_from_released_admission_pool` (pool handles differ, `Ns0` read after the admission pool is released, and `R` at least the admission pool's segment bytes read from `torch.cuda.memory._snapshot()` before the release) [CUDA]
   - Configurations: M
-- **TXG-MEM-006**: When `transaction_graph_populations` is non-empty, startup shall succeed only if every declared cell is published and `S <= A` with zero tolerance; if `S > A` by any amount, then the binding shall discard every graph and `initialize_kv_cache` shall raise an error naming `transaction_graph_populations` and reporting `S` and `A`.
-  - Design: Ordering
-  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_serving_bytes_above_admission_fail_startup` [CPU, injected readings including `S = A + 1`]
+- **TXG-MEM-006**: When `transaction_graph_populations` is non-empty, startup shall succeed only if every declared cell is published and `S <= R` with zero tolerance, `R` being the free memory the release of the admission holder and its graph pool returned (`Ns0 - Nr`), in every process whatever its allocator history; if `S > R` by any amount, then the binding shall discard every graph and `initialize_kv_cache` shall raise an error naming `transaction_graph_populations` and reporting `S`, `R`, `A`, the six raw readings, the allocated and reserved operands and the stand-in bytes; and `R > A` shall change nothing but the reported `A - R`.
+  - Design: Normalized measurement; Ordering
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_serving_bytes_above_released_fail_startup` (replaces `test_serving_bytes_above_admission_fail_startup`; injected readings with `S = R` publishing and `S = R + 1` failing although `S < A`; a case with `R > A` publishing and reporting a negative `A - R`; the message carries `S`, `R`, `A` and every raw reading and operand) [CPU]; `tests/v1/engine/test_nemotron_asr.py::test_nemotron_engine_transaction_graph_serving_fits_released` (new; fresh-start experiment: every engine in its own spawned process, per configuration of M, option on with populations `[1]` and `max_num_seqs` 64 at the charge test's utilization; the oracle is "startup fails if and only if `S > R`, with both figures in the error", never an exact byte pair; the figures are printed and no arm pre-registers a pass, because no fresh-process engine measurement of these arms exists; a capacity engine, sized from the published figures of its configuration's first engine and run in its own spawned process, asserts the block-count equality of TXG-MEM-007's memory-bound run under the same oracle; capacity qualification spans M inside one test: the test itself iterates the configurations of M, spawning each engine, records every capacity outcome, and fails with "qualification incomplete" unless at least one configuration's capacity engine published and passed, so the check depends on no test order, worker split or shared session state and cannot pass vacuously) [engine-CUDA]; `tests/v1/engine/test_nemotron_asr.py::test_nemotron_engine_transaction_graph_admission_is_charged` (repeated-engine experiment, pinned by process history: two option-off engines with admission readings, then the option-on engine; `_startup_memory` constructs `EngineCore` inside its `try`, records the executor instance through a wrapping executor class, and calls `shutdown()` on the core or, if construction raised, on the recorded executor on every path; before any expected failure the test asserts the two option-off arms (no admitted figure, no peak reset, `available == requested - non_kv`) and prints their spread; for the option-on arm the oracle is "startup fails if and only if `S > R`, with both figures in the error": when it publishes, the TXG-MEM-007 charge assertions run and the fourth, memory-bound engine runs; when it fails, the exception must be the admission error of this criterion with `S > R` in its message, those figures must equal the model's receipt read through the recorded executor before shutdown, and the fourth engine is skipped with the failure recorded; the g1 bucket-off arm with population `[1]`, `max_num_seqs` 64 and utilization 0.4 is the arm the recorded A40 evidence (Open Question 2) predicts will fail, and the test reports its pair beside the recorded one without asserting equality) [engine-CUDA]
   - Configurations: M
-- **TXG-MEM-007**: When `transaction_graph_populations` is non-empty and neither `num_gpu_blocks_override` nor `kv_cache_memory_bytes` is set, `non_kv_cache_memory` from the memory-profiling window shall include the retained admission inventory and the admission preparation and capture peak, with the peak headroom left as the profiler's own measurement (the model resets no peak memory statistics during `prepare_execution_memory`) and no deduction for retained memory the peak headroom also counts, so resident capacity is fixed from the remaining budget; and the admission holder shall be alive when `prepare_execution_memory` returns, stay alive through the eager profile transactions and the window close, and be released only in `capture_transaction_graphs`.
-  - Design: Budget mechanics; Ordering
-  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_admission_holder_lives_until_serving_capture` (event order of holder release against `prepare_execution_memory` return, eager profiles, window close and `capture_transaction_graphs`) [CPU]; `tests/v1/engine/test_nemotron_asr.py::test_nemotron_engine_transaction_graph_admission_is_charged` (option-on minus option-off, where the option-off arm runs twice before the option-on arm, takes admission's normalized readings at the admission point, and is represented by its second run because the first engine in a process also creates process-wide device memory that later engines start with; the spread between the two option-off runs is reported, with no tolerance below `A`: `total_consumed >= A` for retention; in every run, no peak-statistics reset inside `prepare_execution_memory` and a KV budget equal to requested memory less `total_consumed` and the profiler's `transient_peak_headroom`; the `non_kv_cache_memory` and `transient_peak_headroom` differences reported, not bounded, because the profiler may observe a smaller transient peak above the retained floor; and a memory-bound run whose block count equals the count core derives from the reduced budget) [engine-CUDA]
-  - Configurations: M (the option-off arms of each configuration run the same configuration)
-- **TXG-MEM-008**: When `transaction_graph_populations` is non-empty and `num_gpu_blocks_override` or `kv_cache_memory_bytes` is set, the model shall still measure and report `A` and check `S <= A` under either override, and shall not itself change the resident block count, which core derives from the override once its budget validation accepts the configuration; and if serving capture then raises or runs out of memory, then startup shall fail with an admission-failure error naming `transaction_graph_populations`. Planner rejection of an oversized override is TXG-MEM-011 and KV-allocation failure is TXG-MEM-012; core reports both.
+- **TXG-MEM-007**: When `transaction_graph_populations` is non-empty and `kv_cache_memory_bytes` is unset, whether or not `num_gpu_blocks_override` is set, `non_kv_cache_memory` from the memory-profiling window shall include the retained admission inventory, and therefore at least `R`, the free memory the inventory's later release returns, and the admission preparation and capture peak, with the peak headroom left as the profiler's own measurement (the model resets no peak memory statistics during `prepare_execution_memory`) and no deduction for retained memory the peak headroom also counts, so the budget core validates against, and the resident capacity it derives when neither override is set, never counts memory serving will occupy; and in every configuration, with or without either override, the admission holder shall be alive when `prepare_execution_memory` returns, stay alive through the eager profile transactions and the window close (where a window runs), and be released only in `capture_transaction_graphs`.
+  - Design: Budget mechanics; Normalized measurement; Ordering; Capacity overrides
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_admission_holder_lives_until_serving_capture` (event order of holder release against `prepare_execution_memory` return, eager profiles, window close and `capture_transaction_graphs`, in four cases: neither override, `num_gpu_blocks_override` alone, `kv_cache_memory_bytes` alone, both) [CPU]; `tests/v1/engine/test_nemotron_asr.py::test_nemotron_engine_transaction_graph_admission_is_charged` (option-on minus option-off, where the option-off arm runs twice before the option-on arm, takes admission's normalized readings at the admission point, and is represented by its second run because the first engine in a process also creates process-wide device memory that later engines start with; the spread between the two option-off runs is reported, with no tolerance below `R`: `total_consumed >= R` for retention, and `A`, `R`, `A - R` and the difference `(on - off) - R` reported; in every run, no peak-statistics reset inside `prepare_execution_memory` and a KV budget equal to requested memory less `total_consumed` and the profiler's `transient_peak_headroom`; the `non_kv_cache_memory` and `transient_peak_headroom` differences reported, not bounded, because the profiler may observe a smaller transient peak above the retained floor; and a memory-bound run whose block count equals the count core derives from the reduced budget) [engine-CUDA]; `tests/v1/engine/test_nemotron_asr.py::test_nemotron_engine_transaction_graph_charge_holds_under_block_override` (new; `num_gpu_blocks_override` set; fresh-start: the option-on and the option-off engine each in its own spawned process, so neither inherits the other's process memory; `total_consumed(on) - total_consumed(off) >= R` and the override accepted against the charged remainder) [engine-CUDA]
+  - Configurations: M (the option-off arms of each configuration run the same configuration); the four override cases in the CPU test over M
+- **TXG-MEM-008**: When `transaction_graph_populations` is non-empty and `num_gpu_blocks_override` or `kv_cache_memory_bytes` is set, the model shall still measure and report `A`, `R` and `S` and check `S <= R` under either override and under both, and shall not itself change the resident block count, which core derives from the override once its budget validation accepts the configuration; when `kv_cache_memory_bytes` is set no window runs, so the charge clause of TXG-MEM-007 does not apply and the fixed budget must leave room for `R` itself; and if serving capture then raises or runs out of memory, then startup shall fail with an admission-failure error naming `transaction_graph_populations`. Planner rejection of an oversized override is TXG-MEM-011 and KV-allocation failure is TXG-MEM-012; core reports both.
   - Design: Capacity overrides
-  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_override_capacity_reports_admission_and_wraps_failures` (`A` and the `S <= A` check under each override, the model requesting no block-count change, and serving-capture failure) [CPU]
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_override_capacity_reports_admission_and_wraps_failures` (`A`, `R`, `S` and the `S <= R` check in four cases: neither override, each alone and both; the model requesting no block-count change; the hook running from `profile_run` with no window under `kv_cache_memory_bytes`; and serving-capture failure) [CPU]
   - Configurations: M
 - **TXG-MEM-009**: When `transaction_graph_populations` is non-empty, if admission capture raises or runs out of memory inside the profile window, then `prepare_execution_memory` shall raise an error naming `transaction_graph_populations` and latch `_execution_memory_failed`, and for an out-of-memory error the message shall report the normalized bytes admitted so far, the cells captured, the failing cell label and the device's free and total memory, and no projected total for the unfinished inventory.
   - Design: Failure modes and diagnostics
@@ -1195,6 +1783,30 @@ configurations.
   - Design: Capacity overrides; Failure modes and diagnostics; Core Obligations, item 5 (delivered)
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_state_spec_names_the_option_as_a_memory_contributor` (the label the served spec carries) [CPU]; `tests/v1/worker/test_gpu_model_runner_v2.py::test_state_kv_allocation_failure_names_memory_contributors` (generic label; injected allocation error and out-of-memory, profiling and serving pools, parametrized) [CPU]; `tests/v1/core/test_kv_cache_utils.py::test_persistent_state_memory_contributors_are_diagnostic` (the label survives planning and the copy that rebuilds the spec as pickle does) [CPU]
   - Configurations: M for the model-level test; core's generic-label tests (`tests/v1/worker/test_gpu_model_runner_v2.py`, `tests/v1/core/test_kv_cache_utils.py`) run no Nemotron model, so geometry and bucket state do not apply to them
+- **TXG-MEM-013**: When `transaction_graph_populations` is non-empty, admission capture and serving capture shall run at the same allocator settings, the worker's configured settings with no block-splitting limit imposed by the profiling run; the model shall record the allocator settings in force (the worker's settings reader, `torch._C._accelerator_getAllocatorSettings`, or the snapshot's `allocator_settings` where it is absent) with `N0` and with `Nr` and report both in the receipt; and if the two differ, then the binding shall discard every graph and `initialize_kv_cache` shall raise an error naming `transaction_graph_populations` and both settings, because `S` and `R` measured under different splitting limits are not comparable.
+  - Design: Budget mechanics; Normalized measurement
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_captures_require_equal_allocator_settings` (new; patched settings reader: equal settings publish, settings that change between `N0` and `Ns0` fail naming both) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_cuda_receipt_reports_admission_and_serving_bytes` (the recorded settings equal each other and the process's configured settings, with no `max_split_size_mb` the worker's profiling run adds) [CUDA]; `tests/v1/engine/test_nemotron_asr.py::test_nemotron_engine_transaction_graph_admission_is_charged` (the option-on receipt's two settings equal and free of the profiling run's split limit) [engine-CUDA]
+  - Configurations: M
+- **TXG-MEM-014**: When `transaction_graph_populations` is non-empty, the model shall take a resident reading `M()` (free device memory from `mem_get_info` with the allocator's reserved, allocated and peak-reserved bytes, with no `gc.collect()` or `empty_cache()`) at exactly these points: `Cs`, at publication after the admission checks pass, synchronized; `Cw`, in `post_warmup` after every verification check passes, synchronized, followed by a reset of the allocator's peak statistics; `Cp`, on one daemon thread the model starts after `Cw` only when its start condition holds, in this precedence: the registered environment variable `VLLM_NEMOTRON_TXG_MEMORY_THREAD` (the measurement-and-test switch, declared in `vllm/envs.py` as a lazily read `bool` that is `True` only for the value `1`, listed in `compile_factors()`'s `ignored_factors`, and read only through `vllm.envs`) starts it unconditionally, and otherwise it starts only when the engine's stats logging is enabled (TXG-CORE-004) and `PERIODIC_THREAD_QUALIFIED` is `True`; the thread sets the device and once per `VLLM_LOG_STATS_INTERVAL` takes one sample (`torch.cuda.memory_stats()`, `mem_get_info`, `memory_stats()` again) with no explicit synchronize and with device calls outside the shared lock, marks the sample `inconsistent` when the two statistics reads differ in reserved bytes, catches every exception, records an `error` with its reason and re-arms, checks its cancellation flag before every device call and, under the lock, before every publication, publishes each sample as one immutable record under the lock that guards the latest record, the synchronized watermark, the `Cp` suppression mark, the pending spike and the flag, and is stopped by `shutdown()` setting the flag under the lock and waking it, then joining with a bounded timeout before `Cx` and reporting `joined` or `abandoned after timeout`, an abandoned sampler exiting on resumption without reading or publishing; `Cx`, in `ModelState.shutdown()` before `discard()`, synchronized; and `Cn`, on each `transaction_graph_memory` call, labelled `served` with the total replay count at the time, synchronized; and the serving thread shall execute no code on account of growth tracking: no gate, clock read, memory read, device synchronize, `gc.collect()`, `empty_cache()` or allocator snapshot in `execute`, `prepare_step`, `postprocess_state` or the commit path.
+  - Design: Memory growth after startup; Ordering
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_resident_readings_are_taken_at_defined_points_only` (new; patched device calls record each reading's point, order, thread, synchronization and the absence of `gc.collect()` and `empty_cache()`; `Cw` after a passing verification, followed by the peak reset, and absent after a failing one; the thread started after `Cw` with the switch set (read through `vllm.envs`, the cache reset by `disable_envs_cache()` before the case), or with stats logging enabled and `PERIODIC_THREAD_QUALIFIED` patched `True`, and never with the switch unset or `0` when stats logging alone holds or the constant is `False`; the patched readers raise if called on the serving thread during a served step, eager or replayed, at every population; a reader that raises on the thread yields an `error` `Cp` and the thread takes the next sample; `shutdown()` joins the thread before `Cx` and before `discard()` and reports `joined`; a stand-in `mem_get_info` that blocks makes the join time out, `shutdown()` reports `abandoned after timeout`, still takes `Cx` and runs `discard()`, and when the test releases the blocked call afterwards the sampler sees the cancellation flag and exits with no reading and no publication) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_periodic_thread_calls_no_synchronizing_api` (new; on the thread, `torch.cuda.synchronize`, `torch.cuda.Stream.synchronize`, `torch.cuda.Event.synchronize`, `Tensor.item` and `Tensor.cpu` are patched to record their caller; after several samples none was called from the thread; the sample order `memory_stats`, `mem_get_info`, `memory_stats` is recorded) [CPU]; `tests/v1/engine/test_nemotron_asr.py::test_nemotron_engine_transaction_graph_periodic_reading_fires` (new; `EngineCore(..., log_stats=True)` with `VLLM_NEMOTRON_TXG_MEMORY_THREAD=1`, a sub-second interval, the b31 lockstep workload repeated until three samples have been published during served steps or a timeout expires, the first awaited on the event the thread sets after its first completed sample, and a timeout with fewer than three samples failing the test; every step bitwise equal to eager and `Cp` lines present; the only engine test that asserts `Cp`) [engine-CUDA]; `tests/test_envs.py::test_nemotron_txg_memory_thread_is_not_compile_factor` (new; the switch set to `1`: `envs.VLLM_NEMOTRON_TXG_MEMORY_THREAD` is `True`, absent from `compile_factors()`; set to `0` or unset: `False`) [CPU]; `tests/v1/engine/test_nemotron_asr.py::test_nemotron_engine_transaction_graph_serving_thread_is_unchanged_with_periodic_reading` (new; `VLLM_GPU_SYNC_CHECK=error` with the thread running: no sync-check error on the serving thread, which is the only thread the facility polices, and every step bitwise equal to eager; this is evidence about the serving thread, not about the daemon) [engine-CUDA]
+  - Configurations: M
+- **TXG-MEM-015**: When `transaction_graph_populations` is non-empty and the binding has published, the binding shall retain no tensor it did not hold at publication (its arenas, static inputs, owned outputs and graph entries are fixed there), the serving graph pool's segments shall be unchanged after publication, and a replay shall allocate only the caller-owned escaped row tensor; and under the isolated-replay experiment (every cell warmed and replayed once before measurement, each replay's escaped rows dropped and the device synchronized before each reading), the allocator's allocated bytes after a replay shall equal those before it and its reserved bytes shall not increase across further replays.
+  - Design: Memory growth after startup; Invariants
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_cuda_replays_retain_no_new_memory` (new; the isolated-replay experiment over ten replays per cell: allocated bytes equal before and after each replay, reserved bytes constant, the serving pool's segment set from `torch.cuda.memory._snapshot()` identical before and after, and the binding's tensor inventory identical by identity; a control that keeps escaped rows alive across replays asserts only the binding-owned invariants) [CUDA]
+  - Configurations: M
+- **TXG-MEM-016**: When `transaction_graph_populations` is non-empty and a resident reading `Cw`, `Cp`, `Cn` or `Cx` is taken, the model shall compute against its baseline (`Cs` for `Cw`; `Cw` for the others) the reserved growth `ΔR = rsv(P) - rsv(B)`, the allocated growth `ΔA`, the cached slack `ΔR - ΔA`, the device growth `ΔF = free(B) - free(P)` and the unexplained device-wide residual growth `ΔX = ΔF - ΔR`, shall include the reading and its figures in the receipt (`Cw`, latest `Cp`) or the reader's result (`Cn`), and shall log one `INFO` line with the reading and figures at `Cw`, at each `Cp` while the thread runs, and at `Cx`; the model shall keep a synchronized watermark and a separate `Cp` suppression mark, both starting at zero at `Cw`; if `ΔX` at `Cn` or at `Cx` is greater than zero and strictly greater than the synchronized watermark, then the model shall log a `WARNING` giving `ΔX`, `ΔR`, `ΔA` and `ΔF`, worded as device-wide growth the option's tracker observed and not as growth the option caused, and raise the watermark under the lock; a `Cp` sample shall never move the watermark; at every `Cn` and `Cx` reading, after the watermark has been compared and updated, the `Cp` mark shall be reset to the updated watermark; a later consistent `Cp` pair whose `ΔX` values both lie below the `Cp` mark shall lower it to the smaller of that pair, never below the watermark; for `Cp`, whose samples are approximate, the model shall warn only when two consecutive consistent samples both have `ΔX` greater than zero and strictly greater than the `Cp` mark, shall then raise the `Cp` mark to the smaller of the two and consume the pair, shall hold a single such sample as a pending spike that moves nothing, and shall clear the pending spike on an `error` or `inconsistent` sample (the latter reported with both reserved values) and on any `Cn` or `Cx` reading between the two samples; a read that raised shall be recorded as `error` with its reason, a point never reached as `unavailable`, and a figure whose point or baseline is `error`, `inconsistent` or `unavailable` as `unavailable` naming the operand, with the raw values obtained reported and no substituted baseline; and growth tracking shall never latch the binding, fail a step, raise from `post_warmup` or `shutdown` or on the periodic thread, alter a startup error already raised, prevent `discard()`, or change serving behaviour.
+  - Design: Memory growth after startup
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_memory_growth_is_reported_and_never_latches` (new; injected readings: `Cp` samples with `ΔX = 0` and `ΔX < 0` log `INFO` only; at `Cn` and `Cx` a first `ΔX > 0` logs the `WARNING` with the figures, a repeat at the same `ΔX` and a lower positive `ΔX` do not, a higher one does; at `Cp` a single sample above the `Cp` mark logs nothing and moves nothing, two consecutive consistent samples above it log one `WARNING` and raise the `Cp` mark to the smaller of the two without touching the watermark, a later single sample above the new mark again moves nothing, an `error` sample or a `Cn` reading between two such samples clears the pending spike, and after a false pair has raised the `Cp` mark to 8 MiB a later consistent pair at 3 MiB and 2 MiB lowers it to 2 MiB while a pair below the watermark lowers it only to the watermark; `ΔX > 0` at `Cw` logs no warning; `ΔA` and the cached slack reported; the binding stays ready and the next `execute` replays) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_inconsistent_periodic_sample_never_warns` (new; two interleavings with no serving synchronize: a patched `memory_stats` that returns a changed reserved figure on the second read makes the sample `inconsistent` with both values, which logs no `WARNING`, moves neither the synchronized watermark nor the `Cp` mark and clears any pending spike; and a patched pair that allocates a segment before `mem_get_info` and frees it before the second statistics read leaves both totals equal and `ΔX` spuriously positive for one sample, which logs no `WARNING` and leaves the mark unchanged, the next consistent sample being judged against the unchanged mark) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_false_periodic_spikes_do_not_suppress_synchronized_growth` (new; two independent cases, each on a fresh tracker: repeated equal-total false `Cp` spikes of 8 MiB raise only the `Cp` mark, then one synchronized reading, `Cn` in the first case and `Cx` in the second, with genuine `ΔX` of 4 MiB logs a `WARNING` against the unchanged synchronized watermark and resets the `Cp` mark to the watermark; in the `Cn` case a following `Cx` at the same 4 MiB logs no `WARNING`, because `Cn` raised the watermark) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_unavailable_memory_readings_change_no_outcome` (new; a read that raises at each of `Cs`, `Cw`, `Cp`, `Cn` and `Cx` in turn: the point is `error` with the exception text, dependent figures `unavailable` naming it, raw values kept, the next point read on its own and the thread re-armed; after a TXG-MEM-010 startup failure `Cs` and `Cw` are `unavailable`, no thread starts, `shutdown` still takes `Cx`, reports unavailable figures, the original startup error is unchanged and `discard()` runs; after a failed verification `Cw` is `unavailable`, no thread starts and the verification error is unchanged) [CPU]; `tests/v1/engine/test_nemotron_asr.py::test_nemotron_engine_transaction_graph_b31_lockstep_matches_eager` (reads `transaction_graph_memory` after startup, after the second lockstep step and after the run: every figure present and finite, printed, not bounded; it asserts nothing about `Cp`, which only `test_nemotron_engine_transaction_graph_periodic_reading_fires` asserts) [engine-CUDA]
+  - Configurations: M
+- **TXG-MEM-017**: When `transaction_graph_populations` is non-empty and `capture_transaction_graphs` releases the admission holder, the binding shall, before the release, record outside the holder the storage range (`untyped_storage().data_ptr()` and `nbytes`) of every admission-owned buffer (the arenas, static inputs and owned outputs of the admission inventory), the admission graph pool's id, and weak references to those tensors and to the admission `torch.cuda.CUDAGraph` objects; after the release, after `Ns0`'s normalization (device synchronize, `gc.collect()`, `empty_cache()`) and the `Ns0` and `rsv(Ns0)` readings, and before the first serving-capture allocation, it shall take one startup-only `torch.cuda.memory_snapshot(include_traces=False)` filtered to the worker device and verify that no segment carries the admission pool id and that no active block overlaps a recorded storage range, with no device allocation by this option between the release and the snapshot; if either check fails, then the binding shall discard every graph and `initialize_kv_cache` shall raise an error naming `transaction_graph_populations` and the surviving pool id or storage range, with any live weak reference named as a diagnostic; and the aggregate reserved figures `rsv(N1) - rsv(N0)` and `rsv(Nr) - rsv(Ns0)` shall be reported in the receipt and in any `S > R` error as diagnostics that never fail startup.
+  - Design: Normalized measurement; Ordering
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_release_frees_every_admission_owned_buffer` (new; patched snapshot: a passing case publishes; a retained `detach()` alias of an owned output, whose block stays active in the snapshot, fails startup naming its storage range; a retained admission pool segment fails naming the pool id; a retained `CUDAGraph` object is named as a live weak reference beside the failing check; injected reserved readings with a drop short of the growth publish and report both figures, and an `S > R` error carries them) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_cuda_serving_pool_is_distinct_from_released_admission_pool` (on the device: the snapshot after the release holds no segment with the admission pool id and no active block over a recorded range; a deliberately retained `detach()` alias in a negative arm fails startup naming its range; the aggregate figures reported) [CUDA]
+  - Configurations: M
+- **TXG-MEM-018**: When `transaction_graph_populations` is non-empty, every transaction capture, admission and serving, shall run on the binding's one capture stream, the stream on which the binding's eager warm-ups for that cell run, so that per-stream lazy state (the cuBLAS workspace) is created by the inventory's warm-up and released with its graphs; the binding shall verify this inside each capture by comparing the current stream's `cuda_stream` handle, read within the capture context, with its capture stream's handle, treating two stream objects with one handle as one stream; each nested graph binding (the decode graph binding, the encoder execution's graph regions and the CHUNK-bucket binding) shall record the `cuda_stream` handle of every `GraphCaptureContext` stream it captured on and expose them as `capture_stream_handles()`; the transaction binding shall draw its capture stream once, in `prepare_execution_memory` after the nested inventory is sealed and before `N0`, with a handle distinct from the runner stream and from every recorded nested handle, drawing again from torch's per-device stream pool until a handle is distinct or a drawn handle repeats (the pool has wrapped) and, on a wrap with no distinct handle, failing startup with an error naming `transaction_graph_populations`, the collided handles and the draw count (a startup failure, not a latch), so that no graph live at the draw was captured on the stream whose lazy state the release frees; the guarantee rests on the premise, which the design states, that nothing else captures between the binding's stream draw and the admission release: the nested inventory is sealed before admission (TXG-MEM-002), core captures nothing under `cudagraph_mode` `NONE` (TXG-ENV-003), and the only captures in the window are the binding's own, on its stream; and a graph runtime used for capture shall capture on the stream current at the call, as the platform wrapper does, with a capture on the default stream left to torch's own capture stream.
+  - Design: Normalized measurement; Capture and the replay-cell oracle
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_capture_runs_on_the_binding_stream` (new; stand-in runtime and stream handles: the handle read inside each capture equals the binding stream's handle; a runtime that captures elsewhere fails the capture naming the option; stand-in nested bindings expose `capture_stream_handles()`, a collision with the first pool draw makes the binding draw another, a patched pool that returns only colliding handles fails startup when a handle repeats, with the named error, the draw count and no latch) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_cuda_admission_and_serving_capture_share_cell_order` (the `cuda_stream` handle read inside each capture equals the binding's for every cell of both inventories and differs from the nested bindings' and the runner stream's; precondition: the owed A40 run with C++ allocation frames and a stream-handle collision check (Open Question 2) has confirmed the workspace owner, that the binding stream aliases no nested capture stream, and, by recording every capture start with its stream handle from the binding's stream draw (the point this criterion pins, after the nested inventory is sealed and before `N0`) to the admission release, that no other capture occurs in that window) [CUDA]
+  - Configurations: M
 
 ### Capture lifetime (LIFE)
 
@@ -1382,9 +1994,9 @@ configurations.
   - Design: Observability
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_counters_raise_when_the_model_is_unreachable` [CPU]
   - Configurations: M
-- **TXG-OBS-004**: When `transaction_graph_populations` is non-empty, the execution profile receipt shall include readiness; per cell, arena bytes, reserved-memory growth, warm-up seconds, capture seconds and capture index; `A`, `S`, the release-check result, and the admission and serving capture seconds; and the served geometry (0 for g0, 1 for g1), with cell labels unchanged, so that `replay` labels carry no geometry.
+- **TXG-OBS-004**: When `transaction_graph_populations` is non-empty, the execution profile receipt shall include readiness; per cell, arena bytes, reserved-memory growth, warm-up seconds, capture seconds and capture index; the complete startup accounting: the six raw readings `N0`, `Na`, `N1`, `Nr`, `Ns0` and `Ns1`, the allocated bytes read with `Na` and `N1` and the stand-in bytes, `rsv(N0)`, `rsv(N1)`, `rsv(Nr)` and `rsv(Ns0)` with the two aggregate reserved diagnostics of TXG-MEM-017, the derived `A`, `R`, `S`, `A - R` and `R - S`, the release-check result, the allocator settings recorded with `N0` and `Nr`, and the admission and serving capture seconds; the resident readings `Cs`, `Cw` (once `post_warmup` has run) and the latest `Cp`, each with its growth figures; and the served geometry (0 for g0, 1 for g1), with cell labels unchanged, so that `replay` labels carry no geometry; every value shall carry a status of present, `error` (a read that raised, with the exception text), `inconsistent` (a `Cp` sample whose two statistics reads disagree, with both reserved values), or `unavailable` (a point never reached, or a derived figure with an `error`, `inconsistent` or `unavailable` operand, naming it); the receipt shall be readable after a failed startup, before anything is published, with the readings startup did obtain; and publication shall log one `INFO` line naming `transaction_graph_populations` with `A`, `R`, `S`, `A - R` and `R - S`, while a failed startup shall log one line with every raw reading and operand before the error is raised.
   - Design: Observability
-  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_receipt_captures_largest_population_first_and_reports_cost` (including the admission fields and the served geometry, parametrized over M) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_cuda_receipt_reports_admission_and_serving_bytes` (also the TXG-OBS-002 implicit-synchronization check) [CUDA]
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_receipt_captures_largest_population_first_and_reports_cost` (including every raw reading and operand with its status, the derived figures, the recorded settings, `Cs`, `Cw` and `Cp`, the publication log line and the served geometry, parametrized over M; and after an injected `S > R` failure the receipt holds the readings obtained with `Ns1` present, `Cs` and `Cw` `unavailable`, and the failure log line present) [CPU]; `tests/models/nemotron_asr/test_transaction_graph.py::test_cuda_receipt_reports_admission_and_serving_bytes` (`A`, `R`, `S` positive with `S <= R`, `A - R` and `R - S` consistent with the raw readings, the four `rsv(·)` values present; also the TXG-OBS-002 implicit-synchronization check) [CUDA]
   - Configurations: M
 - **TXG-OBS-005**: When `transaction_graph_populations` is non-empty and a step replays a cell, at g0, g1 with the CHUNK-bucket binding off, or g1 with `chunk_bucket_graph_populations` `[1, 31, 63]`, the encoder invocation counters and the CHUNK-bucket binding's replay and fallback counts shall not advance, per-step batch stats shall advance, and `replays:<cell label>` shall increase by exactly one.
   - Design: Host control flow inside the body
@@ -1394,6 +2006,10 @@ configurations.
   - Design: g1 and the CHUNK-bucket binding; Host control flow inside the body
   - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_cuda_bucket_counts_record_eager_invocations` (new; transaction populations `[2]`; baseline read after startup; bucket and encoder-invocation deltas across one eager one-row CHUNK step, one eager three-row CHUNK step, one eager one-row REPLAY step and one replayed two-row CHUNK step) [CUDA]
   - Configurations: g1 with `chunk_bucket_graph_populations` `[1, 31, 63]`; not g0 or bucket off, because the bucket's counts exist only with the bucket on
+- **TXG-OBS-007**: When `transaction_graph_populations` is non-empty, `transaction_graph_memory` shall accept a model, runner, worker, executor or in-process `EngineCore`, take one resident reading labelled `served` with the total replay count at the time (`Cn`), and return it with the recorded readings `Cs`, `Cw` and the latest `Cp`, each with its status, and the growth figures of TXG-MEM-016, synchronizing the device once per call; where `transaction_graph_populations` is absent or empty it shall return an empty mapping for a reachable model; and if the model is unreachable in process, with or without the option, it shall raise rather than return an empty mapping.
+  - Design: Observability; Memory growth after startup
+  - Test: `tests/models/nemotron_asr/test_transaction_graph.py::test_memory_reader_reaches_the_model_from_an_engine_core` (new; every target, the `served` reading with the replay count, the recorded readings and figures, one synchronize per call with patched device calls, the off branch's empty mapping and the unreachable target's raise) [CPU]
+  - Configurations: M
 
 ### Core warmup fix (CORE; owned by the core persistent-state design)
 
@@ -1405,17 +2021,25 @@ configurations.
   - Design: Core Dependency: Persistent-State Warmup; Core Obligations, item 1 (delivered)
   - Test: `tests/v1/worker/test_mixed_warmup_gate.py::test_mixed_warmup_disables_watermarking` (run path) [CPU]; `tests/v1/worker/test_mixed_warmup_gate.py::test_mixed_warmup_skipped_for_single_seq` (`max_num_reqs < 2`) [CPU]; `tests/v1/worker/test_mixed_warmup_gate.py::test_mixed_warmup_skipped_for_pooling_short_and_block_starved_runs` (pooling model, `num_tokens < 3`, insufficient blocks, parametrized) [CPU]
   - Configurations: core tests with generic state specs; no Nemotron model runs, so geometry and bucket state do not apply
+- **TXG-CORE-003**: When a model defines `prepare_execution_memory` and `kv_cache_memory_bytes` is unset, `determine_available_memory` shall call it once inside the `memory_profiling` window and before it enters `_scoped_allocator_max_split`, so the call runs at the configured allocator settings and its retained memory is counted in `non_kv_cache_memory`; the split limit shall cover only `profile_run`, which shall not call the hook again, and shall be restored whether or not the profiling run raises; and when `kv_cache_memory_bytes` is set, `profile_run` shall call the hook once at the configured settings with no split limit.
+  - Design: Budget mechanics; Core Obligations, item 7 (delivered)
+  - Test: `tests/v1/worker/test_gpu_worker.py::test_execution_memory_is_prepared_before_the_split_limit` (window opens, hook at the original settings, profile run under `max_split_size_mb:20`, window closes, settings restored; parametrized over a failing profile run) [CPU]; `tests/v1/worker/test_gpu_worker.py::test_execution_memory_is_prepared_once_under_a_fixed_budget` (new; `kv_cache_memory_bytes` set: the hook runs once from `profile_run` with no split limit and no window) [CPU]
+  - Configurations: core tests with a generic model; no Nemotron model runs, so geometry and bucket state do not apply
+- **TXG-CORE-004**: When `EngineCore` is constructed with `log_stats` true or false, it shall write that value into `vllm_config` (an `ObservabilityConfig` field) before it constructs the executor, overriding any value the configuration already carries, so that every worker's model state reads the engine's setting; and until core delivers the field, a model state shall read the setting as disabled.
+  - Design: Memory growth after startup; Core Obligations, item 8 (owed)
+  - Test: `tests/v1/engine/test_log_stats_conduit.py::test_engine_core_writes_log_stats_before_the_executor` (new, in a module without the CUDA skip; a recording `Executor` subclass captures the `vllm_config` it receives at construction; `EngineCore(..., log_stats=True)` and `(..., log_stats=False)`, each with the configuration pre-set to the opposite value: the recorded configuration carries the constructor's value) [CPU]; `tests/v1/engine/test_log_stats_conduit.py::test_worker_reads_log_stats_under_each_executor` (new; a tiny model under the uniprocess and the multiprocess executor, the worker's field read through `collective_rpc` for `log_stats` true and false) [CUDA]; `tests/v1/worker/test_gpu_model_runner_v2.py::test_model_state_sees_the_stats_logging_setting` (new; generic model state; the field true, false, and absent, read as enabled only when true) [CPU]
+  - Configurations: core tests with a generic model state; no Nemotron model runs, so geometry and bucket state do not apply
 
 ### Consistency report
 
-- **Coverage.** Every target behaviour has a criterion except: the slot-reuse invariant between commit reservation and collection and replay serialization (Invariants), which rest on core synchronous scheduling for persistent state and are tested there; nested-scratch write-before-read, a model property whose behavioural coverage is TXG-REP-017, including the CHUNK-bucket scratch at g1; the bucket binding's freedom from `signature` fallback (unprepared positional projections under the `eager-graphed` arm), observed through the zero-fallback lockstep of TXG-REP-010 and TXG-REP-013 with the bucket on; the bucket-before-admission startup order, which TXG-MEM-002's "after the nested inventory is ready" covers once the nested inventory includes the bucket graphs; the sleep-mode, CuMem and weight-reload rejections, which are existing persistent-state contracts owned elsewhere; "a nonzero `signature` count is a defect", an operating judgement observed through TXG-REP-005's counter; and the client-level `EngineDeadError` after a fatal step, which is the core-owned `EngineCoreProc` busy-loop path (`core.py:1833-1841`, `:1794-1800`), which stops later steps and is covered generically by `tests/v1/shutdown/test_forward_error.py`, with no existing harness driving a Nemotron streaming session through the multiprocess client (TXG-FAIL-005/006 observe propagation out of `EngineCore.step` instead). The Default-On Gate (including the `EngineCoreProc` counter reader; the counters are an in-process harness facility here), Open Questions probes, the startup-count proposal and the exploratory measurements carry no criteria by decision.
-- **Observable proxies.** TXG-ENV-003 names the construction-observable options, because the runner's `needs_cudagraph_capture()` is not observable at model construction, and orders its checks before the model's other construction-time mode rejections; TXG-REP-014 reads the per-operation `fp32_precision` settings, because the legacy matmul-precision getter raises once those settings are used; TXG-ENV-010 observes validation precedence through which error a doubly invalid configuration raises, and TXG-ENV-011 error ownership through the bucket binding's own error; TXG-ENV-009 observes the call routing as the identity of `TransactionCallBindings.bucket_transition`; TXG-OBS-006 observes the post-startup baseline as a reading after `post_warmup` and before the first served step, and its deltas across eager steps at a bucket population, at another population and with no CHUNK row.
-- **Core-owned.** Core Obligations lists every obligation on the core persistent-state design with its criteria. Core delivers all six obligations: TXG-CORE-001 and TXG-CORE-002 are tested in core; TXG-VER-004, TXG-LIFE-007 and TXG-LIFE-008 pair the core tests with model-level tests of the model state's `post_warmup`, `shutdown` and startup access, and TXG-LIFE-009 tests the model's `is_profiling` guard. TXG-MEM-011 and TXG-MEM-012 pair core's generic-label tests with a model-level test that the served state spec names the option only while it is on, and TXG-MEM-011 also routes the served spec through core's planner.
-- **Conservative defaults.** TXG-MEM-006 fixes zero tolerance for `S <= A`, and TXG-MEM-008 keeps it under both capacity overrides; TXG-MEM-002 requires the complete inventory, so no cross-cell reuse is assumed; TXG-MEM-007 forbids deducting double-counted peak.
-- **Contradictions.** None between the criteria and the tests they name. `test_arena_rejects_vectors_outside_its_layout` is an arena-level guard beside the execution-level `signature` fallback (TXG-REP-005). `test_cuda_graph_replay_matches_eager_across_varied_plans` excludes park tokens and is not park-echo coverage (TXG-REP-011).
-- **Implicit scoping resolved.** Processor and `bind_rows` geometry enforcement (TXG-ENV-007, TXG-ENV-008) and the unreachable-model reader (TXG-OBS-003) are option-independent, because the design passes the configured set to the plan context unconditionally. "Worker-fatal" is read as the latch of TXG-FAIL-004 for every fatal check, including pre-boundary process-constant, wrapper-entry and post-warmup failures; only non-fatal pre-boundary failures follow the structural-failure contract (TXG-FAIL-001). Signature-fallback pool preservation applies only to captured storage distinct from the live pools (TXG-REP-005). Budget-derived capacity applies only without an override, and an override's count only once core budget validation accepts it (TXG-MEM-007, TXG-MEM-008). "Every CHUNK step replays" means zero CHUNK-step fallbacks in the homogeneous lockstep workload, with echo steps at undeclared populations counted `undeclared`; mixed and staggered steps keep eager equivalence and their fallback counts (TXG-REP-010, TXG-REP-013). Request abort is not ticket cancellation, and post-replay page preservation lasts until a rebind or authorized write (TXG-FAIL-002, TXG-FAIL-007). Per-row rejections are classified as eager classifies them, terminal ones as request failures, never step failures (TXG-REP-012). Processor geometry rejection is tested at the processor; the in-process engine tests bypass it (TXG-ENV-007). Geometry and CHUNK-bucket state follow the preamble rule: criteria whose behaviour depends on the served geometry or the bucket binding (TXG-ENV-004, TXG-ENV-009 to TXG-ENV-012, TXG-REP-001, TXG-REP-010 to TXG-REP-013, TXG-REP-017 to TXG-REP-019, TXG-OBS-004 to TXG-OBS-006, TXG-VER-001, TXG-VER-003) name their configurations; every other criterion holds at g0 and at g1, with the bucket off and, at g1, on. The rule states where a criterion applies; a criterion's tests establish it only in the configurations they run in, listed below.
-- **Test configurations.** Every criterion carries a Configurations entry, and every criterion whose behaviour can be exercised under a g1 engine is tested over M (g0; g1 with the CHUNK-bucket binding off; g1 with `[1, 31, 63]`). Entries narrower than M, each with its reason in the entry: TXG-ENV-004 (bucket-on cases belong to TXG-ENV-009 to TXG-ENV-011); TXG-ENV-009, TXG-ENV-010, TXG-OBS-006 and the bucket parts of TXG-REP-006, TXG-REP-007, TXG-VER-001 and TXG-VER-003 (bucket-only behaviour, inapplicable at g0 or bucket off); TXG-ENV-011 (bucket configured, including its negative case at g0, `[0]`); TXG-ENV-012 (the bucket binding is not a constructor input); TXG-REP-019 (g1-only lookahead behaviour); the core generic tests of TXG-CORE-001, TXG-CORE-002, TXG-MEM-011, TXG-MEM-012, TXG-LIFE-007, TXG-LIFE-008 and TXG-VER-004 (no Nemotron model runs). Wider than M: TXG-REP-010 adds g1 with `[1, 63]`; TXG-ENV-007 and TXG-ENV-008 run option off and on in each served set. Shared tests: TXG-LIFE-007, TXG-VER-004 and TXG-OBS-001 run in TXG-REP-013's parametrized engine test, which keeps each one's assertions in every configuration; TXG-REP-009 shares TXG-REP-001's capture test; TXG-OBS-002 shares TXG-OBS-004's CUDA receipt test. Phase 5 replaces `test_option_rejects_served_geometries_other_than_g0`, whose `g1` case contradicts TXG-ENV-004.
-- **Context-free reading.** Every criterion names `transaction_graph_populations` and its state in its own clause; cross-file concepts (g0, g1, served geometry, CHUNK-bucket binding on, eager, bitwise equal, configuration error, `endpoint_enabled`, `N()`) carry a parenthetical or the preamble definition.
+- **Coverage.** Every target behaviour has a criterion except: the slot-reuse invariant between commit reservation and collection and replay serialization (Invariants), which rest on core synchronous scheduling for persistent state and are tested there; nested-scratch write-before-read, a model property whose behavioural coverage is TXG-REP-017, including the CHUNK-bucket scratch at g1; the bucket binding's freedom from `signature` fallback (unprepared positional projections under the `eager-graphed` arm), observed through the zero-fallback lockstep of TXG-REP-010 and TXG-REP-013 with the bucket on; the bucket-before-admission startup order, which TXG-MEM-002's "after the nested inventory is ready" covers once the nested inventory includes the bucket graphs; the sleep-mode, CuMem and weight-reload rejections, which are existing persistent-state contracts owned elsewhere; "a nonzero `signature` count is a defect", an operating judgement observed through TXG-REP-005's counter; and the client-level `EngineDeadError` after a fatal step, which is the core-owned `EngineCoreProc` busy-loop path (`core.py:1833-1841`, `:1794-1800`), which stops later steps and is covered generically by `tests/v1/shutdown/test_forward_error.py`, with no existing harness driving a Nemotron streaming session through the multiprocess client (TXG-FAIL-005/006 observe propagation out of `EngineCore.step` instead). The Default-On Gate (including the `EngineCoreProc` counter and memory readers; both are in-process harness facilities here), Open Questions probes, the startup-count proposal and the exploratory measurements carry no criteria by decision. The startup accounting and post-startup growth tracking are covered by TXG-MEM-003, TXG-MEM-005 to TXG-MEM-008 and TXG-MEM-013 to TXG-MEM-018, with TXG-OBS-004 and TXG-OBS-007 as their reporting surface, TXG-CORE-003 as the core placement they rest on and TXG-CORE-004 as the owed conduit for the periodic thread; the one-granule overrun of Open Question 2 carries no criterion until the owner decides.
+- **Observable proxies.** TXG-ENV-003 names the construction-observable options, because the runner's `needs_cudagraph_capture()` is not observable at model construction, and orders its checks before the model's other construction-time mode rejections; TXG-REP-014 reads the per-operation `fp32_precision` settings, because the legacy matmul-precision getter raises once those settings are used; TXG-ENV-010 observes validation precedence through which error a doubly invalid configuration raises, and TXG-ENV-011 error ownership through the bucket binding's own error; TXG-ENV-009 observes the call routing as the identity of `TransactionCallBindings.bucket_transition`; TXG-OBS-006 observes the post-startup baseline as a reading after `post_warmup` and before the first served step, and its deltas across eager steps at a bucket population, at another population and with no CHUNK row; TXG-MEM-013 observes equal allocator scope through the recorded allocator settings at `N0` and `Nr`, because the hook's position inside the worker is not observable from the model; TXG-MEM-016 observes unexplained device-wide residual growth as `ΔF - ΔR`, because instantiated graphs, module loads and other processes' use of the device report through no allocator statistic, which is also why the figure is attributed to no owner; TXG-MEM-017 observes release completeness through the binding's own weak references and pool, because process-wide reserved bytes cannot attribute a segment; TXG-MEM-018 observes stream identity through `cuda_stream` handles inside the capture, because stream objects alias through torch's pool.
+- **Core-owned.** Core Obligations lists every obligation on the core persistent-state design with its criteria. Core has delivered seven obligations and owes the eighth (TXG-CORE-004, the stats-logging setting in the worker, without which the periodic reading thread starts only under the measurement-and-test switch): TXG-CORE-001 to TXG-CORE-003 are tested in core; TXG-VER-004, TXG-LIFE-007 and TXG-LIFE-008 pair the core tests with model-level tests of the model state's `post_warmup`, `shutdown` and startup access, and TXG-LIFE-009 tests the model's `is_profiling` guard. TXG-MEM-011 and TXG-MEM-012 pair core's generic-label tests with a model-level test that the served state spec names the option only while it is on, and TXG-MEM-011 also routes the served spec through core's planner. TXG-CORE-003 (hook placement) pairs with the model-level equal-scope check of TXG-MEM-013, which detects a placement regression from the model's side.
+- **Conservative defaults.** TXG-MEM-006 fixes zero tolerance for `S <= R` in every process, and TXG-MEM-008 keeps it under each capacity override and both; `A` is reported and never a bound, and `R > A` is reported, never fatal, because neither ordering of the two is guaranteed; TXG-MEM-002 requires the complete inventory, so no cross-cell reuse is assumed; TXG-MEM-007 forbids deducting double-counted peak and requires the window to count at least `R` whenever a window runs; TXG-MEM-013 fails startup rather than compare figures from different allocator scopes; TXG-MEM-017 fails startup on a surviving admission-owned reference and only reports the aggregate reserved figures, which can neither prove nor refute completeness; TXG-MEM-016 warns on a new level of unexplained device-wide residual growth and never latches, because growth the model does not own has no model-side recovery path (Decisions & Alternatives, "Growth severity"); a one-granule overrun at equal scope is an open design question (Open Question 2), not a tolerance, and the measured case fails startup under the policy as written.
+- **Contradictions.** None between the criteria and the tests they name. `test_arena_rejects_vectors_outside_its_layout` is an arena-level guard beside the execution-level `signature` fallback (TXG-REP-005). `test_cuda_graph_replay_matches_eager_across_varied_plans` excludes park tokens and is not park-echo coverage (TXG-REP-011). TXG-OBS-002 (the counters never synchronize) and TXG-OBS-007 (the memory reader synchronizes once per call) are two readers with stated contracts, not one reader with two. TXG-MEM-014's serving-thread clause and TXG-MEM-016's `Cp` and `Cn` readings agree because `Cp` runs on the daemon thread and `Cn` is taken only by the harness between steps. TXG-MEM-017's snapshot runs once at startup, so it does not contradict TXG-MEM-014's ban on allocator snapshots on the serving thread. The status schema is one: `error` for a raised read, `unavailable` for an unreached point or a figure with such an operand (preamble, TXG-MEM-016, TXG-OBS-004). TXG-MEM-005's release ordering and TXG-MEM-003's `Nr`/`Ns0` pair name the same two readings around the same release, and both allow the host-side settings and `rsv(·)` reads beside them. TXG-MEM-013 and Ordering step 6 both record the allocator settings with `N0` and `Nr`. TXG-MEM-007's chain (`non_kv_cache_memory >= R`) holds because the holder is alive at window close (same criterion) and `R` is what that holder returns (TXG-MEM-003); it applies with and without `num_gpu_blocks_override` and not under `kv_cache_memory_bytes`, where no window exists (TXG-MEM-008), while the holder-lifetime clause applies everywhere. TXG-MEM-015's unconditional clause covers binding-owned memory only; its allocator-statistics clause is scoped to the isolated-replay experiment, and the engine test of TXG-MEM-016 asserts reporting, not values, so neither contradicts Open Question 11. TXG-MEM-006's repeated-engine test asserts the outcome that matches the figures, so an in-process `S > R` is a reported finding and a startup failure, never a bypass.
+- **Implicit scoping resolved.** Processor and `bind_rows` geometry enforcement (TXG-ENV-007, TXG-ENV-008) and the unreachable-model reader (TXG-OBS-003) are option-independent, because the design passes the configured set to the plan context unconditionally. "Worker-fatal" is read as the latch of TXG-FAIL-004 for every fatal check, including pre-boundary process-constant, wrapper-entry and post-warmup failures; only non-fatal pre-boundary failures follow the structural-failure contract (TXG-FAIL-001). Signature-fallback pool preservation applies only to captured storage distinct from the live pools (TXG-REP-005). Budget-derived capacity applies only without an override, and an override's count only once core budget validation accepts it (TXG-MEM-007, TXG-MEM-008). "Every CHUNK step replays" means zero CHUNK-step fallbacks in the homogeneous lockstep workload, with echo steps at undeclared populations counted `undeclared`; mixed and staggered steps keep eager equivalence and their fallback counts (TXG-REP-010, TXG-REP-013). Request abort is not ticket cancellation, and post-replay page preservation lasts until a rebind or authorized write (TXG-FAIL-002, TXG-FAIL-007). Per-row rejections are classified as eager classifies them, terminal ones as request failures, never step failures (TXG-REP-012). Processor geometry rejection is tested at the processor; the in-process engine tests bypass it (TXG-ENV-007). "Growth" in TXG-MEM-016 is a difference between two resident readings at the named points, not a per-step quantity; `ΔR`, `ΔA` and the cached slack are reported without a bound because their bound is a core figure, and only a new level of `ΔX` carries a warning, attributed to no owner. "Zero tolerance" in TXG-MEM-006 applies to `S <= R` as measured in whatever process runs; a negative `A - R` is a reported anomaly, not a failure, because `A` bounds nothing (TXG-OBS-004). Free-memory figures are process-history dependent, so the qualifying `S <= R` evidence comes from the fresh-start experiment, while the repeated-engine experiment asserts that outcome and figures agree (preamble). "Unavailable" readings and figures are reported as such and never substituted (TXG-MEM-016). Geometry and CHUNK-bucket state follow the preamble rule: criteria whose behaviour depends on the served geometry or the bucket binding (TXG-ENV-004, TXG-ENV-009 to TXG-ENV-012, TXG-REP-001, TXG-REP-010 to TXG-REP-013, TXG-REP-017 to TXG-REP-019, TXG-OBS-004 to TXG-OBS-006, TXG-VER-001, TXG-VER-003) name their configurations; every other criterion holds at g0 and at g1, with the bucket off and, at g1, on. The rule states where a criterion applies; a criterion's tests establish it only in the configurations they run in, listed below.
+- **Test configurations.** Every criterion carries a Configurations entry, and every criterion whose behaviour can be exercised under a g1 engine is tested over M (g0; g1 with the CHUNK-bucket binding off; g1 with `[1, 31, 63]`). Entries narrower than M, each with its reason in the entry: TXG-ENV-004 (bucket-on cases belong to TXG-ENV-009 to TXG-ENV-011); TXG-ENV-009, TXG-ENV-010, TXG-OBS-006 and the bucket parts of TXG-REP-006, TXG-REP-007, TXG-VER-001 and TXG-VER-003 (bucket-only behaviour, inapplicable at g0 or bucket off); TXG-ENV-011 (bucket configured, including its negative case at g0, `[0]`); TXG-ENV-012 (the bucket binding is not a constructor input); TXG-REP-019 (g1-only lookahead behaviour); the core generic tests of TXG-CORE-001 to TXG-CORE-004, TXG-MEM-011, TXG-MEM-012, TXG-LIFE-007, TXG-LIFE-008 and TXG-VER-004 (no Nemotron model runs). Spawned option-on CUDA tests (one process per case, because each admits and serves and asserts a non-memory pass, which `S <= R` would otherwise condition on allocator history): `test_cuda_replayed_rows_survive_another_cells_replay`, `test_cuda_replay_freezes_nested_counters_and_counts_once`, `test_cuda_interleaved_fallbacks_and_replays_match_eager`, `test_cuda_bucket_counts_record_eager_invocations`, `test_cuda_startup_access_stores_no_resident_page` and the new `test_cuda_replays_retain_no_new_memory`, beside the already spawned `test_cuda_admission_and_serving_capture_share_cell_order`, `test_cuda_serving_pool_is_distinct_from_released_admission_pool` and `test_cuda_receipt_reports_admission_and_serving_bytes`; `test_cuda_g1_lookahead_rows_match_eager` serves at binding level without admission, so no `R` exists and no gate applies to it (the model-level guard of TXG-MEM-010 is what requires admission before a CUDA serving capture). Every option-on engine test belongs to an experiment: fresh-start, with the option-on engine the first engine in its spawned process (the eager arm, where one exists, runs after it or in its own process), for `test_nemotron_engine_transaction_graph_matches_eager`, `test_nemotron_engine_transaction_graph_b31_lockstep_matches_eager`, `test_nemotron_engine_transaction_graph_replay_failure_propagates_from_step`, `test_nemotron_engine_transaction_graph_collection_failure_propagates_from_step`, `test_nemotron_engine_transaction_graph_periodic_reading_fires`, `test_nemotron_engine_transaction_graph_serving_thread_is_unchanged_with_periodic_reading`, and, with every engine in its own spawned process, `test_nemotron_engine_transaction_graph_serving_fits_released` and `test_nemotron_engine_transaction_graph_charge_holds_under_block_override` (whose `on - off` charge comparison would otherwise be biased by first-engine process memory); repeated-engine, by design, for `test_nemotron_engine_transaction_graph_admission_is_charged`. The output-equality tests may run their eager arm after the option-on engine in the same process because that order affects no figure they assert. Wider than M: TXG-REP-010 adds g1 with `[1, 63]`; TXG-ENV-007 and TXG-ENV-008 run option off and on in each served set. Shared tests: TXG-LIFE-007, TXG-VER-004 and TXG-OBS-001 run in TXG-REP-013's parametrized engine test, which keeps each one's assertions in every configuration; TXG-REP-009 shares TXG-REP-001's capture test; TXG-OBS-002 and TXG-MEM-013 share TXG-OBS-004's CUDA receipt test; TXG-MEM-017 shares TXG-MEM-005's CUDA distinct-pool test; TXG-MEM-018 shares TXG-MEM-002's CUDA cell-order test, gated by the owed A40 precondition; TXG-MEM-006, TXG-MEM-007 and TXG-MEM-013 share the engine admission-charge test (the repeated-engine experiment); TXG-MEM-016 shares the b31 lockstep engine test. Phase 5 replaces `test_option_rejects_served_geometries_other_than_g0`, whose `g1` case contradicts TXG-ENV-004, and `test_serving_bytes_above_released_fail_startup` replaces `test_serving_bytes_above_admission_fail_startup` (TXG-MEM-006); `test_release_frees_every_admission_owned_buffer` is TXG-MEM-017's only CPU test.
+- **Context-free reading.** Every criterion names `transaction_graph_populations` and its state in its own clause; cross-file concepts (g0, g1, served geometry, CHUNK-bucket binding on, eager, bitwise equal, configuration error, `endpoint_enabled`, `N()`, `rsv(·)`, `A`, `R`, `S`, resident reading, `Cs`/`Cw`/`Cp`/`Cn`/`Cx`, `ΔR`/`ΔA`/`ΔF`/`ΔX`, cached slack, unavailable, serving path, the fresh-start, repeated-engine and isolated-replay experiments) carry a parenthetical or the preamble definition.
 
 ## References
 
