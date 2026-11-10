@@ -18,6 +18,10 @@ steps:
   - vllm/utils/torch_utils.py
   - vllm/utils/torch_version.py
   - tests/plugins_tests/test_platform_plugins.py
+  # Endpoint plugin middleware runs inside core's (see test_endpoint_plugins.py)
+  - tests/plugins_tests/test_endpoint_plugins.py
+  - vllm/entrypoints/launchers/app.py
+  - vllm/entrypoints/serve/middleware/
   commands:
   # begin platform plugin and general plugin tests, all the code in-between runs on dummy platform
   - pip install -e ./plugins/vllm_add_dummy_platform

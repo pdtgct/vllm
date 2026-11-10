@@ -133,6 +133,12 @@ There is currently no rejection of route conflicts (tracked as a follow-up to RF
 - Namespace your routes under a distinct prefix, e.g. `/plugins/<plugin-name>/...`, rather than reusing `/v1/...` or other core prefixes
 - Only register routes under a core prefix (like the worked example's `/v1/admin/scheduler_config`) if you specifically intend to override or extend existing behavior and document that clearly for operators allowlisting your plugin
 
+## Middleware and authentication
+
+`attach_router` receives the app, so a plugin can also add ASGI middleware with `app.add_middleware(...)`. Such middleware can see requests to any route, core routes included, whenever core's outer middleware forwards them, so audit it like the plugin's routes (see [Endpoint Plugins security posture](../usage/security.md#endpoint-plugins)).
+
+`build_app()` runs plugin hooks after registering core's routers and before adding core's request middleware, such as CORS, authentication, request ID, scaling, WebSocket metrics, response logging and any `--middleware`. Starlette makes the last added middleware the outermost, so that core middleware wraps plugin middleware, and when `--api-key` (or `VLLM_API_KEY`) is set, core authenticates non-`OPTIONS` HTTP requests and WebSocket connections on guarded paths before plugin middleware sees them. Middleware that core routers add while they are registered, such as the Prometheus HTTP instrumentation, sits inside plugin middleware. Which paths `--api-key` guards is described in [API Key Authentication Limitations](../usage/security.md#api-key-authentication-limitations).
+
 ## Compatibility
 
 `state`/serving handler internals (e.g. the shape of in-tree `OpenAIServing*` classes) are not a stable public contract yet. Treat them as use-at-your-own-risk and expect them to change between vLLM versions. `FastAPI`, `EngineClient` and the `EndpointPlugin` protocol itself are the supported surface.

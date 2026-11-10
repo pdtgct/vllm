@@ -15,6 +15,8 @@ from typing import Any
 import httpx
 import pytest
 from fastapi import APIRouter, FastAPI
+from starlette.testclient import TestClient, WebSocketDenialResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 from vllm_add_dummy_endpoint_plugin import DummyAdminEndpointPlugin
 
 from vllm.entrypoints.common.cli_args import make_arg_parser
@@ -66,6 +68,43 @@ class _RouterEndpointPlugin(DummyAdminEndpointPlugin):
         app.include_router(self.router)
 
 
+class _WebSocketClaimMiddleware:
+    """Plugin ASGI middleware that serves one WebSocket path itself."""
+
+    def __init__(self, app: ASGIApp, path: str, calls: list[str]):
+        self.app = app
+        self.path = path
+        self.calls = calls
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "websocket" or scope["path"] != self.path:
+            await self.app(scope, receive, send)
+            return
+        self.calls.append(scope["path"])
+        await receive()
+        await send({"type": "websocket.accept"})
+        await send({"type": "websocket.send", "text": "claimed"})
+        await send({"type": "websocket.close", "code": 1000})
+
+
+class _AuthProbeEndpointPlugin:
+    name = "auth_probe_endpoint_plugin"
+    required_tasks = None
+
+    def __init__(self):
+        self.websocket_calls: list[str] = []
+
+    def attach_router(self, app: FastAPI) -> None:
+        app.add_middleware(
+            _WebSocketClaimMiddleware,
+            path="/v1/auth_probe/ws",
+            calls=self.websocket_calls,
+        )
+
+    async def init_state(self, engine_client, state, args) -> None:
+        pass
+
+
 class _FakeEngineClient:
     """Minimal stand in exercising `collective_rpc`. Not a real engine."""
 
@@ -92,6 +131,26 @@ def _fake_loader(factories: dict[str, Any]):
         return factories
 
     return _load_plugins_by_group
+
+
+_API_KEY = "test-key"
+_AUTH_HEADERS = {"Authorization": f"Bearer {_API_KEY}"}
+
+
+@pytest.fixture
+def auth_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[TestClient, _AuthProbeEndpointPlugin]:
+    """`build_app` with `--api-key` set and `_AuthProbeEndpointPlugin` loaded."""
+    args = _build_args()
+    args.api_key = [_API_KEY]
+    plugin = _AuthProbeEndpointPlugin()
+    monkeypatch.setenv("VLLM_PLUGINS", plugin.name)
+    monkeypatch.setattr(
+        "vllm.plugins.load_plugins_by_group",
+        _fake_loader({plugin.name: lambda: plugin}),
+    )
+    return TestClient(build_app(args, supported_tasks=())), plugin
 
 
 def test_dummy_plugin_satisfies_protocol():
@@ -392,3 +451,21 @@ async def test_endpoint_plugin_end_to_end(monkeypatch: pytest.MonkeyPatch):
     assert response.status_code == 200
     assert response.json() == {"scheduler_config": ["cfg-a", "cfg-b"]}
     assert fake_engine_client.rpc_calls == [("get_scheduler_config", (), {})]
+
+
+def test_api_key_wraps_plugin_middleware(auth_probe):
+    """Core authentication wraps middleware added in `attach_router`, so an
+    unauthenticated WebSocket never reaches the plugin's middleware."""
+    client, plugin = auth_probe
+
+    with (
+        pytest.raises(WebSocketDenialResponse) as exc_info,
+        client.websocket_connect("/v1/auth_probe/ws"),
+    ):
+        pass
+    assert exc_info.value.status_code == 401
+    assert plugin.websocket_calls == []
+
+    with client.websocket_connect("/v1/auth_probe/ws", headers=_AUTH_HEADERS) as ws:
+        assert ws.receive_text() == "claimed"
+    assert plugin.websocket_calls == ["/v1/auth_probe/ws"]
