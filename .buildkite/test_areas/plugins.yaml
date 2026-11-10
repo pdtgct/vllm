@@ -79,6 +79,9 @@ steps:
       - vllm/utils/torch_utils.py
       - vllm/utils/torch_version.py
       - tests/plugins_tests/test_platform_plugins.py
+      - tests/plugins_tests/test_endpoint_plugins.py
+      - vllm/entrypoints/launchers/app.py
+      - vllm/entrypoints/serve/middleware/
 
 
 # Disabled until the GGUF plugin installation is locked.
