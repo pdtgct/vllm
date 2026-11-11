@@ -790,8 +790,12 @@ def test_model_config_reports_declared_persistent_state(
 def test_persistent_state_async_scheduling_unset_resolves_off_with_one_warning(
     state_stub_models, dummy_state_model_path, caplog_vllm
 ):
+    """Unset async scheduling resolves off with one warning naming persistent
+    state; cudagraph_mode NONE is explicit so that M33 logs nothing here."""
     caplog_vllm.clear()
-    config = _state_config(dummy_state_model_path)
+    config = _state_config(
+        dummy_state_model_path, compilation_config={"cudagraph_mode": "NONE"}
+    )
     assert config.scheduler_config.async_scheduling is False
     assert len(_persistent_state_warnings(caplog_vllm)) == 1, caplog_vllm.text
 
@@ -833,10 +837,16 @@ def test_persistent_state_explicit_off_options_log_nothing(
 def test_persistent_state_extensible_kv_cache_unset_resolves_off(
     state_stub_models, dummy_state_model_path, caplog_vllm
 ):
+    """Unset, the extensible KV cache resolves off without a warning; the other
+    two options are explicit so that they log nothing here."""
     caplog_vllm.clear()
-    config = _state_config(dummy_state_model_path, async_scheduling=False)
+    config = _state_config(
+        dummy_state_model_path,
+        async_scheduling=False,
+        compilation_config={"cudagraph_mode": "NONE"},
+    )
     assert config.cache_config.enable_extensible_kv_cache is False
-    assert not any("extensible" in m for m in _persistent_state_warnings(caplog_vllm))
+    assert _persistent_state_warnings(caplog_vllm) == []
 
 
 # @spec M29
@@ -849,18 +859,25 @@ def test_persistent_state_extensible_kv_cache_requested_fails(
 
 
 # @spec M33
+@pytest.mark.parametrize("level", [0, 1, 2, 3])
 def test_persistent_state_cudagraph_mode_unset_resolves_none_with_one_warning(
-    state_stub_models, dummy_state_model_path, caplog_vllm
+    state_stub_models, dummy_state_model_path, caplog_vllm, level
 ):
+    """Unset cudagraph_mode resolves to NONE at every optimization level, with
+    one warning naming persistent state; async scheduling is explicitly off so
+    that M28 logs nothing here."""
     caplog_vllm.clear()
-    config = _state_config(dummy_state_model_path, async_scheduling=False)
+    config = _state_config(
+        dummy_state_model_path, async_scheduling=False, optimization_level=level
+    )
     assert config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
-    warnings = _persistent_state_warnings(caplog_vllm)
-    assert len([m for m in warnings if "CUDA graph" in m]) == 1, caplog_vllm.text
+    assert len(_persistent_state_warnings(caplog_vllm)) == 1, caplog_vllm.text
 
 
 # @spec M33
-@pytest.mark.parametrize("mode", ["FULL", "PIECEWISE", "FULL_AND_PIECEWISE"])
+@pytest.mark.parametrize(
+    "mode", ["FULL", "PIECEWISE", "FULL_AND_PIECEWISE", "FULL_DECODE_ONLY"]
+)
 def test_persistent_state_cudagraph_mode_requested_fails(
     state_stub_models, dummy_state_model_path, mode
 ):
@@ -880,6 +897,8 @@ def test_persistent_state_cudagraph_mode_requested_fails(
 def test_persistent_state_enforce_eager_takes_precedence_over_cudagraph_mode(
     state_stub_models, dummy_state_model_path, caplog_vllm
 ):
+    """enforce_eager gives NONE without a warning or an error, even with an
+    explicit mode."""
     caplog_vllm.clear()
     config = _state_config(
         dummy_state_model_path,
@@ -888,24 +907,12 @@ def test_persistent_state_enforce_eager_takes_precedence_over_cudagraph_mode(
         compilation_config={"cudagraph_mode": "FULL"},
     )
     assert config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
-    assert not any("CUDA graph" in m for m in _persistent_state_warnings(caplog_vllm))
+    assert _persistent_state_warnings(caplog_vllm) == []
 
 
-# @spec M7
-@pytest.mark.parametrize("override", [0, 1])
-def test_persistent_state_override_below_two_pages_fails_at_configuration(
-    state_stub_models, dummy_state_model_path, override
-):
-    """An override below two pages holds no slot; configuration refuses it,
-    before any engine allocates memory."""
-    with pytest.raises(ValueError, match="no slot"):
-        _state_config(
-            dummy_state_model_path,
-            async_scheduling=False,
-            num_gpu_blocks_override=override,
-        )
-
-
+# @spec M28
+# @spec M29
+# @spec M33
 def test_persistent_state_defaults_leave_other_models_alone(caplog_vllm):
     """A model without the declaration keeps its own defaults and no
     persistent-state warning is logged."""

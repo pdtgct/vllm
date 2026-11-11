@@ -21,9 +21,11 @@ from vllm.model_executor.models.registry import (
     _MULTIMODAL_MODELS,
     _SPECULATIVE_DECODING_MODELS,
     _TEXT_GENERATION_MODELS,
+    _VLLM_MODELS,
     ModelRegistry,
     _LazyRegisteredModel,
     _ModelRegistry,
+    _resolve_module_name,
 )
 from vllm.platforms import current_platform
 
@@ -295,16 +297,34 @@ class OutOfTreeStateModel(nn.Module):
 
 # @spec M31
 def test_registry_in_tree_models_have_no_persistent_state(monkeypatch, tmp_path):
-    """No in-tree architecture declares persistent state."""
+    """Every in-tree architecture reports `has_persistent_state` False. An
+    architecture that cannot be inspected here is accounted for only when its
+    class cannot be imported in this environment either."""
     monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path))
-    registry = _ModelRegistry(dict(ModelRegistry.models))
+    # The canonical in-tree table, not the process-wide registry plugins extend.
+    registry = _ModelRegistry(
+        {
+            arch: _LazyRegisteredModel(
+                module_name=_resolve_module_name(module), class_name=class_name
+            )
+            for arch, (module, class_name) in _VLLM_MODELS.items()
+        }
+    )
     registry.fill_model_info_cache()
-    declared = []
-    for model_arch in sorted(registry.get_supported_archs()):
-        model_info = registry._try_inspect_model_cls(model_arch)
-        if model_info is not None and model_info.has_persistent_state is not False:
-            declared.append(model_arch)
-    assert declared == []
+    results = {
+        arch: registry._try_inspect_model_cls(arch) for arch in sorted(_VLLM_MODELS)
+    }
+    uninspectable = sorted(arch for arch, info in results.items() if info is None)
+    assert [
+        arch for arch in uninspectable if registry._try_load_model_cls(arch) is not None
+    ] == []
+    declared = {
+        arch: info.has_persistent_state
+        for arch, info in results.items()
+        if info is not None and info.has_persistent_state is not False
+    }
+    assert declared == {}
+    assert len(results) == len(_VLLM_MODELS)
 
 
 def _out_of_tree_state_model(monkeypatch, tmp_path):

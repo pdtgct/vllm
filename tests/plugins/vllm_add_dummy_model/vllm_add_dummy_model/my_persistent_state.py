@@ -12,6 +12,10 @@ the output, which is what the regression, pause and cache-clear tests rely on.
 
 `hf_overrides` field `stub_page_mib` sets the state page size in MiB
 (default 1).
+
+`EVENTS` records, in order, the hook calls and forward passes of every stub
+built in this process, so an in-process engine test can tell how far startup
+got even when it fails.
 """
 
 from typing import Any
@@ -31,6 +35,10 @@ from vllm.v1.worker.gpu.model_states.interface import ModelState
 STATE_LAYER = "state"
 TOKENS_PER_TURN = 2
 MiB = 1 << 20
+
+# ("initialize_state_slots", is_profiling), ("prepare_step", dummy_run,
+# is_profile, slots_bound) and ("forward", dummy_run) records.
+EVENTS: list[tuple[Any, ...]] = []
 
 
 def expected_tokens(
@@ -58,14 +66,16 @@ class StubPersistentStateModelState(ModelState):
 
     def __init__(self, vllm_config, model, encoder_cache, device):
         super().__init__(vllm_config, model, encoder_cache, device)
-        self.events: list[tuple[Any, ...]] = []
         self._handles: dict[str, Any] = {}
 
     def initialize_state_slots(self, bindings) -> None:
         super().initialize_state_slots(bindings)
-        self.events.append(("initialize_state_slots", bindings.is_profiling))
+        EVENTS.append(("initialize_state_slots", bindings.is_profiling))
 
     def prepare_step(self, scheduler_output, *, dummy_run: bool, is_profile: bool):
+        EVENTS.append(
+            ("prepare_step", dummy_run, is_profile, self.state_slots is not None)
+        )
         self._handles = {} if dummy_run else (scheduler_output.state_slot_handles or {})
 
     def prepare_inputs(self, input_batch, req_states) -> dict[str, Any]:
@@ -83,7 +93,7 @@ class StubPersistentStateModelState(ModelState):
         }
 
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
-        return {}
+        return {"dummy_run": True}
 
     def prepare_inputs_embeds(self, scheduled_encoder_inputs, input_batch, req_states):
         return None
@@ -138,8 +148,10 @@ class StubPersistentStateForCausalLM(nn.Module):
         count_pool: torch.Tensor | None = None,
         query_start_loc: torch.Tensor | None = None,
         num_reqs: int = 0,
+        dummy_run: bool = False,
     ) -> torch.Tensor:
         assert input_ids is not None
+        EVENTS.append(("forward", dummy_run))
         hidden = torch.zeros(
             input_ids.shape[0], 8, dtype=torch.float32, device=input_ids.device
         )

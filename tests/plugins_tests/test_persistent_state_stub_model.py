@@ -8,6 +8,10 @@ dummy weights), whose output depends only on the state slot it is given and
 its inputs. The in-process engine core exposes the scheduler and the worker;
 `LLM` and `AsyncLLM` are the public entries. See
 docs/design/persistent_state.md for the criteria named in `@spec`.
+
+Each in-process engine test starts its own engine in a new process; behaviours
+that need the same stream state share one test where a second startup would
+only repeat the setup.
 """
 
 import asyncio
@@ -22,9 +26,11 @@ from vllm import LLM, SamplingParams
 from vllm.config import CUDAGraphMode
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.platforms import current_platform
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
+from vllm.v1.request import RequestStatus
 
 if not current_platform.is_cuda():
     pytest.skip(reason="runs engines on a CUDA device", allow_module_level=True)
@@ -34,6 +40,7 @@ STATE_LAYER = "state"
 FIRST_INPUT = [10, 20, 30]
 SECOND_INPUT = [40, 50]
 MAX_STEPS = 64
+TIMEOUT = 60
 RESET_REFUSAL = (
     "persistent state: {n} state slot(s) are held, and resetting running "
     "requests would end their streams. Abort the streams and wait until they "
@@ -43,6 +50,10 @@ PAUSE_REFUSAL = (
     "persistent state: {n} state slot(s) are held, and clearing the cache would "
     "end their streams. Pause with clear_cache=False; to clear the cache, abort "
     "the streams, wait until they have retired, then reset the prefix cache."
+)
+RETRY_REFUSAL = (
+    "persistent state: {n} state slot(s) are still retiring; retry the reset "
+    "once they have retired."
 )
 RELEASE_REFUSAL = (
     "persistent state: the KV cache holds per-stream state, so it cannot be "
@@ -90,21 +101,28 @@ def _model(core: EngineCore):
     return core.model_executor.driver_worker.worker.model_runner.model
 
 
-def _expected_turns(model) -> list[list[int]]:
+def _stub_events() -> list:
+    from vllm_add_dummy_model.my_persistent_state import EVENTS
+
+    return EVENTS
+
+
+def _expected_turns(vocab_size: int, eos_token_id: int) -> list[list[int]]:
     """The tokens the stub emits for FIRST_INPUT then SECOND_INPUT on one slot."""
     from vllm_add_dummy_model.my_persistent_state import expected_tokens
 
-    first = expected_tokens(0, FIRST_INPUT[-1], model.vocab_size, model.eos_token_id)
-    second = expected_tokens(
-        len(first), SECOND_INPUT[-1], model.vocab_size, model.eos_token_id
-    )
+    first = expected_tokens(0, FIRST_INPUT[-1], vocab_size, eos_token_id)
+    second = expected_tokens(len(first), SECOND_INPUT[-1], vocab_size, eos_token_id)
     return [first, second]
 
 
-# The LLM regression: default configuration, slots reused across prompts.
+def _mentions(message: str, number: int) -> bool:
+    return re.search(rf"(?<![\d.]){number}(?![\d.])", message) is not None
 
 
-# @spec F1
+# The LLM regression: the default configuration, slots reused across prompts.
+
+
 # @spec M5
 # @spec M17
 # @spec M28
@@ -114,9 +132,9 @@ def _expected_turns(model) -> list[list[int]]:
 def test_llm_generates_the_stub_tokens_on_reused_slots(dummy_state_model_path):
     """With max_num_seqs=2 and the persistent-state defaults left unset, six
     greedy prompts each produce the stub's tokens from a fresh counter: a slot
-    reused without its release fence or its initializer would change them.
-    The defaults resolve to synchronous scheduling, no extensible KV cache and
-    no runner CUDA graphs, and releasing the KV cache is refused."""
+    reused without its initializer would change them. The defaults resolve to
+    synchronous scheduling, no extensible KV cache and no runner CUDA graphs,
+    and releasing the KV cache is refused."""
     from vllm_add_dummy_model.my_persistent_state import expected_tokens
 
     llm = LLM(**_engine_kwargs(dummy_state_model_path))
@@ -139,7 +157,6 @@ def test_llm_generates_the_stub_tokens_on_reused_slots(dummy_state_model_path):
     with pytest.raises(RuntimeError) as refused:
         llm.release_kv_cache_memory()
     assert str(refused.value) == RELEASE_REFUSAL
-    assert "remote KV" not in str(refused.value)
 
 
 # Startup.
@@ -151,16 +168,31 @@ def test_engine_refuses_more_slots_than_the_fixed_budget_holds(
     dummy_state_model_path,
 ):
     """kv_cache_memory_bytes of three 1 MiB pages under max_num_seqs=4 (five
-    pages) fails startup, naming the largest max_num_seqs that fits."""
+    pages) fails startup; the message states the planned and fitting pages,
+    the page size and the largest max_num_seqs that fits."""
     with pytest.raises(ValueError) as rejected:
         _engine_core(
-            dummy_state_model_path,
-            max_num_seqs=4,
-            kv_cache_memory_bytes=3 * MiB,
+            dummy_state_model_path, max_num_seqs=4, kv_cache_memory_bytes=3 * MiB
         )
     message = str(rejected.value)
-    assert "5 pages" in message and "3 fit" in message, message
-    assert "largest max_num_seqs that fits is 2" in message, message
+    for figure in (5, 3, 2):
+        assert _mentions(message, figure), (figure, message)
+    assert "max_num_seqs" in message, message
+
+
+# @spec M7
+@create_new_process_for_each_test()
+def test_engine_refuses_an_override_below_two_pages_before_profiling(
+    dummy_state_model_path,
+):
+    """num_gpu_blocks_override=1 holds no slot: startup fails with a ValueError
+    saying so before memory profiling runs the model or any state pool is
+    bound."""
+    events = _stub_events()
+    events.clear()
+    with pytest.raises(ValueError, match="no slot"):
+        _engine_core(dummy_state_model_path, num_gpu_blocks_override=1)
+    assert [e for e in events if e[0] in ("forward", "initialize_state_slots")] == []
 
 
 # @spec M31
@@ -168,26 +200,50 @@ def test_engine_refuses_more_slots_than_the_fixed_budget_holds(
 def test_engine_refuses_an_undeclared_state_layer(dummy_undeclared_state_model_path):
     """A model that builds a persistent-state layer without declaring
     `supports_persistent_state` fails startup with a ValueError naming the
-    class attribute."""
+    class attribute, before memory profiling runs the model."""
+    events = _stub_events()
+    events.clear()
     with pytest.raises(ValueError, match="supports_persistent_state"):
         _engine_core(dummy_undeclared_state_model_path)
+    assert [e for e in events if e[0] == "forward"] == []
+
+
+# @spec model-hooks (prepare_step on runs before the slots are bound; the LLD
+# states this hook clause without a criterion ID)
+@create_new_process_for_each_test()
+def test_declared_model_gets_prepare_step_before_its_slots_are_bound(
+    dummy_state_model_path,
+):
+    """The profiling and dummy runs before the serving bindings exist call
+    `prepare_step` on a declared model, with no slots bound."""
+    events = _stub_events()
+    events.clear()
+    core = _engine_core(dummy_state_model_path)
+    try:
+        serving = events.index(("initialize_state_slots", False))
+        early = [e for e in events[:serving] if e[0] == "prepare_step"]
+        assert early, events
+        assert all(e[1] or e[2] for e in early), early
+        assert all(e[3] is False for e in early), early
+    finally:
+        core.shutdown()
 
 
 # A resumable stream through the in-process engine core (M17).
 
 
-def _params(core: EngineCore) -> SamplingParams:
-    params = SamplingParams(max_tokens=8, temperature=0)
+def _params(core: EngineCore, **kwargs) -> SamplingParams:
+    params = SamplingParams(temperature=0, **{"max_tokens": 8, **kwargs})
     params.update_from_generation_config({}, _model(core).eos_token_id)
     return params
 
 
-def _feed(core, request_id, tokens, resumable=True):
+def _feed(core, request_id, tokens, resumable=True, **params):
     request = EngineCoreRequest(
         request_id=request_id,
         prompt_token_ids=list(tokens),
         mm_features=None,
-        sampling_params=_params(core),
+        sampling_params=_params(core, **params),
         pooling_params=None,
         arrival_time=time.time(),
         lora_request=None,
@@ -213,100 +269,155 @@ def _run_turn(core, request_id) -> list[int]:
     raise AssertionError(f"{request_id} did not end its turn in {MAX_STEPS} steps")
 
 
-def _step_until_retired(core, request_id):
-    for _ in range(MAX_STEPS):
-        if not any(
-            r.request_id == request_id for r in core.scheduler.state_retirements
-        ):
-            return
-        core.step_fn()
-    raise AssertionError(f"{request_id} did not retire in {MAX_STEPS} steps")
+def _retiring(core) -> list[str]:
+    return [r.request_id for r in core.scheduler.state_retirements]
+
+
+def _manager(core):
+    return core.scheduler.kv_cache_manager.coordinator.state_managers[STATE_LAYER]
 
 
 def _snapshot(core):
     """Everything a refused clear must leave as it is."""
     scheduler = core.scheduler
-    manager = scheduler.kv_cache_manager.coordinator.state_managers[STATE_LAYER]
+    manager = _manager(core)
     return (
         {rid: manager.get(rid) for rid in scheduler.requests},
         manager.num_free_slots,
         {rid: request.status for rid, request in scheduler.requests.items()},
         [request.request_id for request in scheduler.running],
-        len(scheduler.state_retirements),
+        _retiring(core),
         scheduler.pause_state,
     )
 
 
-def _stream_both_turns(core, request_id, between_turns=None) -> list[list[int]]:
+def _park(core, request_id="stream"):
     _feed(core, request_id, FIRST_INPUT)
-    first = _run_turn(core, request_id)
-    if between_turns is not None:
-        between_turns()
-    _feed(core, request_id, SECOND_INPUT)
-    second = _run_turn(core, request_id)
+    turn = _run_turn(core, request_id)
+    assert core.scheduler.requests[request_id].status == (
+        RequestStatus.WAITING_FOR_STREAMING_REQ
+    )
+    return turn
+
+
+def _bind(core, request_id="stream"):
+    """One step of a turn: the request is running and its slot is bound."""
+    _feed(core, request_id, FIRST_INPUT)
+    core.step_fn()
+    assert core.scheduler.requests[request_id].status == RequestStatus.RUNNING
+    assert _manager(core).get(request_id) is not None
+
+
+def _retire(core, request_id="ended"):
+    """End a parked stream; its slot is retiring until its fence is acked."""
+    _park(core, request_id)
     core.abort_requests([request_id])
-    _step_until_retired(core, request_id)
-    return [first, second]
-
-
-def _park(core, request_id):
-    _feed(core, request_id, FIRST_INPUT)
-    _run_turn(core, request_id)
+    assert _retiring(core) == [request_id]
 
 
 # @spec M17
 @create_new_process_for_each_test()
-def test_in_process_parked_stream_refusals_and_keep_pause(dummy_state_model_path):
-    """While a stream is parked, a keep pause that clears the cache, a reset
-    of running requests and a release are refused with the exact messages
-    before anything changes; a keep pause without a clear is taken and the
-    stream then continues with the tokens of an unpaused stream."""
+@pytest.mark.parametrize("held", ["parked", "bound"])
+def test_in_process_keep_pause_clearing_the_cache_refused(dummy_state_model_path, held):
+    """A keep pause that clears the cache is refused with the exact message
+    while a slot is parked or bound, before anything changes."""
     core = _engine_core(dummy_state_model_path)
     try:
-        reference = _stream_both_turns(core, "reference")
-        assert reference == _expected_turns(_model(core))
-
-        def pause_and_resume():
-            before = _snapshot(core)
-            with pytest.raises(RuntimeError) as refused:
-                core.pause_scheduler(mode="keep", clear_cache=True)
-            assert str(refused.value) == PAUSE_REFUSAL.format(n=1)
-            assert _snapshot(core) == before
-            with pytest.raises(RuntimeError) as refused:
-                core.reset_prefix_cache(reset_running_requests=True)
-            assert str(refused.value) == RESET_REFUSAL.format(n=1)
-            assert _snapshot(core) == before
-            with pytest.raises(RuntimeError) as refused:
-                core.release_kv_cache_memory()
-            assert str(refused.value) == RELEASE_REFUSAL
-            assert _snapshot(core) == before
-            assert core.pause_scheduler(mode="keep", clear_cache=False) is None
-            core.resume_scheduler()
-            assert _snapshot(core) == before
-
-        assert _stream_both_turns(core, "paused", pause_and_resume) == reference
+        if held == "parked":
+            _park(core)
+        else:
+            _bind(core)
+        before = _snapshot(core)
+        with pytest.raises(RuntimeError) as refused:
+            core.pause_scheduler(mode="keep", clear_cache=True)
+        assert str(refused.value) == PAUSE_REFUSAL.format(n=1)
+        assert _snapshot(core) == before
     finally:
         core.shutdown()
 
 
 # @spec M17
 @create_new_process_for_each_test()
-def test_in_process_abort_pause_drains_and_clears(dummy_state_model_path):
-    """The default abort pause ends a parked stream, steps the engine until
-    its slot has retired and clears the cache; a new stream then starts from
-    the initializer."""
+def test_in_process_reset_of_running_requests_refused_while_parked(
+    dummy_state_model_path,
+):
     core = _engine_core(dummy_state_model_path)
     try:
-        _park(core, "aborted")
-        assert core.pause_scheduler() is None
-        assert "aborted" not in core.scheduler.requests
-        assert not core.scheduler.state_retirements
-        manager = core.scheduler.kv_cache_manager.coordinator.state_managers[
-            STATE_LAYER
-        ]
-        assert manager.num_free_slots == 2
+        _park(core)
+        before = _snapshot(core)
+        with pytest.raises(RuntimeError) as refused:
+            core.reset_prefix_cache(reset_running_requests=True)
+        assert str(refused.value) == RESET_REFUSAL.format(n=1)
+        assert _snapshot(core) == before
+    finally:
+        core.shutdown()
+
+
+# @spec M17
+@create_new_process_for_each_test()
+@pytest.mark.parametrize("state", ["parked", "paused-without-slots"])
+def test_in_process_release_refused(dummy_state_model_path, state):
+    """Releasing the KV cache is refused before its pause check, while a stream
+    is parked and also once a completed pause has left no slot held."""
+    core = _engine_core(dummy_state_model_path)
+    try:
+        _park(core)
+        if state == "paused-without-slots":
+            assert core.pause_scheduler() is None
+            assert _manager(core).num_free_slots == 2
+        before = _snapshot(core)
+        with pytest.raises(RuntimeError) as refused:
+            core.release_kv_cache_memory()
+        assert str(refused.value) == RELEASE_REFUSAL
+        assert _snapshot(core) == before
+    finally:
+        core.shutdown()
+
+
+# @spec M17
+@create_new_process_for_each_test()
+def test_in_process_keep_pause_without_clear_preserves_the_stream(
+    dummy_state_model_path,
+):
+    """A stream parked across a keep pause without a cache clear resumes under
+    the same handle with the tokens of an unpaused stream."""
+    core = _engine_core(dummy_state_model_path)
+    try:
+        model = _model(core)
+        first = _park(core)
+        handle = _manager(core).get("stream")
+        assert core.pause_scheduler(mode="keep", clear_cache=False) is None
         core.resume_scheduler()
-        assert _stream_both_turns(core, "next") == _expected_turns(_model(core))
+        assert _manager(core).get("stream") == handle
+        _feed(core, "stream", SECOND_INPUT)
+        second = _run_turn(core, "stream")
+        assert [first, second] == _expected_turns(model.vocab_size, model.eos_token_id)
+    finally:
+        core.shutdown()
+
+
+# @spec M17
+@create_new_process_for_each_test()
+@pytest.mark.parametrize("reset_connector", [True, False])
+def test_in_process_abort_pause_drains_and_clears(
+    dummy_state_model_path, reset_connector
+):
+    """The default abort pause, whatever reset_connector is, ends a parked
+    stream, steps the engine until its slot has retired and clears the cache;
+    a new stream then starts from the initializer."""
+    core = _engine_core(dummy_state_model_path)
+    try:
+        model = _model(core)
+        _park(core, "aborted")
+        assert core.pause_scheduler(reset_connector=reset_connector) is None
+        assert "aborted" not in core.scheduler.requests
+        assert _retiring(core) == []
+        assert _manager(core).num_free_slots == 2
+        core.resume_scheduler()
+        first = _park(core, "next")
+        _feed(core, "next", SECOND_INPUT)
+        second = _run_turn(core, "next")
+        assert [first, second] == _expected_turns(model.vocab_size, model.eos_token_id)
     finally:
         core.shutdown()
 
@@ -321,35 +432,73 @@ def test_in_process_reset_drains_retiring_slots(
     reset steps the engine until no slot is retiring and then resets."""
     core = _engine_core(dummy_state_model_path)
     try:
-        _park(core, "ended")
-        core.abort_requests(["ended"])
-        assert core.scheduler.state_retirements
+        _retire(core)
         assert core.reset_prefix_cache(reset_running_requests=reset_running_requests)
-        assert not core.scheduler.state_retirements
+        assert _retiring(core) == []
+        assert _manager(core).num_free_slots == 2
     finally:
         core.shutdown()
 
 
 # @spec M17
 @create_new_process_for_each_test()
-def test_in_process_reset_with_a_queued_request_asks_for_a_retry(
-    dummy_state_model_path,
+@pytest.mark.parametrize("reset_running_requests", [True, False])
+def test_in_process_reset_with_a_queued_request_does_not_step(
+    dummy_state_model_path, reset_running_requests
 ):
-    """With a slot retiring and a request queued, the in-process reset raises
-    the retry message without stepping."""
+    """With a slot retiring and a request queued, the in-process reset of
+    running requests raises the retry message, and the reset without them
+    returns False; neither steps the engine or changes anything."""
     core = _engine_core(dummy_state_model_path)
     try:
-        _park(core, "ended")
-        core.abort_requests(["ended"])
+        _retire(core)
+        _feed(core, "queued", FIRST_INPUT, resumable=False)
+        before = _snapshot(core)
+        if reset_running_requests:
+            with pytest.raises(RuntimeError) as refused:
+                core.reset_prefix_cache(reset_running_requests=True)
+            assert str(refused.value) == RETRY_REFUSAL.format(n=1)
+        else:
+            assert core.reset_prefix_cache(reset_running_requests=False) is False
+        assert _snapshot(core) == before
+    finally:
+        core.shutdown()
+
+
+# @spec M17
+@create_new_process_for_each_test()
+def test_in_process_clearing_keep_pause_with_a_queued_request_asks_for_a_retry(
+    dummy_state_model_path,
+):
+    """With a slot retiring and a request queued, a keep pause that clears the
+    cache raises the retry message before any change."""
+    core = _engine_core(dummy_state_model_path)
+    try:
+        _retire(core)
         _feed(core, "queued", FIRST_INPUT, resumable=False)
         before = _snapshot(core)
         with pytest.raises(RuntimeError) as refused:
-            core.reset_prefix_cache(reset_running_requests=True)
-        assert str(refused.value) == (
-            "persistent state: 1 state slot(s) are still retiring; retry the "
-            "reset once they have retired."
-        )
+            core.pause_scheduler(mode="keep", clear_cache=True)
+        assert str(refused.value) == RETRY_REFUSAL.format(n=1)
         assert _snapshot(core) == before
+    finally:
+        core.shutdown()
+
+
+# @spec M17
+@create_new_process_for_each_test()
+def test_in_process_clearing_keep_pause_with_only_retiring_slots_drains(
+    dummy_state_model_path,
+):
+    """With only a retiring slot, a keep pause that clears the cache steps the
+    engine until the slot has retired, then completes."""
+    core = _engine_core(dummy_state_model_path)
+    try:
+        _retire(core)
+        assert core.pause_scheduler(mode="keep", clear_cache=True) is None
+        assert _retiring(core) == []
+        assert _manager(core).num_free_slots == 2
+        assert core.scheduler.pause_state == PauseState.PAUSED_ALL
     finally:
         core.shutdown()
 
@@ -357,89 +506,229 @@ def test_in_process_reset_with_a_queued_request_asks_for_a_retry(
 # The multiprocess engine through AsyncLLM (M17).
 
 
-@pytest.mark.asyncio
-async def test_async_llm_parked_stream_across_pauses(
-    dummy_state_model_path, monkeypatch
-):
-    """While a stream is parked, keep and wait pauses that clear the cache and
-    a reset of running requests are refused; a keep pause without a clear
-    preserves the stream. After the stream ends, keep and wait pauses that
-    clear the cache complete once its slot has retired, and a new stream then
-    starts from the initializer."""
-    from vllm_add_dummy_model.my_persistent_state import expected_tokens
-
-    from vllm.engine.protocol import StreamingInput
-    from vllm.inputs import TokensPrompt
-    from vllm.sampling_params import RequestOutputKind
+def _async_llm(path, monkeypatch):
     from vllm.v1.engine.async_llm import AsyncLLM
 
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
-    args = AsyncEngineArgs(
-        **_engine_kwargs(dummy_state_model_path, **RESOLVED_DEFAULTS)
+    return AsyncLLM.from_engine_args(
+        AsyncEngineArgs(**_engine_kwargs(path, **RESOLVED_DEFAULTS))
     )
-    llm = AsyncLLM.from_engine_args(args)
-    try:
-        hf = llm.model_config.hf_config
-        vocab, eos = llm.model_config.get_vocab_size(), int(hf.eos_token_id)
-        first = expected_tokens(0, FIRST_INPUT[-1], vocab, eos)
-        second = expected_tokens(len(first), SECOND_INPUT[-1], vocab, eos)
-        params = SamplingParams(
+
+
+class _Stream:
+    """One streaming-input request: FIRST_INPUT, then SECOND_INPUT once
+    `release()` is called; `parked` is set when the first turn ends."""
+
+    def __init__(self, llm, request_id):
+        from vllm.sampling_params import RequestOutputKind
+
+        self.llm = llm
+        self.request_id = request_id
+        self.gate = asyncio.Event()
+        self.parked = asyncio.Event()
+        self.params = SamplingParams(
             max_tokens=8, temperature=0, output_kind=RequestOutputKind.DELTA
         )
+        self.task = asyncio.create_task(self._run())
 
-        async def stream(request_id, gate: asyncio.Event, parked: asyncio.Event):
-            async def inputs():
-                yield StreamingInput(prompt=TokensPrompt(prompt_token_ids=FIRST_INPUT))
-                await gate.wait()
-                yield StreamingInput(prompt=TokensPrompt(prompt_token_ids=SECOND_INPUT))
+    async def _inputs(self):
+        from vllm.engine.protocol import StreamingInput
+        from vllm.inputs import TokensPrompt
 
-            turns: list[list[int]] = [[]]
-            async for output in llm.generate(inputs(), params, request_id):
-                completion = output.outputs[0]
-                turns[-1].extend(completion.token_ids)
-                if completion.finish_reason is not None and not output.finished:
-                    turns.append([])
-                    parked.set()
-            return [turn for turn in turns if turn]
+        yield StreamingInput(prompt=TokensPrompt(prompt_token_ids=FIRST_INPUT))
+        await self.gate.wait()
+        yield StreamingInput(prompt=TokensPrompt(prompt_token_ids=SECOND_INPUT))
 
-        async def run(request_id, while_parked):
-            gate, parked = asyncio.Event(), asyncio.Event()
-            task = asyncio.create_task(stream(request_id, gate, parked))
-            await asyncio.wait_for(parked.wait(), 60)
-            await while_parked()
-            gate.set()
-            return await asyncio.wait_for(task, 60)
+    async def _run(self):
+        turns: list[list[int]] = [[]]
+        final = None
+        async for output in self.llm.generate(
+            self._inputs(), self.params, self.request_id
+        ):
+            completion = output.outputs[0]
+            turns[-1].extend(completion.token_ids)
+            if completion.finish_reason is not None and not output.finished:
+                turns.append([])
+                self.parked.set()
+            if output.finished:
+                final = completion.finish_reason
+        return [turn for turn in turns if turn], final
 
-        async def nothing():
-            return None
+    async def wait_parked(self):
+        await asyncio.wait_for(self.parked.wait(), TIMEOUT)
 
-        assert (await run("reference", nothing))[:2] == [first, second]
+    async def finish(self):
+        self.gate.set()
+        return await asyncio.wait_for(self.task, TIMEOUT)
 
-        async def refused_then_kept():
-            pause_refusal = re.escape(PAUSE_REFUSAL.format(n=1))
-            for mode in ("keep", "wait"):
-                with pytest.raises(Exception, match=pause_refusal):
-                    await llm.pause_generation(mode=mode, clear_cache=True)
-            with pytest.raises(Exception, match=re.escape(RESET_REFUSAL.format(n=1))):
-                await llm.reset_prefix_cache(reset_running_requests=True)
-            await llm.pause_generation(mode="keep", clear_cache=False)
-            await llm.resume_generation()
 
-        assert (await run("paused", refused_then_kept))[:2] == [first, second]
+def _llm_expected_turns(llm) -> list[list[int]]:
+    hf = llm.model_config.hf_config
+    return _expected_turns(llm.model_config.get_vocab_size(), int(hf.eos_token_id))
 
-        # Only retiring slots: a clearing pause completes once they retire,
-        # including a keep pause whose finish waits for the engine to idle.
+
+# @spec M17
+@pytest.mark.asyncio
+async def test_async_llm_clearing_pauses_and_reset_refused_while_parked(
+    dummy_state_model_path, monkeypatch
+):
+    """While a stream is parked, keep and wait pauses that clear the cache and
+    a reset of running requests are refused with the exact messages; the
+    stream then continues with the tokens of an unrefused one."""
+    llm = _async_llm(dummy_state_model_path, monkeypatch)
+    try:
+        stream = _Stream(llm, "parked")
+        await stream.wait_parked()
         for mode in ("keep", "wait"):
-            gate, parked = asyncio.Event(), asyncio.Event()
-            task = asyncio.create_task(stream(f"ended-{mode}", gate, parked))
-            await asyncio.wait_for(parked.wait(), 60)
-            await llm.abort(f"ended-{mode}")
+            with pytest.raises(Exception, match=re.escape(PAUSE_REFUSAL.format(n=1))):
+                await asyncio.wait_for(
+                    llm.pause_generation(mode=mode, clear_cache=True), TIMEOUT
+                )
+        with pytest.raises(Exception, match=re.escape(RESET_REFUSAL.format(n=1))):
             await asyncio.wait_for(
-                llm.pause_generation(mode=mode, clear_cache=True), 60
+                llm.reset_prefix_cache(reset_running_requests=True), TIMEOUT
             )
-            await llm.resume_generation()
-            task.cancel()
-            assert (await run(f"after-{mode}", nothing))[:2] == [first, second]
+        turns, _ = await stream.finish()
+        assert turns == _llm_expected_turns(llm)
+    finally:
+        llm.shutdown()
+
+
+# @spec M17
+@pytest.mark.asyncio
+async def test_async_llm_keep_pause_without_clear_preserves_the_stream(
+    dummy_state_model_path, monkeypatch
+):
+    llm = _async_llm(dummy_state_model_path, monkeypatch)
+    try:
+        stream = _Stream(llm, "paused")
+        await stream.wait_parked()
+        await asyncio.wait_for(
+            llm.pause_generation(mode="keep", clear_cache=False), TIMEOUT
+        )
+        await asyncio.wait_for(llm.resume_generation(), TIMEOUT)
+        turns, _ = await stream.finish()
+        assert turns == _llm_expected_turns(llm)
+    finally:
+        llm.shutdown()
+
+
+# @spec M17
+@pytest.mark.asyncio
+async def test_async_llm_clearing_pauses_refused_while_a_slot_is_bound(
+    dummy_state_model_path, monkeypatch
+):
+    """A request held mid-generation by a keep pause without a clear has a
+    bound slot; keep and wait pauses that clear the cache are then refused,
+    and the request completes after the resume."""
+    llm = _async_llm(dummy_state_model_path, monkeypatch)
+    try:
+        params = SamplingParams(max_tokens=50, temperature=0, ignore_eos=True)
+        started, finished = asyncio.Event(), asyncio.Event()
+
+        async def generate():
+            tokens = []
+            async for output in llm.generate(
+                {"prompt_token_ids": FIRST_INPUT}, params, "bound"
+            ):
+                tokens = output.outputs[0].token_ids
+                started.set()
+            finished.set()
+            return tokens
+
+        task = asyncio.create_task(generate())
+        await asyncio.wait_for(started.wait(), TIMEOUT)
+        await asyncio.wait_for(
+            llm.pause_generation(mode="keep", clear_cache=False), TIMEOUT
+        )
+        # Precondition: the request is still running, so its slot is bound.
+        assert not finished.is_set()
+        for mode in ("keep", "wait"):
+            with pytest.raises(Exception, match=re.escape(PAUSE_REFUSAL.format(n=1))):
+                await asyncio.wait_for(
+                    llm.pause_generation(mode=mode, clear_cache=True), TIMEOUT
+                )
+        await asyncio.wait_for(llm.resume_generation(), TIMEOUT)
+        assert len(await asyncio.wait_for(task, TIMEOUT)) == 50
+    finally:
+        llm.shutdown()
+
+
+# @spec M17
+@pytest.mark.asyncio
+async def test_async_llm_abort_pause_drains_a_parked_stream(
+    dummy_state_model_path, monkeypatch
+):
+    """The default abort pause ends a parked stream with an abort, completes
+    once its slot has retired, and a new stream then starts from the
+    initializer."""
+    llm = _async_llm(dummy_state_model_path, monkeypatch)
+    try:
+        stream = _Stream(llm, "aborted")
+        await stream.wait_parked()
+        await asyncio.wait_for(llm.pause_generation(), TIMEOUT)
+        turns, final = await asyncio.wait_for(stream.task, TIMEOUT)
+        assert final == "abort"
+        await asyncio.wait_for(llm.resume_generation(), TIMEOUT)
+        after = _Stream(llm, "after")
+        await after.wait_parked()
+        assert (await after.finish())[0] == _llm_expected_turns(llm)
+    finally:
+        llm.shutdown()
+
+
+# @spec M17
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["keep", "wait"])
+async def test_async_llm_clearing_pause_with_only_retiring_slots_completes(
+    dummy_state_model_path, monkeypatch, mode
+):
+    """After a parked stream is aborted, a pause that clears the cache
+    completes (once its slot has retired) and a new stream starts from the
+    initializer. Whether the pause arrives before or after the retirement is
+    not controlled; the LLD's deferred re-check has no public path without
+    stream admission and is not claimed here."""
+    llm = _async_llm(dummy_state_model_path, monkeypatch)
+    try:
+        stream = _Stream(llm, "ended")
+        await stream.wait_parked()
+        await asyncio.wait_for(llm.abort("ended"), TIMEOUT)
+        await asyncio.wait_for(
+            llm.pause_generation(mode=mode, clear_cache=True), TIMEOUT
+        )
+        await asyncio.wait_for(llm.resume_generation(), TIMEOUT)
+        # The abort ended the stream.
+        assert (await asyncio.wait_for(stream.task, TIMEOUT))[1] == "abort"
+        after = _Stream(llm, "after")
+        await after.wait_parked()
+        assert (await after.finish())[0] == _llm_expected_turns(llm)
+    finally:
+        llm.shutdown()
+
+
+# @spec C3
+@pytest.mark.asyncio
+async def test_async_llm_refuses_stop_strings_on_streaming_input(
+    dummy_state_model_path, monkeypatch
+):
+    """A stop string is evaluated by the frontend, not the engine core, and
+    the frontend refuses it on streaming input; so no resumable stream can
+    stop on one and park."""
+    from vllm.engine.protocol import StreamingInput
+    from vllm.exceptions import VLLMValidationError
+    from vllm.inputs import TokensPrompt
+
+    llm = _async_llm(dummy_state_model_path, monkeypatch)
+    try:
+
+        async def inputs():
+            yield StreamingInput(prompt=TokensPrompt(prompt_token_ids=FIRST_INPUT))
+
+        with pytest.raises(VLLMValidationError, match="stop strings"):
+            async for _ in llm.generate(
+                inputs(), SamplingParams(max_tokens=8, stop=["x"]), "stop"
+            ):
+                pass
     finally:
         llm.shutdown()
 
@@ -449,9 +738,10 @@ async def test_async_llm_parked_stream_across_pauses(
 
 # @spec F3
 def test_completion_waits_for_a_registered_writing_stream():
-    """A write enqueued on a registered auxiliary stream after a delay is
-    complete by the time the step's completion is collected: the worker joins
-    every registered stream into the main stream before recording the event."""
+    """A write enqueued on a registered auxiliary stream is still pending when
+    the step is fenced and its completion collected, and is complete once the
+    completion is delivered: the worker joins every registered stream into
+    the main stream before recording the event."""
     from tests.v1.core.utils import create_state_spec
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheGroupSpec, StateSlotHandle
@@ -477,10 +767,13 @@ def test_completion_waits_for_a_registered_writing_stream():
     count = rows.component_pools["count"]
     written = torch.cuda.Event()
     with torch.cuda.stream(aux):
-        torch.cuda._sleep(200_000_000)
+        torch.cuda._sleep(1_000_000_000)
         count[1].fill_(7)
         written.record(aux)
     completion = bindings.finish_step(ModelRunnerOutput(req_ids=["r"]), main)
+    # Precondition: the write is still pending when the step is fenced; a
+    # host slow enough to see it complete makes this test fail, not pass.
+    assert not written.query()
     output = completion.get_output()
     assert written.query()
     assert output.state_completion.handles == {"r": {STATE_LAYER: handle}}

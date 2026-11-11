@@ -9048,7 +9048,9 @@ def _state_output(step, *, sampled=42, acknowledge=True):
     )
 
 
-def _stream_input(request_id="stream", tokens=(1, 2, 3), mm_features=None, **params):
+def _stream_input(
+    request_id="stream", tokens=(1, 2, 3), mm_features=None, client_index=0, **params
+):
     """One input of an ordinary (never admitted) resumable request."""
     sampling_params = SamplingParams(max_tokens=params.pop("max_tokens", 4), **params)
     sampling_params.update_from_generation_config({}, EOS_TOKEN_ID)
@@ -9058,6 +9060,7 @@ def _stream_input(request_id="stream", tokens=(1, 2, 3), mm_features=None, **par
         sampling_params=sampling_params,
         pooling_params=None,
         mm_features=mm_features,
+        client_index=client_index,
         resumable=True,
     )
 
@@ -9090,6 +9093,7 @@ def _scheduler_classes():
     }
 
 
+# @spec C1
 @pytest.mark.parametrize("kind", ["default", "custom", "plain", "diffusion", "async"])
 def test_state_layout_selects_state_scheduler(kind):
     """A persistent-state layout selects StateScheduler, or a configured
@@ -9110,6 +9114,7 @@ def test_state_layout_selects_state_scheduler(kind):
         )
 
 
+# @spec C1
 def test_attention_layout_keeps_configured_scheduler():
     from vllm.v1.core.sched.state_scheduler import StateScheduler, get_scheduler_cls
 
@@ -9176,8 +9181,10 @@ def test_state_stop_retires_slot_until_cleanup_is_acknowledged():
 
 # @spec F2
 def test_state_slot_never_scheduled_releases_at_once():
-    """A slot whose request was never scheduled returns to the pool at once,
-    with no cleanup step."""
+    """Slot-manager unit test: a slot whose request was never scheduled
+    returns to the pool at once, with no cleanup step. Without stream
+    admission every slot is allocated by a schedule, so this property has no
+    public path in PR A; the slot is allocated through the manager."""
     scheduler = _state_scheduler()
     manager = _state_manager(scheduler)
     (request,) = create_requests(num_requests=1, num_tokens=4)
@@ -9391,6 +9398,7 @@ def test_state_missing_acknowledgments_quarantine_only_their_slots():
 # input replaces the prompt.
 
 
+# @spec C3
 def test_state_stream_parks_at_eos_and_keeps_its_slot():
     """A resumable request whose turn stops on EOS parks under the same handle;
     only its end retires the slot."""
@@ -9411,6 +9419,7 @@ def test_state_stream_parks_at_eos_and_keeps_its_slot():
     assert manager.num_free_slots == 2
 
 
+# @spec C4
 @pytest.mark.parametrize("queued", [False, True])
 def test_state_stream_continuation_replaces_the_prompt(queued):
     """The next input of a parked stream, sent before or after the park,
@@ -9437,6 +9446,7 @@ def test_state_stream_continuation_replaces_the_prompt(queued):
     assert scheduler.schedule().num_scheduled_tokens == {"stream": 3}
 
 
+# @spec C3
 @pytest.mark.parametrize("stop", ["stop_token", "length"])
 @pytest.mark.parametrize("queued", [False, True])
 def test_state_stream_other_stops_end_the_stream(stop, queued):
@@ -9505,8 +9515,7 @@ def test_state_stream_misplaced_multimodal_continuation_ends_the_request(
     and the error reaches the client in the next output."""
     scheduler = _state_scheduler()
     manager = _state_manager(scheduler)
-    request = _stream_input()
-    request.client_index = 3
+    request = _stream_input(client_index=3)
     scheduler.add_request(request)
     step = scheduler.schedule()
     handle = manager.get("stream")
@@ -9535,7 +9544,6 @@ def test_state_stream_misplaced_multimodal_continuation_ends_the_request(
 
 
 # @spec M32
-# @spec F2
 @_MISPLACED_MM
 def test_state_stream_misplaced_continuation_before_first_schedule(offset, length):
     """A continuation queued before the request was ever scheduled ends it with
@@ -9620,9 +9628,10 @@ def test_reset_running_requests_refused_while_a_slot_is_held(kind):
 def test_reset_running_requests_counts_bound_and_parked_slots():
     """The refusal counts every bound and parked slot, not retiring ones."""
     scheduler = _state_scheduler(max_num_seqs=3)
-    _hold_slot(scheduler, "retiring", "retiring")
     _hold_slot(scheduler, "parked", "parked")
+    _hold_slot(scheduler, "retiring", "retiring")
     _hold_slot(scheduler, "bound", "bound")
+    assert [r.request_id for r in scheduler.state_retirements] == ["retiring"]
     before = _slot_state(scheduler)
     with pytest.raises(RuntimeError) as refused:
         scheduler.reset_prefix_cache(reset_running_requests=True)

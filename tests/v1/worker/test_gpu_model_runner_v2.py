@@ -598,3 +598,89 @@ def test_standalone_draft_kv_dtype_override(
     )
     assert target.kernel_config.moe_backend == "flashinfer_cutlass"
     assert target.attention_config.backend == AttentionBackendEnum.FLASHINFER
+
+
+# Persistent-state bindings on the worker. See docs/design/persistent_state.md
+# for the criteria named in `@spec`. The pool is a CPU tensor and the main
+# stream a CPU stream: no writing stream is registered, so no device
+# synchronization is involved before `finish_step`, which is not called here.
+
+
+def _state_bindings():
+    from tests.v1.core.utils import create_state_spec
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec
+    from vllm.v1.worker.gpu.state_slots import StateSlotBindings
+
+    spec = create_state_spec()
+    pool = torch.zeros(3 * spec.page_size_bytes, dtype=torch.uint8)
+    return StateSlotBindings([KVCacheGroupSpec(["state"], spec)], {"state": pool})
+
+
+def _begin_state_step(bindings, step_seq, handles):
+    """Begin a scheduled step that binds `handles` ({request_id: handle})."""
+    step = SchedulerOutput.make_empty()
+    step.state_step_seq = step_seq
+    step.state_slot_handles = {rid: {"state": h} for rid, h in handles.items()}
+    step.state_cleanup_handles = {}
+    bindings.begin_step(step, torch.Stream(device="cpu"))
+    bindings.activate_requests()
+
+
+def _handle(epoch="epoch", slot=1, generation=1):
+    from vllm.v1.kv_cache_interface import StateSlotHandle
+
+    return StateSlotHandle(epoch, slot, generation)
+
+
+# @spec M5
+def test_state_first_bind_initializes_and_rebind_keeps_the_page():
+    """The first bind of a generation writes the descriptors' initial values;
+    binding the same handle again leaves what the model wrote."""
+    bindings = _state_bindings()
+    handle = _handle()
+    _begin_state_step(bindings, 1, {"r": handle})
+    rows = bindings.bind_rows("state", ("r",), (handle,))
+    hidden = rows.component_pools["hidden"]
+    assert hidden[1].tolist() == [1.0] * 4
+    hidden[1].fill_(5.0)
+    _begin_state_step(bindings, 2, {"r": handle})
+    assert hidden[1].tolist() == [5.0] * 4
+    _begin_state_step(bindings, 3, {"s": _handle(generation=2)})
+    assert hidden[1].tolist() == [1.0] * 4
+
+
+# @spec C5
+@pytest.mark.parametrize(
+    ("first", "second", "match"),
+    [
+        (_handle(epoch="a"), _handle(epoch="b"), "epoch"),
+        (_handle(generation=2), _handle(generation=1), "generation"),
+    ],
+    ids=["other-epoch", "older-generation"],
+)
+def test_state_bind_rejects_a_stale_handle(first, second, match):
+    """A handle from another engine epoch, or an older generation of a bound
+    slot, is rejected."""
+    bindings = _state_bindings()
+    _begin_state_step(bindings, 1, {"r": first})
+    with pytest.raises(ValueError, match=match):
+        _begin_state_step(bindings, 2, {"s": second})
+
+
+# @spec C5
+def test_state_rows_only_for_the_current_steps_handles():
+    """Rows are exposed only for handles bound in the current step: not for a
+    request outside it, not under a wrong handle, and not through rows taken
+    in an earlier step."""
+    bindings = _state_bindings()
+    first, second = _handle(slot=1), _handle(slot=2)
+    _begin_state_step(bindings, 1, {"a": first, "b": second})
+    earlier = bindings.bind_rows("state", ("a",), (first,))
+    _begin_state_step(bindings, 2, {"b": second})
+    with pytest.raises(ValueError):
+        bindings.bind_rows("state", ("a",), (first,))
+    with pytest.raises(ValueError):
+        bindings.bind_rows("state", ("b",), (_handle(slot=2, generation=7),))
+    with pytest.raises(ValueError, match="Stale state step access"):
+        earlier.component_pools  # noqa: B018
+    assert bindings.bind_rows("state", ("b",), (second,)).slot_indices_cpu == (2,)
