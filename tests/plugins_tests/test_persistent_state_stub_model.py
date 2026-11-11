@@ -545,12 +545,13 @@ class _Stream:
         self.task = asyncio.create_task(self._run())
 
     async def _inputs(self):
+        # Copies: the output processor extends a request's prompt list in place.
         from vllm.engine.protocol import StreamingInput
         from vllm.inputs import TokensPrompt
 
-        yield StreamingInput(prompt=TokensPrompt(prompt_token_ids=FIRST_INPUT))
+        yield StreamingInput(prompt=TokensPrompt(prompt_token_ids=list(FIRST_INPUT)))
         await self.gate.wait()
-        yield StreamingInput(prompt=TokensPrompt(prompt_token_ids=SECOND_INPUT))
+        yield StreamingInput(prompt=TokensPrompt(prompt_token_ids=list(SECOND_INPUT)))
 
     async def _run(self):
         turns: list[list[int]] = [[]]
