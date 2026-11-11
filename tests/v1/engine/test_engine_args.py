@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from tests.v1.kv_connector.unit import utils as connector_utils
-from vllm.config import ModelConfig
+from vllm.config import CUDAGraphMode, ModelConfig
 from vllm.config.kv_transfer import KVCacheAccess, KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.engine.arg_utils import EngineArgs
@@ -724,3 +724,191 @@ def test_extensible_kv_cache_connector_needs_block_compact_layout():
     assert layout.name == "LBNHC"
     with pytest.raises(ValueError, match="block-compact"):
         resolve_kv_cache_layout(make_config(), [["LHBNC"]])
+
+
+# Persistent state: the configuration defaults a model that declares persistent
+# state gets, through EngineArgs and the dummy-model plugin's stub classes. See
+# docs/design/persistent_state.md for the criteria named in `@spec`.
+
+
+@pytest.fixture
+def state_stub_models(request):
+    """Register the plugin's stub persistent-state classes in this process."""
+    from tests.plugins.vllm_add_dummy_model.vllm_add_dummy_model import (
+        my_persistent_state as stub,
+    )
+    from vllm.model_executor.models.registry import ModelRegistry
+
+    for cls in (
+        stub.StubPersistentStateForCausalLM,
+        stub.StubUndeclaredPersistentStateForCausalLM,
+    ):
+        if cls.__name__ not in ModelRegistry.models:
+            ModelRegistry.register_model(cls.__name__, cls)
+            request.addfinalizer(
+                lambda name=cls.__name__: ModelRegistry.models.pop(name, None)
+            )
+    return stub
+
+
+def _state_config(path, **overrides):
+    return EngineArgs(
+        model=path,
+        load_format="dummy",
+        enable_prefix_caching=False,
+        max_model_len=64,
+        max_num_seqs=2,
+        **overrides,
+    ).create_engine_config(UsageContext.OPENAI_API_SERVER)
+
+
+def _persistent_state_warnings(caplog) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "WARNING"
+        and "persistent state" in record.getMessage().lower()
+    ]
+
+
+# @spec M31
+def test_model_config_reports_declared_persistent_state(
+    state_stub_models,
+    dummy_state_model_path,
+    dummy_undeclared_state_model_path,
+):
+    """`ModelConfig.has_persistent_state` is True exactly for a class that sets
+    `supports_persistent_state = True`."""
+    assert _state_config(dummy_state_model_path).model_config.has_persistent_state
+    undeclared = _state_config(dummy_undeclared_state_model_path)
+    assert undeclared.model_config.has_persistent_state is False
+    plain = EngineArgs(model="facebook/opt-125m").create_engine_config()
+    assert plain.model_config.has_persistent_state is False
+
+
+# @spec M28
+def test_persistent_state_async_scheduling_unset_resolves_off_with_one_warning(
+    state_stub_models, dummy_state_model_path, caplog_vllm
+):
+    caplog_vllm.clear()
+    config = _state_config(dummy_state_model_path)
+    assert config.scheduler_config.async_scheduling is False
+    assert len(_persistent_state_warnings(caplog_vllm)) == 1, caplog_vllm.text
+
+
+# @spec M28
+def test_persistent_state_async_scheduling_requested_fails(
+    state_stub_models, dummy_state_model_path
+):
+    with pytest.raises(ValueError) as refused:
+        _state_config(dummy_state_model_path, async_scheduling=True)
+    assert (
+        "Async scheduling is not yet validated with persistent state. "
+        "Use --no-async-scheduling."
+    ) in str(refused.value)
+
+
+# @spec M28
+# @spec M29
+# @spec M33
+def test_persistent_state_explicit_off_options_log_nothing(
+    state_stub_models, dummy_state_model_path, caplog_vllm
+):
+    """Explicitly disabled async scheduling and extensible KV cache, and an
+    explicit cudagraph_mode NONE, are accepted without a warning."""
+    caplog_vllm.clear()
+    config = _state_config(
+        dummy_state_model_path,
+        async_scheduling=False,
+        enable_extensible_kv_cache=False,
+        compilation_config={"cudagraph_mode": "NONE"},
+    )
+    assert config.scheduler_config.async_scheduling is False
+    assert config.cache_config.enable_extensible_kv_cache is False
+    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+    assert _persistent_state_warnings(caplog_vllm) == []
+
+
+# @spec M29
+def test_persistent_state_extensible_kv_cache_unset_resolves_off(
+    state_stub_models, dummy_state_model_path, caplog_vllm
+):
+    caplog_vllm.clear()
+    config = _state_config(dummy_state_model_path, async_scheduling=False)
+    assert config.cache_config.enable_extensible_kv_cache is False
+    assert not any("extensible" in m for m in _persistent_state_warnings(caplog_vllm))
+
+
+# @spec M29
+@requires_cuda
+def test_persistent_state_extensible_kv_cache_requested_fails(
+    state_stub_models, dummy_state_model_path
+):
+    with pytest.raises(ValueError, match="persistent state"):
+        _state_config(dummy_state_model_path, enable_extensible_kv_cache=True)
+
+
+# @spec M33
+def test_persistent_state_cudagraph_mode_unset_resolves_none_with_one_warning(
+    state_stub_models, dummy_state_model_path, caplog_vllm
+):
+    caplog_vllm.clear()
+    config = _state_config(dummy_state_model_path, async_scheduling=False)
+    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+    warnings = _persistent_state_warnings(caplog_vllm)
+    assert len([m for m in warnings if "CUDA graph" in m]) == 1, caplog_vllm.text
+
+
+# @spec M33
+@pytest.mark.parametrize("mode", ["FULL", "PIECEWISE", "FULL_AND_PIECEWISE"])
+def test_persistent_state_cudagraph_mode_requested_fails(
+    state_stub_models, dummy_state_model_path, mode
+):
+    with pytest.raises(ValueError) as refused:
+        _state_config(
+            dummy_state_model_path,
+            async_scheduling=False,
+            compilation_config={"cudagraph_mode": mode},
+        )
+    assert (
+        f"CUDA graph mode {mode} is not yet validated with persistent state. "
+        "Use cudagraph_mode NONE; the model can capture its own graphs."
+    ) in str(refused.value)
+
+
+# @spec M33
+def test_persistent_state_enforce_eager_takes_precedence_over_cudagraph_mode(
+    state_stub_models, dummy_state_model_path, caplog_vllm
+):
+    caplog_vllm.clear()
+    config = _state_config(
+        dummy_state_model_path,
+        async_scheduling=False,
+        enforce_eager=True,
+        compilation_config={"cudagraph_mode": "FULL"},
+    )
+    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+    assert not any("CUDA graph" in m for m in _persistent_state_warnings(caplog_vllm))
+
+
+# @spec M7
+@pytest.mark.parametrize("override", [0, 1])
+def test_persistent_state_override_below_two_pages_fails_at_configuration(
+    state_stub_models, dummy_state_model_path, override
+):
+    """An override below two pages holds no slot; configuration refuses it,
+    before any engine allocates memory."""
+    with pytest.raises(ValueError, match="no slot"):
+        _state_config(
+            dummy_state_model_path,
+            async_scheduling=False,
+            num_gpu_blocks_override=override,
+        )
+
+
+def test_persistent_state_defaults_leave_other_models_alone(caplog_vllm):
+    """A model without the declaration keeps its own defaults and no
+    persistent-state warning is logged."""
+    caplog_vllm.clear()
+    EngineArgs(model="facebook/opt-125m").create_engine_config()
+    assert _persistent_state_warnings(caplog_vllm) == []

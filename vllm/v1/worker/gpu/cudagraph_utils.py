@@ -1148,6 +1148,9 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
         runner.model_state._mamba_group_ids = []
     if hasattr(runner.model_state, "_mamba_spec"):
         runner.model_state._mamba_spec = None
+    if getattr(runner, "state_slots", None) is not None:
+        runner.state_slots = None
+        runner.model_state.state_slots = None
     if hasattr(runner, "kv_caches"):
         runner.kv_caches.clear()
     if hasattr(runner, "attn_groups"):

@@ -12,6 +12,11 @@ steps:
   source_file_dependencies:
   - vllm/plugins/
   - tests/plugins/
+  - tests/plugins_tests/test_persistent_state_stub_model.py
+  - vllm/model_executor/layers/state.py
+  - vllm/v1/core/sched/state_scheduler.py
+  - vllm/v1/core/state_slot_manager.py
+  - vllm/v1/worker/gpu/state_slots.py
   commands:
   # These plugins act only when a test names them (io_processor and endpoint)
   # or add new model names (dummy_model), so they can all be installed at once.
@@ -26,6 +31,7 @@ steps:
   - pytest -v -s plugins_tests/test_oot_registration_online.py # it needs a clean process
   - pytest -v -s plugins_tests/test_oot_registration_offline.py # it needs a clean process
   - pytest -v -s plugins_tests/lora_resolvers # unit tests for in-tree lora resolver plugins
+  - pytest -v -s plugins_tests/test_persistent_state_stub_model.py # persistent state end to end
   mirror:
     amd:
       label: ":amd: (MI250) Plugin Integration"

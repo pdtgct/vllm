@@ -383,6 +383,11 @@ class Scheduler(SchedulerInterface):
             self.connector.bind_kv_cache_manager(self.kv_cache_manager)
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+        # Whether scheduled token ids go back to the workers; see
+        # _make_cached_request_data.
+        self.send_new_token_ids = (
+            self.use_pp and not self.scheduler_config.async_scheduling
+        )
         self._pending_encoder_input_ids: dict[str, set[int]] = {}
         # Scheduler iteration counter. Drives the PP+async decode-throttle
         # cadence (`next_decode_eligible_step`).
@@ -1952,12 +1957,13 @@ class Scheduler(SchedulerInterface):
             # NOTE: In PP+async scheduling, we consume token ids via a direct GPU
             # broadcast path (`input_batch.prev_sampled_token_ids`), so we can
             # omit this payload.
-            if self.use_pp and not self.scheduler_config.async_scheduling:
+            if self.send_new_token_ids:
                 # When using PP, the scheduler sends the sampled tokens back,
                 # because there's no direct communication between the first-
-                # stage worker and the last-stage worker. Otherwise, we don't
-                # need to send the sampled tokens back because the model runner
-                # will cache them.
+                # stage worker and the last-stage worker. Persistent-state
+                # models also plan their rows from this host token slice.
+                # Otherwise, we don't need to send the sampled tokens back
+                # because the model runner will cache them.
                 num_tokens = num_scheduled_tokens[req_id] - len(
                     spec_decode_tokens.get(req_id, ())
                 )
@@ -2242,6 +2248,16 @@ class Scheduler(SchedulerInterface):
         )
         return GrammarOutput(structured_output_request_ids, bitmask)
 
+    def _add_queued_outputs(self, outputs: dict[int, list[EngineCoreOutput]]) -> None:
+        """Add outputs queued outside model execution ahead of this step's."""
+        return
+
+    def _get_stale_output_req_ids(
+        self, scheduler_output: SchedulerOutput
+    ) -> set[str] | None:
+        """Requests whose output in this step must be dropped unread."""
+        return None
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -2272,6 +2288,7 @@ class Scheduler(SchedulerInterface):
             perf_stats = self.perf_metrics.get_step_perf_stats_per_gpu(scheduler_output)
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
+        self._add_queued_outputs(outputs)
         spec_decoding_stats: SpecDecodingStats | None = None
 
         failed_kv_load_req_ids: set[str] = set()
@@ -2296,11 +2313,14 @@ class Scheduler(SchedulerInterface):
         stopped_preempted_reqs: set[Request] = set()
         # Stopped resumable requests to re-enqueue, in output order.
         continuing_reqs: list[Request] = []
+        stale_req_ids = self._get_stale_output_req_ids(scheduler_output)
         # The worker's output order follows its batch, not num_scheduled_tokens.
         req_indices = {
             req_id: i for i, req_id in enumerate(model_runner_output.req_ids)
         }
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
+            if stale_req_ids and req_id in stale_req_ids:
+                continue
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
             output_is_stale = False

@@ -424,3 +424,29 @@ def get_kv_cache_configs(
         available_memory,
         kv_cache_planning.get_global_kv_cache_groups(vllm_config, kv_cache_specs),
     )
+
+
+def create_state_spec(page_size_bytes: int = 32, **spec_kwargs):
+    """The generic test state spec: a 32-byte page, or a larger one padded by
+    a filler component."""
+    from vllm.v1.kv_cache_interface import (
+        PersistentStateDescriptor,
+        PersistentStateSpec,
+    )
+
+    descriptors = [
+        PersistentStateDescriptor("hidden", (4,), torch.float32, 0, 16, torch.ones),
+        PersistentStateDescriptor("count", (2,), torch.int64, 16, 16, torch.zeros),
+    ]
+    if page_size_bytes > 32:
+        descriptors.append(
+            PersistentStateDescriptor(
+                "filler", (page_size_bytes - 32,), torch.uint8, 32, 16, torch.zeros
+            )
+        )
+    return PersistentStateSpec(
+        state_name="test",
+        descriptors=tuple(descriptors),
+        page_size_bytes=page_size_bytes,
+        **spec_kwargs,
+    )
