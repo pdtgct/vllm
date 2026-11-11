@@ -106,20 +106,18 @@ memory protection: tensors already returned are not revoked.
 The pool's size is configured: `max_num_seqs + 1` pages, or
 `num_gpu_blocks_override` when it is set. Planning computes how many pages fit
 the KV cache budget. The budget comes from memory profiling or from
-`kv_cache_memory_bytes`; when the graph-memory estimate runs, the graphs the
-runner captures are counted in it. When fewer pages fit than are configured,
-startup fails and, without an override, reports the largest `max_num_seqs`
-that fits the measured budget; the engine never runs with fewer slots than
-configured. Graph memory can depend on `max_num_seqs`, so a smaller value can
-change the budget, and the reported value is a starting point for the next
-attempt, not a guarantee.
+`kv_cache_memory_bytes`. When fewer pages fit than are configured, startup
+fails and, without an override, reports the largest `max_num_seqs` that fits
+the measured budget; the engine never runs with fewer slots than configured.
+A profiled budget is measured again at the next startup, so the reported
+value is a starting point for the next attempt, not a guarantee.
 
-The serving pool is allocated once, in full, before the serving graph capture,
-and its pages keep their addresses for the engine's lifetime, so graphs
-captured over it stay valid. For that reason a state-only layout does not use
-the extensible KV cache, which commits pages after warmup and graph capture,
-sized from measured memory: the state pool's size is already fixed by
-configuration, and the model's graphs address every page.
+The serving pool is allocated once, in full, before the state bindings are
+built, and its pages keep their addresses for the engine's lifetime, so the
+state views that the bindings give the model stay valid. For that reason a
+state-only layout does not use the extensible KV cache, which commits pages
+after warmup, sized from measured memory: the state pool's size is already
+fixed by configuration, and the bindings address every page from startup.
 
 ### Startup criteria
 
@@ -136,9 +134,9 @@ configuration, and the model's graphs address every page.
   fits (one less than the fitting page count), or that no slot fits when fewer
   than two pages fit. Under a persistent-state layout, a
   `num_gpu_blocks_override` below 2 raises `ValueError` stating that the pool
-  would hold no slot, before memory profiling allocates any temporary pool.
-  When the planned pages fit, the
-  pool has exactly the planned page count; planning never reduces it.
+  would hold no slot, before memory profiling allocates any state pool. When
+  the planned pages fit, the pool has exactly the planned page count; planning
+  never reduces it.
 
 ## Release fence
 

@@ -27,8 +27,10 @@ from vllm.config import CUDAGraphMode
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.platforms import current_platform
 from vllm.v1.core.sched.interface import PauseState
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.core import EngineCore
+from vllm.v1.engine.core_client import InprocClient
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 from vllm.v1.request import RequestStatus
 
@@ -120,31 +122,63 @@ def _mentions(message: str, number: int) -> bool:
     return re.search(rf"(?<![\d.]){number}(?![\d.])", message) is not None
 
 
-# The LLM regression: the default configuration, slots reused across prompts.
+# The LLM regression: slots reused across prompts, with the default
+# configuration and with the values it resolves to passed explicitly.
 
 
+# @spec C7
 # @spec M5
 # @spec M17
 # @spec M28
 # @spec M29
 # @spec M33
-@create_new_process_for_each_test()
-def test_llm_generates_the_stub_tokens_on_reused_slots(dummy_state_model_path):
-    """With max_num_seqs=2 and the persistent-state defaults left unset, six
-    greedy prompts each produce the stub's tokens from a fresh counter: a slot
-    reused without its initializer would change them. The defaults resolve to
-    synchronous scheduling, no extensible KV cache and no runner CUDA graphs,
-    and releasing the KV cache is refused."""
+@create_new_process_for_each_test("spawn")
+@pytest.mark.parametrize(
+    "configuration",
+    [
+        # C7, M5, M17, M28, M29 and M33: the defaults left unset.
+        "defaults",
+        # C7 and M5 only: generation and slot reuse, with nothing to resolve.
+        "explicit",
+    ],
+)
+def test_llm_generates_the_stub_tokens_on_reused_slots(
+    dummy_state_model_path, configuration
+):
+    """With max_num_seqs=2, six greedy prompts each produce the stub's tokens
+    from a fresh counter: a slot reused without its initializer, or held by
+    two requests at once, would change them. With the persistent-state
+    defaults left unset, they resolve to synchronous scheduling, no extensible
+    KV cache and no runner CUDA graphs, and releasing the KV cache is refused.
+    With those values passed explicitly (and a pool of three pages), only the
+    generation and the slot reuse are checked."""
     from vllm_add_dummy_model.my_persistent_state import expected_tokens
 
-    llm = LLM(**_engine_kwargs(dummy_state_model_path))
+    explicit = configuration == "explicit"
+    # What the defaults resolve to on the non-eager path, with the pool M7
+    # plans for max_num_seqs=2 (max_num_seqs + 1 pages).
+    overrides: dict = (
+        dict(
+            async_scheduling=False,
+            enable_extensible_kv_cache=False,
+            compilation_config={"cudagraph_mode": "NONE"},
+            enforce_eager=False,
+            num_gpu_blocks_override=3,
+        )
+        if explicit
+        else {}
+    )
+    llm = LLM(**_engine_kwargs(dummy_state_model_path, **overrides))
     config = llm.llm_engine.vllm_config
     assert config.scheduler_config.async_scheduling is False
     assert config.cache_config.enable_extensible_kv_cache is False
     assert config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
     assert config.model_config.enforce_eager is False
 
-    model = _model(llm.llm_engine.engine_core.engine_core)
+    # Without multiprocessing, LLM runs the engine core in this process.
+    client = llm.llm_engine.engine_core
+    assert isinstance(client, InprocClient)
+    model = _model(client.engine_core)
     prompts = [[11 * i + 1, 11 * i + 2, 11 * i + 3] for i in range(6)]
     params = SamplingParams(temperature=0, max_tokens=8)
     outputs = llm.generate([{"prompt_token_ids": p} for p in prompts], params)
@@ -154,16 +188,17 @@ def test_llm_generates_the_stub_tokens_on_reused_slots(dummy_state_model_path):
     ]
     assert {output.outputs[0].finish_reason for output in outputs} == {"stop"}
 
-    with pytest.raises(RuntimeError) as refused:
-        llm.release_kv_cache_memory()
-    assert str(refused.value) == RELEASE_REFUSAL
+    if not explicit:
+        with pytest.raises(RuntimeError) as refused:
+            llm.release_kv_cache_memory()
+        assert str(refused.value) == RELEASE_REFUSAL
 
 
 # Startup.
 
 
 # @spec M7
-@create_new_process_for_each_test()
+@create_new_process_for_each_test("spawn")
 def test_engine_refuses_more_slots_than_the_fixed_budget_holds(
     dummy_state_model_path,
 ):
@@ -181,7 +216,7 @@ def test_engine_refuses_more_slots_than_the_fixed_budget_holds(
 
 
 # @spec M7
-@create_new_process_for_each_test()
+@create_new_process_for_each_test("spawn")
 @pytest.mark.parametrize("override", [0, 1])
 def test_engine_refuses_an_override_below_two_pages_before_profiling(
     dummy_state_model_path, override
@@ -199,7 +234,7 @@ def test_engine_refuses_an_override_below_two_pages_before_profiling(
 
 
 # @spec M31
-@create_new_process_for_each_test()
+@create_new_process_for_each_test("spawn")
 def test_engine_refuses_an_undeclared_state_layer(dummy_undeclared_state_model_path):
     """A model that builds a persistent-state layer without declaring
     `supports_persistent_state` fails startup with a ValueError naming the
@@ -212,7 +247,7 @@ def test_engine_refuses_an_undeclared_state_layer(dummy_undeclared_state_model_p
 
 
 # @spec C8
-@create_new_process_for_each_test()
+@create_new_process_for_each_test("spawn")
 def test_declared_model_gets_prepare_step_before_its_slots_are_bound(
     dummy_state_model_path,
 ):
@@ -320,7 +355,7 @@ def _retire(core, request_id="ended"):
 
 
 # @spec M17
-@create_new_process_for_each_test()
+@create_new_process_for_each_test("spawn")
 @pytest.mark.parametrize("held", ["parked", "bound"])
 def test_in_process_keep_pause_clearing_the_cache_refused(dummy_state_model_path, held):
     """A keep pause that clears the cache is refused with the exact message
@@ -341,7 +376,7 @@ def test_in_process_keep_pause_clearing_the_cache_refused(dummy_state_model_path
 
 
 # @spec M17
-@create_new_process_for_each_test()
+@create_new_process_for_each_test("spawn")
 @pytest.mark.parametrize("held", ["parked", "bound"])
 def test_in_process_reset_of_running_requests_refused_while_held(
     dummy_state_model_path, held
@@ -365,17 +400,18 @@ def test_in_process_reset_of_running_requests_refused_while_held(
 
 
 # @spec M17
-@create_new_process_for_each_test()
+@create_new_process_for_each_test("spawn")
 @pytest.mark.parametrize("state", ["parked", "paused-without-slots"])
 def test_in_process_release_refused(dummy_state_model_path, state):
     """Releasing the KV cache is refused before its pause check, while a stream
     is parked and also once a completed pause has left no slot held."""
     core = _engine_core(dummy_state_model_path)
     try:
+        free = _manager(core).num_free_slots
         _park(core)
         if state == "paused-without-slots":
             assert core.pause_scheduler() is None
-            assert _manager(core).num_free_slots == 2
+            assert _manager(core).num_free_slots == free
         before = _snapshot(core)
         with pytest.raises(RuntimeError) as refused:
             core.release_kv_cache_memory()
@@ -386,7 +422,7 @@ def test_in_process_release_refused(dummy_state_model_path, state):
 
 
 # @spec M17
-@create_new_process_for_each_test()
+@create_new_process_for_each_test("spawn")
 def test_in_process_keep_pause_without_clear_preserves_the_stream(
     dummy_state_model_path,
 ):
@@ -408,7 +444,7 @@ def test_in_process_keep_pause_without_clear_preserves_the_stream(
 
 
 # @spec M17
-@create_new_process_for_each_test()
+@create_new_process_for_each_test("spawn")
 @pytest.mark.parametrize("reset_connector", [True, False])
 def test_in_process_abort_pause_drains_and_clears(
     dummy_state_model_path, reset_connector
@@ -419,11 +455,13 @@ def test_in_process_abort_pause_drains_and_clears(
     core = _engine_core(dummy_state_model_path)
     try:
         model = _model(core)
+        free = _manager(core).num_free_slots
         _park(core, "aborted")
         assert core.pause_scheduler(reset_connector=reset_connector) is None
+        assert isinstance(core.scheduler, Scheduler)
         assert "aborted" not in core.scheduler.requests
         assert _retiring(core) == []
-        assert _manager(core).num_free_slots == 2
+        assert _manager(core).num_free_slots == free
         core.resume_scheduler()
         first = _park(core, "next")
         _feed(core, "next", SECOND_INPUT)
@@ -434,7 +472,7 @@ def test_in_process_abort_pause_drains_and_clears(
 
 
 # @spec M17
-@create_new_process_for_each_test()
+@create_new_process_for_each_test("spawn")
 @pytest.mark.parametrize("reset_running_requests", [True, False])
 def test_in_process_reset_drains_retiring_slots(
     dummy_state_model_path, reset_running_requests
@@ -443,16 +481,17 @@ def test_in_process_reset_drains_retiring_slots(
     reset steps the engine until no slot is retiring and then resets."""
     core = _engine_core(dummy_state_model_path)
     try:
+        free = _manager(core).num_free_slots
         _retire(core)
         assert core.reset_prefix_cache(reset_running_requests=reset_running_requests)
         assert _retiring(core) == []
-        assert _manager(core).num_free_slots == 2
+        assert _manager(core).num_free_slots == free
     finally:
         core.shutdown()
 
 
 # @spec M17
-@create_new_process_for_each_test()
+@create_new_process_for_each_test("spawn")
 @pytest.mark.parametrize("reset_running_requests", [True, False])
 def test_in_process_reset_with_a_queued_request_does_not_step(
     dummy_state_model_path, reset_running_requests
@@ -477,7 +516,7 @@ def test_in_process_reset_with_a_queued_request_does_not_step(
 
 
 # @spec M17
-@create_new_process_for_each_test()
+@create_new_process_for_each_test("spawn")
 def test_in_process_clearing_keep_pause_with_a_queued_request_asks_for_a_retry(
     dummy_state_model_path,
 ):
@@ -497,7 +536,7 @@ def test_in_process_clearing_keep_pause_with_a_queued_request_asks_for_a_retry(
 
 
 # @spec M17
-@create_new_process_for_each_test()
+@create_new_process_for_each_test("spawn")
 def test_in_process_clearing_keep_pause_with_only_retiring_slots_drains(
     dummy_state_model_path,
 ):
@@ -505,18 +544,20 @@ def test_in_process_clearing_keep_pause_with_only_retiring_slots_drains(
     engine until the slot has retired, then completes."""
     core = _engine_core(dummy_state_model_path)
     try:
+        free = _manager(core).num_free_slots
         _retire(core)
         assert core.pause_scheduler(mode="keep", clear_cache=True) is None
         assert _retiring(core) == []
-        assert _manager(core).num_free_slots == 2
+        assert _manager(core).num_free_slots == free
         assert core.scheduler.pause_state == PauseState.PAUSED_ALL
     finally:
         core.shutdown()
 
 
-# The multiprocess engine through AsyncLLM (M17). A bound slot is held only
-# for one step, which a multiprocess client cannot order a pause against, so
-# bound-slot refusals are tested in-process above.
+# The multiprocess engine through AsyncLLM (M17). A running request's slot
+# stays bound from step to step, but a multiprocess client cannot order its
+# pause or reset before the request finishes, so bound-slot refusals are
+# tested in-process above.
 
 
 def _async_llm(path, monkeypatch):
@@ -722,5 +763,6 @@ def test_completion_waits_for_a_registered_writing_stream():
     assert not written.query()
     output = completion.get_output()
     assert written.query()
+    assert output.state_completion is not None
     assert output.state_completion.handles == {"r": {STATE_LAYER: handle}}
     assert count[1].tolist() == [7, 7]
