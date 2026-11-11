@@ -9115,7 +9115,7 @@ def test_state_layout_selects_state_scheduler(kind):
 
 
 # @spec C1
-def test_attention_layout_keeps_configured_scheduler():
+def test_attention_layout_keeps_configured_scheduler_not_state_scheduler():
     from vllm.v1.core.sched.state_scheduler import StateScheduler, get_scheduler_cls
 
     scheduler = create_scheduler()
@@ -9447,26 +9447,43 @@ def test_state_stream_continuation_replaces_the_prompt(queued):
 
 
 # @spec C3
-@pytest.mark.parametrize("stop", ["stop_token", "length"])
+@pytest.mark.parametrize("stop", ["stop_token", "length", "repetition"])
 @pytest.mark.parametrize("queued", [False, True])
 def test_state_stream_other_stops_end_the_stream(stop, queued):
-    """A stop token or the length limit ends a resumable state request instead
-    of parking it, even with a continuation queued; its slot retires behind
-    the fence and is then reusable."""
+    """A stop token, the length limit or detected repetition ends a resumable
+    state request instead of parking it, even with a continuation queued; its
+    slot retires behind the fence and is then reusable. (Stop strings are
+    refused for streaming input, so they never end a turn.)"""
+    from vllm.sampling_params import RepetitionDetectionParams
+
     scheduler = _state_scheduler()
     manager = _state_manager(scheduler)
     if stop == "stop_token":
         request = _stream_input(tokens=[3], stop_token_ids=[6])
         expected = (RequestStatus.FINISHED_STOPPED, FinishReason.STOP)
-    else:
+    elif stop == "length":
         request = _stream_input(tokens=[3], max_tokens=1)
         expected = (RequestStatus.FINISHED_LENGTH_CAPPED, FinishReason.LENGTH)
+    else:
+        request = _stream_input(
+            tokens=[3],
+            repetition_detection=RepetitionDetectionParams(
+                max_pattern_size=1, min_count=2
+            ),
+        )
+        expected = (RequestStatus.FINISHED_REPETITION, FinishReason.REPETITION)
     scheduler.add_request(request)
     step = scheduler.schedule()
     old = step.state_slot_handles["stream"]["state"]
     if queued:
         scheduler.add_request(_stream_input())
     outputs = scheduler.update_from_output(step, _state_output(step, sampled=6))
+    if stop == "repetition":
+        # The second identical token is the repetition.
+        assert request.status == RequestStatus.RUNNING
+        step = scheduler.schedule()
+        assert step.state_slot_handles["stream"]["state"] == old
+        outputs = scheduler.update_from_output(step, _state_output(step, sampled=6))
     assert request.status == expected[0]
     assert not request.resumable
     assert "stream" not in scheduler.requests
@@ -9612,7 +9629,7 @@ def _slot_state(scheduler):
 
 # @spec M17
 @pytest.mark.parametrize("kind", ["bound", "parked"])
-def test_reset_running_requests_refused_while_a_slot_is_held(kind):
+def test_state_reset_running_requests_refused_while_a_slot_is_held(kind):
     """A reset that would preempt running requests is refused while a slot is
     bound or parked, with the exact message, before anything changes."""
     scheduler = _state_scheduler()
@@ -9625,7 +9642,7 @@ def test_reset_running_requests_refused_while_a_slot_is_held(kind):
 
 
 # @spec M17
-def test_reset_running_requests_counts_bound_and_parked_slots():
+def test_state_reset_running_requests_counts_bound_and_parked_slots():
     """The refusal counts every bound and parked slot, not retiring ones."""
     scheduler = _state_scheduler(max_num_seqs=3)
     _hold_slot(scheduler, "parked", "parked")
@@ -9641,7 +9658,7 @@ def test_reset_running_requests_counts_bound_and_parked_slots():
 
 # @spec M17
 @pytest.mark.parametrize("kind", ["bound", "parked", "retiring"])
-def test_reset_without_running_requests_changes_nothing_while_held(kind):
+def test_state_reset_without_running_requests_changes_nothing_while_held(kind):
     """Without resetting running requests, a reset while any slot is held
     returns False and changes nothing, as it does while blocks are in use."""
     scheduler = _state_scheduler()
@@ -9652,9 +9669,14 @@ def test_reset_without_running_requests_changes_nothing_while_held(kind):
 
 
 # @spec M17
-def test_reset_running_requests_with_only_retiring_slots_asks_for_a_retry():
+def test_state_reset_running_requests_with_only_retiring_slots_asks_for_a_retry():
     """With only retiring slots, the scheduler's reset refuses with the retry
-    message and preempts nothing; once the slots have retired, it succeeds."""
+    message and preempts nothing; once the slots have retired, it succeeds.
+
+    Recorded coverage exception: the multiprocess engine's retiring-only reset
+    retry is covered here, at scheduler level, only. Its busy loop retires the
+    slots by itself within a step or two, so an engine-level reset cannot be
+    ordered before the retirement deterministically."""
     scheduler = _state_scheduler()
     _hold_slot(scheduler, "retiring")
     before = _slot_state(scheduler)

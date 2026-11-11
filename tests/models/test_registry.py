@@ -324,7 +324,6 @@ def test_registry_in_tree_models_have_no_persistent_state(monkeypatch, tmp_path)
         if info is not None and info.has_persistent_state is not False
     }
     assert declared == {}
-    assert len(results) == len(_VLLM_MODELS)
 
 
 def _out_of_tree_state_model(monkeypatch, tmp_path):

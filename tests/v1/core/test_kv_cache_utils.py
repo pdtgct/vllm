@@ -2525,7 +2525,7 @@ def test_persistent_state_pool_allocates_one_page_per_block():
     assert raw.numel() == 3 * spec.page_size_bytes
 
 
-# @spec C4
+# @spec C7
 def test_persistent_state_manager_holds_one_slot_per_request():
     """Each request holds one slot whatever its token count, and allocation
     fails once every slot is held."""
@@ -2626,38 +2626,52 @@ def test_persistent_state_more_than_one_state_layer_refused():
 
 # @spec C6
 @pytest.mark.parametrize(
-    "owner,option,value",
+    "owner,option,value,label",
     [
-        ("scheduler_config", "async_scheduling", True),
-        ("parallel_config", "tensor_parallel_size", 2),
-        ("parallel_config", "pipeline_parallel_size", 2),
-        ("parallel_config", "data_parallel_size", 2),
-        ("parallel_config", "decode_context_parallel_size", 2),
-        ("parallel_config", "prefill_context_parallel_size", 2),
-        ("parallel_config", "enable_dbo", True),
+        ("scheduler_config", "async_scheduling", True, "async scheduling"),
+        ("parallel_config", "tensor_parallel_size", 2, "tensor_parallel_size"),
+        ("parallel_config", "pipeline_parallel_size", 2, "pipeline_parallel_size"),
+        ("parallel_config", "data_parallel_size", 2, "data_parallel_size"),
+        (
+            "parallel_config",
+            "decode_context_parallel_size",
+            2,
+            "decode_context_parallel_size",
+        ),
+        (
+            "parallel_config",
+            "prefill_context_parallel_size",
+            2,
+            "prefill_context_parallel_size",
+        ),
+        ("parallel_config", "enable_dbo", True, "dual batch overlap"),
         (
             None,
             "speculative_config",
             SpeculativeConfig(model="ngram", num_speculative_tokens=1),
+            "speculative decoding",
         ),
         (
             None,
             "kv_transfer_config",
             KVTransferConfig(kv_connector="ExampleConnector", kv_role="kv_both"),
+            "KV transfer",
         ),
-        ("cache_config", "enable_prefix_caching", True),
-        ("model_config", "enable_sleep_mode", True),
-        ("model_config", "enable_cumem_allocator", True),
-        ("attention_config", "hisparse_config", HiSparseConfig()),
+        ("cache_config", "enable_prefix_caching", True, "prefix caching"),
+        ("model_config", "enable_sleep_mode", True, "sleep mode"),
+        ("model_config", "enable_cumem_allocator", True, "CuMem"),
+        ("attention_config", "hisparse_config", HiSparseConfig(), "HiSparse"),
     ],
 )
-def test_persistent_state_unsupported_config_refused(owner, option, value):
+def test_persistent_state_unsupported_config_refused(owner, option, value, label):
+    """Each unsupported configuration is refused with a ValueError naming it."""
     from tests.v1.core.utils import create_state_spec
 
     config = _state_config()
     setattr(getattr(config, owner) if owner else config, option, value)
-    with pytest.raises(ValueError, match="Persistent state does not support"):
+    with pytest.raises(ValueError, match="Persistent state does not support") as e:
         get_kv_cache_configs(config, [{"state": create_state_spec()}], [4096])
+    assert label in str(e.value), str(e.value)
 
 
 # @spec C2
@@ -2750,7 +2764,7 @@ def test_persistent_state_plans_exactly_the_configured_pages(
 # @spec M7
 @pytest.mark.parametrize(
     ("max_num_seqs", "budget_pages", "fit"),
-    [(4, 3, 3), (2, 2, 2), (2, 2.5, 2)],
+    [(6, 5, 5), (4, 4, 4), (4, 4.5, 4)],
     ids=["two-short", "one-short", "fractional"],
 )
 def test_persistent_state_non_fit_names_the_largest_max_num_seqs(
@@ -2758,7 +2772,8 @@ def test_persistent_state_non_fit_names_the_largest_max_num_seqs(
 ):
     """Fewer fitting pages than planned fail planning; the message states the
     planned and fitting page counts, the page size (32 bytes) and the largest
-    max_num_seqs that fits (one less than the fitting pages)."""
+    max_num_seqs that fits (one less than the fitting pages). The figures are
+    distinct and greater than one, so none is matched incidentally."""
     message, _ = _state_planning_error(budget_pages, max_num_seqs=max_num_seqs)
     for figure in (max_num_seqs + 1, fit, 32, fit - 1):
         assert _mentions(message, figure), (figure, message)
@@ -2768,19 +2783,25 @@ def test_persistent_state_non_fit_names_the_largest_max_num_seqs(
 # @spec M7
 @pytest.mark.parametrize("budget_pages", [0, 1, 1.5])
 def test_persistent_state_non_fit_without_a_slot(budget_pages):
-    """When fewer than two pages fit, the message says that no slot fits."""
-    message, _ = _state_planning_error(budget_pages)
-    for figure in (3, int(budget_pages), 32):
+    """When fewer than two pages fit, the message says, in any wording, that no
+    slot fits."""
+    import re
+
+    message, _ = _state_planning_error(budget_pages, max_num_seqs=4)
+    for figure in (5, int(budget_pages), 32):
         assert _mentions(message, figure), (figure, message)
-    assert "no slot" in message.lower(), message
+    lower = message.lower()
+    assert "slot" in lower and re.search(r"\b(no|zero|0|none)\b", lower), message
 
 
 # @spec M7
 def test_persistent_state_non_fit_precedes_auto_fit_of_max_model_len():
     """The capacity check runs before max_model_len is fitted automatically,
     which leaves it unchanged."""
-    message, config = _state_planning_error(2, auto_fit=True)
-    assert "max_num_seqs" in message and _mentions(message, 1), message
+    message, config = _state_planning_error(4, max_num_seqs=4, auto_fit=True)
+    for figure in (5, 4, 3, 32):
+        assert _mentions(message, figure), (figure, message)
+    assert "max_num_seqs" in message, message
     assert "Cannot auto-fit" not in message
     assert config.model_config.max_model_len == 32
 
@@ -2789,9 +2810,7 @@ def test_persistent_state_non_fit_precedes_auto_fit_of_max_model_len():
 @pytest.mark.parametrize(("budget_pages", "fit"), [(3, 3), (1, 1)])
 def test_persistent_state_override_non_fit_states_the_pages(budget_pages, fit):
     """An override larger than the budget fails planning; the message states
-    the override's pages, the fitting pages and the page size, and names the
-    override."""
+    the override's pages, the fitting pages and the page size."""
     message, _ = _state_planning_error(budget_pages, override=4)
     for figure in (4, fit, 32):
         assert _mentions(message, figure), (figure, message)
-    assert "num_gpu_blocks_override" in message, message

@@ -46,8 +46,9 @@ so configuration can apply the defaults of
 - Preempting a request with persistent state finishes it with an error instead
   of recomputing it, because the state cannot be rebuilt from tokens.
 - A resumable request parks for its next input only when a turn stops on EOS.
-  Any other stop (length, stop token or string) ends the stream. Each new input
-  replaces the request's prompt; the state carries the history. Multimodal
+  Any other stop (length, a stop token or repetition) ends the stream; stop
+  strings are refused for streaming input, so they never end a turn. Each new
+  input replaces the request's prompt; the state carries the history. Multimodal
   positions are relative to the input's own prompt, and an input with an item
   outside it is refused before it is applied or queued.
 
@@ -61,7 +62,10 @@ so configuration can apply the defaults of
   components, or whose `block_size` is not 1.
 - **C3.** A resumable persistent-state request whose turn stops on EOS keeps
   its slot and waits for its next input; a turn that stops on length, a stop
-  token or a stop string finishes the request.
+  token or repetition finishes the request.
+- **C7.** A request holds one slot from its first schedule until the slot is
+  released (F1); no two live requests hold the same slot, and a request holds
+  no slot before it is first scheduled.
 - **C4.** A parked request's next input replaces its prompt, and the next step
   binds the same handle, so the model sees the state the previous turn left.
 - **C5.** The worker binds a slot only for the scheduler's current handle; a
@@ -74,9 +78,9 @@ so configuration can apply the defaults of
 
 - **M32.** When an input of a resumable persistent-state request has a
   multimodal item outside its own prompt, the scheduler applies and queues
-  nothing from it, and the request finishes with an error at once, even
-  mid-turn; its slot retires as in F1, or is released at once as in F2 when it
-  was never scheduled.
+  nothing from it. The request finishes with an error at once, even mid-turn,
+  and its slot retires as in F1 (a request that was never scheduled holds no
+  slot).
 
 ## Model hooks
 
@@ -88,7 +92,7 @@ A persistent-state model uses these Model Runner V2 hooks:
 - `ModelState.prepare_step(scheduler_output, *, dummy_run, is_profile)` is
   called at the start of each `execute_model`, so the model can tell profiling
   and dummy runs from scheduled steps.
-- A model class that sets `supports_persistent_state = True` also gets
+- **C8.** A model class that sets `supports_persistent_state = True` also gets
   `prepare_step` on the dummy and profiling runs that happen before its state
   slots are bound. Without it, `prepare_step` runs only once slots exist.
 
@@ -102,17 +106,20 @@ memory protection: tensors already returned are not revoked.
 The pool's size is configured: `max_num_seqs + 1` pages, or
 `num_gpu_blocks_override` when it is set. Planning computes how many pages fit
 the KV cache budget. The budget comes from memory profiling or from
-`kv_cache_memory_bytes`. When fewer pages fit than are configured, startup
-fails and, without an override, reports the largest `max_num_seqs` that fits
-the measured budget; the engine never runs with fewer slots than configured.
-Memory that other allocations take can depend on `max_num_seqs`, so a smaller
-value can change the budget, and the reported value is a starting point for the
-next attempt, not a guarantee.
+`kv_cache_memory_bytes`; when the graph-memory estimate runs, the graphs the
+runner captures are counted in it. When fewer pages fit than are configured,
+startup fails and, without an override, reports the largest `max_num_seqs`
+that fits the measured budget; the engine never runs with fewer slots than
+configured. Graph memory can depend on `max_num_seqs`, so a smaller value can
+change the budget, and the reported value is a starting point for the next
+attempt, not a guarantee.
 
-The pool is allocated once, in full, and its pages keep their addresses for
-the engine's lifetime. For that reason a state-only layout does not use the
-extensible KV cache, which commits pages after warmup, sized from measured
-memory: the state pool's size is already fixed by configuration.
+The serving pool is allocated once, in full, before the serving graph capture,
+and its pages keep their addresses for the engine's lifetime, so graphs
+captured over it stay valid. For that reason a state-only layout does not use
+the extensible KV cache, which commits pages after warmup and graph capture,
+sized from measured memory: the state pool's size is already fixed by
+configuration, and the model's graphs address every page.
 
 ### Startup criteria
 
@@ -129,7 +136,8 @@ memory: the state pool's size is already fixed by configuration.
   fits (one less than the fitting page count), or that no slot fits when fewer
   than two pages fit. Under a persistent-state layout, a
   `num_gpu_blocks_override` below 2 raises `ValueError` stating that the pool
-  would hold no slot, before memory profiling. When the planned pages fit, the
+  would hold no slot, before memory profiling allocates any temporary pool.
+  When the planned pages fit, the
   pool has exactly the planned page count; planning never reduces it.
 
 ## Release fence
@@ -166,7 +174,9 @@ acknowledged is retried once; a second miss is a fatal engine error.
   cleanup is sent once more; when that is not acknowledged either, the
   scheduler raises `RuntimeError`, which ends the engine. Clients of the
   multiprocess engine then see `EngineDeadError`; the in-process engine raises
-  the `RuntimeError` from its step.
+  the `RuntimeError` from its step. Without a fault in the worker, every
+  cleanup is acknowledged, so the engine-level outcome has no public path; the
+  scheduler's raise is its testable part.
 
 ## Cache clearing and release
 

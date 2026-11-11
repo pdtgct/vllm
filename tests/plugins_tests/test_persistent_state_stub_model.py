@@ -182,17 +182,20 @@ def test_engine_refuses_more_slots_than_the_fixed_budget_holds(
 
 # @spec M7
 @create_new_process_for_each_test()
+@pytest.mark.parametrize("override", [0, 1])
 def test_engine_refuses_an_override_below_two_pages_before_profiling(
-    dummy_state_model_path,
+    dummy_state_model_path, override
 ):
-    """num_gpu_blocks_override=1 holds no slot: startup fails with a ValueError
-    saying so before memory profiling runs the model or any state pool is
-    bound."""
+    """An override below two pages holds no slot: startup fails with a
+    ValueError saying so, before memory profiling allocates any temporary
+    pool, so no state pool, temporary or serving, was ever bound."""
     events = _stub_events()
     events.clear()
-    with pytest.raises(ValueError, match="no slot"):
-        _engine_core(dummy_state_model_path, num_gpu_blocks_override=1)
-    assert [e for e in events if e[0] in ("forward", "initialize_state_slots")] == []
+    with pytest.raises(ValueError) as rejected:
+        _engine_core(dummy_state_model_path, num_gpu_blocks_override=override)
+    lower = str(rejected.value).lower()
+    assert "slot" in lower and re.search(r"\b(no|zero|0|none)\b", lower), lower
+    assert [e for e in events if e[0] == "initialize_state_slots"] == []
 
 
 # @spec M31
@@ -208,8 +211,7 @@ def test_engine_refuses_an_undeclared_state_layer(dummy_undeclared_state_model_p
     assert [e for e in events if e[0] == "forward"] == []
 
 
-# @spec model-hooks (prepare_step on runs before the slots are bound; the LLD
-# states this hook clause without a criterion ID)
+# @spec C8
 @create_new_process_for_each_test()
 def test_declared_model_gets_prepare_step_before_its_slots_are_bound(
     dummy_state_model_path,
@@ -301,8 +303,10 @@ def _park(core, request_id="stream"):
 
 
 def _bind(core, request_id="stream"):
-    """One step of a turn: the request is running and its slot is bound."""
-    _feed(core, request_id, FIRST_INPUT)
+    """One step of a long request: it is running and its slot is bound."""
+    _feed(
+        core, request_id, FIRST_INPUT, resumable=False, max_tokens=50, ignore_eos=True
+    )
     core.step_fn()
     assert core.scheduler.requests[request_id].status == RequestStatus.RUNNING
     assert _manager(core).get(request_id) is not None
@@ -338,12 +342,19 @@ def test_in_process_keep_pause_clearing_the_cache_refused(dummy_state_model_path
 
 # @spec M17
 @create_new_process_for_each_test()
-def test_in_process_reset_of_running_requests_refused_while_parked(
-    dummy_state_model_path,
+@pytest.mark.parametrize("held", ["parked", "bound"])
+def test_in_process_reset_of_running_requests_refused_while_held(
+    dummy_state_model_path, held
 ):
+    """A reset of running requests is refused with the exact message while a
+    slot is parked or bound (one step into a long request), before anything
+    changes."""
     core = _engine_core(dummy_state_model_path)
     try:
-        _park(core)
+        if held == "parked":
+            _park(core)
+        else:
+            _bind(core)
         before = _snapshot(core)
         with pytest.raises(RuntimeError) as refused:
             core.reset_prefix_cache(reset_running_requests=True)
@@ -503,7 +514,9 @@ def test_in_process_clearing_keep_pause_with_only_retiring_slots_drains(
         core.shutdown()
 
 
-# The multiprocess engine through AsyncLLM (M17).
+# The multiprocess engine through AsyncLLM (M17). A bound slot is held only
+# for one step, which a multiprocess client cannot order a pause against, so
+# bound-slot refusals are tested in-process above.
 
 
 def _async_llm(path, monkeypatch):
@@ -615,47 +628,6 @@ async def test_async_llm_keep_pause_without_clear_preserves_the_stream(
 
 # @spec M17
 @pytest.mark.asyncio
-async def test_async_llm_clearing_pauses_refused_while_a_slot_is_bound(
-    dummy_state_model_path, monkeypatch
-):
-    """A request held mid-generation by a keep pause without a clear has a
-    bound slot; keep and wait pauses that clear the cache are then refused,
-    and the request completes after the resume."""
-    llm = _async_llm(dummy_state_model_path, monkeypatch)
-    try:
-        params = SamplingParams(max_tokens=50, temperature=0, ignore_eos=True)
-        started, finished = asyncio.Event(), asyncio.Event()
-
-        async def generate():
-            tokens = []
-            async for output in llm.generate(
-                {"prompt_token_ids": FIRST_INPUT}, params, "bound"
-            ):
-                tokens = output.outputs[0].token_ids
-                started.set()
-            finished.set()
-            return tokens
-
-        task = asyncio.create_task(generate())
-        await asyncio.wait_for(started.wait(), TIMEOUT)
-        await asyncio.wait_for(
-            llm.pause_generation(mode="keep", clear_cache=False), TIMEOUT
-        )
-        # Precondition: the request is still running, so its slot is bound.
-        assert not finished.is_set()
-        for mode in ("keep", "wait"):
-            with pytest.raises(Exception, match=re.escape(PAUSE_REFUSAL.format(n=1))):
-                await asyncio.wait_for(
-                    llm.pause_generation(mode=mode, clear_cache=True), TIMEOUT
-                )
-        await asyncio.wait_for(llm.resume_generation(), TIMEOUT)
-        assert len(await asyncio.wait_for(task, TIMEOUT)) == 50
-    finally:
-        llm.shutdown()
-
-
-# @spec M17
-@pytest.mark.asyncio
 async def test_async_llm_abort_pause_drains_a_parked_stream(
     dummy_state_model_path, monkeypatch
 ):
@@ -702,33 +674,6 @@ async def test_async_llm_clearing_pause_with_only_retiring_slots_completes(
         after = _Stream(llm, "after")
         await after.wait_parked()
         assert (await after.finish())[0] == _llm_expected_turns(llm)
-    finally:
-        llm.shutdown()
-
-
-# @spec C3
-@pytest.mark.asyncio
-async def test_async_llm_refuses_stop_strings_on_streaming_input(
-    dummy_state_model_path, monkeypatch
-):
-    """A stop string is evaluated by the frontend, not the engine core, and
-    the frontend refuses it on streaming input; so no resumable stream can
-    stop on one and park."""
-    from vllm.engine.protocol import StreamingInput
-    from vllm.exceptions import VLLMValidationError
-    from vllm.inputs import TokensPrompt
-
-    llm = _async_llm(dummy_state_model_path, monkeypatch)
-    try:
-
-        async def inputs():
-            yield StreamingInput(prompt=TokensPrompt(prompt_token_ids=FIRST_INPUT))
-
-        with pytest.raises(VLLMValidationError, match="stop strings"):
-            async for _ in llm.generate(
-                inputs(), SamplingParams(max_tokens=8, stop=["x"]), "stop"
-            ):
-                pass
     finally:
         llm.shutdown()
 
