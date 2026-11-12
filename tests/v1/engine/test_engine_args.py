@@ -849,7 +849,6 @@ def test_persistent_state_extensible_kv_cache_unset_resolves_off(
 
 
 # @spec M29
-@requires_cuda
 def test_persistent_state_extensible_kv_cache_requested_fails(
     state_stub_models, dummy_state_model_path
 ):

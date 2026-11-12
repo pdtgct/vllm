@@ -9497,6 +9497,46 @@ def test_state_stream_other_stops_end_the_stream(stop, queued):
     assert manager.num_free_slots == 2
 
 
+# @spec C3
+@pytest.mark.parametrize("stop", ["eos", "stop_token", "length"])
+def test_state_stream_output_ends_the_clients_stream_unless_it_parks(stop):
+    """The output of a turn that ends a resumable request also ends the
+    client's stream; the output of a turn that parks at EOS does not."""
+    scheduler = _state_scheduler()
+    params = {"stop_token": {"stop_token_ids": [6]}, "length": {"max_tokens": 1}}
+    scheduler.add_request(_stream_input(tokens=[3], **params.get(stop, {})))
+    step = scheduler.schedule()
+    sampled = EOS_TOKEN_ID if stop == "eos" else 6
+    outputs = scheduler.update_from_output(step, _state_output(step, sampled=sampled))
+    (output,) = _finished_outputs(outputs, "stream")
+    assert output.ends_stream is (stop != "eos")
+
+
+# @spec F1
+def test_state_same_request_id_waits_for_its_retiring_slot():
+    """A new request with the id of an ended request whose slot is still
+    retiring is not scheduled, although another slot is free, until that slot
+    has been released."""
+    scheduler = _state_scheduler()
+    manager = _state_manager(scheduler)
+    (ended,) = create_requests(num_requests=1, num_tokens=4)
+    scheduler.add_request(ended)
+    step = scheduler.schedule()
+    old = manager.get(ended.request_id)
+    scheduler.update_from_output(step, _state_output(step))
+    scheduler.finish_requests(ended.request_id, RequestStatus.FINISHED_ABORTED)
+    (again,) = create_requests(num_requests=1, num_tokens=4)
+    assert again.request_id == ended.request_id
+    scheduler.add_request(again)
+    cleanup = scheduler.schedule()
+    assert manager.num_free_slots == 1
+    assert not cleanup.num_scheduled_tokens
+    assert cleanup.state_cleanup_handles == {ended.request_id: {"state": old}}
+    scheduler.update_from_output(cleanup, _state_output(cleanup))
+    assert scheduler.schedule().num_scheduled_tokens == {again.request_id: 4}
+    assert manager.get(again.request_id) not in (None, old)
+
+
 # A misplaced multimodal item in a continuation of a stream that was never
 # admitted ends the request at once (M32).
 
@@ -9711,3 +9751,39 @@ def test_state_reset_running_requests_with_only_retiring_slots_asks_for_a_retry(
     scheduler.update_from_output(cleanup, _state_output(cleanup))
     assert not scheduler.state_retirements
     assert scheduler.reset_prefix_cache(reset_running_requests=True) is True
+
+
+# @spec M17
+# @spec M32
+def test_state_held_outputs_keep_errors_queued_while_held():
+    """Errors queued before and while queued outputs are held reach the client
+    in the first step after the hold, and none in the held steps, whose
+    outputs the caller drops."""
+    scheduler = _state_scheduler()
+    for request_id in ("a", "b"):
+        _hold_slot(scheduler, "parked", request_id)
+
+    def end_with_an_error(request_id):
+        misplaced = _misplaced_input(5, 1)
+        scheduler.add_request(
+            _stream_input(request_id, mm_features=misplaced.mm_features)
+        )
+        assert request_id not in scheduler.requests
+
+    def step():
+        scheduler_output = scheduler.schedule()
+        return scheduler.update_from_output(
+            scheduler_output, _state_output(scheduler_output)
+        )
+
+    end_with_an_error("a")
+    with scheduler.holding_queued_outputs():
+        held = [step()]
+        end_with_an_error("b")
+        held.append(step())
+    assert [o for outputs in held for o in _finished_outputs(outputs, "a")] == []
+    assert [o for outputs in held for o in _finished_outputs(outputs, "b")] == []
+    after = step()
+    for request_id in ("a", "b"):
+        (error,) = _finished_outputs(after, request_id)
+        assert error.finish_reason == FinishReason.ERROR

@@ -62,7 +62,9 @@ so configuration can apply the defaults of
   components, or whose `block_size` is not 1.
 - **C3.** A resumable persistent-state request whose turn stops on EOS keeps
   its slot and waits for its next input; a turn that stops on length, a stop
-  token or repetition finishes the request.
+  token or repetition finishes the request. That turn's final output also
+  finishes the client's stream: `AsyncLLM.generate` returns after it, and no
+  later input of that stream reaches the engine.
 - **C7.** A request holds one slot from its first schedule until the slot is
   released (F1); no two live requests hold the same slot, and a request holds
   no slot before it is first scheduled.
@@ -94,7 +96,7 @@ A persistent-state model uses these Model Runner V2 hooks:
   and dummy runs from scheduled steps.
 - **C8.** A model class that sets `supports_persistent_state = True` also gets
   `prepare_step` on the dummy and profiling runs that happen before its state
-  slots are bound. Without it, `prepare_step` runs only once slots exist.
+  slots are bound.
 
 `StateSlotBindings.bind_rows` authorizes the current step's handles; the
 `StateSlotRows` it returns expose the complete component pools, but a model
@@ -159,7 +161,9 @@ acknowledged is retried once; a second miss is a fatal engine error.
   need new blocks and M17 refuses a reset while a slot is bound or parked)
   returns to the free pool only after the scheduler has received a
   `StateCompletion` covering the request's last scheduled step and a later
-  cleanup of its handle. Until then scheduling binds no other handle to it.
+  cleanup of its handle. Until then scheduling binds no other handle to it,
+  and a new request with the same request id waits until that slot is
+  released.
 - **F2.** A slot that was never scheduled is released at once. Every slot is
   allocated by a schedule, so this is a property of the slot manager.
 - **F3.** The worker records a completion's event on the main stream after

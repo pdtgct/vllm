@@ -802,15 +802,107 @@ async def test_async_llm_clearing_pause_with_only_retiring_slots_completes(
         llm.shutdown()
 
 
+def _record_engine_inputs(llm) -> list[tuple[list[int], bool]]:
+    """The prompt and resumable flag of each request AsyncLLM sends to the
+    engine core, in order, copied when it is sent."""
+    sent: list[tuple[list[int], bool]] = []
+    add = llm.engine_core.add_request_async
+
+    async def record(request):
+        sent.append((list(request.prompt_token_ids or ()), request.resumable))
+        return await add(request)
+
+    llm.engine_core.add_request_async = record
+    return sent
+
+
+# @spec C3
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop", ["length", "stop_token"])
+@pytest.mark.parametrize("later", ["after_the_end", "queued"])
+async def test_async_llm_stream_ends_with_a_turn_that_stops_off_eos(
+    dummy_state_model_path, monkeypatch, stop, later
+):
+    """A turn that stops on the length limit or a stop token finishes the
+    client's stream with that finish reason, so `generate` returns. An input
+    offered after the client has seen the end never reaches the engine, and
+    no end-of-input request follows it; an input queued before the end is
+    dropped with the request. Both slots are then free for two new streams.
+    (Repetition cannot end a stub turn: the stub never emits one token twice
+    in a row, and a turn has two tokens before its EOS.)"""
+    from vllm_add_dummy_model.my_persistent_state import expected_tokens
+
+    from vllm.engine.protocol import StreamingInput
+    from vllm.inputs import TokensPrompt
+    from vllm.sampling_params import RequestOutputKind
+
+    llm = _async_llm(dummy_state_model_path, monkeypatch)
+    try:
+        hf = llm.model_config.hf_config
+        turn = expected_tokens(
+            0, FIRST_INPUT[-1], llm.model_config.get_vocab_size(), int(hf.eos_token_id)
+        )
+        if stop == "length":
+            params: dict = {"max_tokens": 1}
+            expected = (turn[:1], "length", None)
+        else:
+            params = {"max_tokens": 8, "stop_token_ids": [turn[1]]}
+            expected = (turn[:2], "stop", turn[1])
+        sent = _record_engine_inputs(llm)
+        ended = asyncio.Event()
+
+        async def inputs():
+            yield StreamingInput(
+                prompt=TokensPrompt(prompt_token_ids=list(FIRST_INPUT))
+            )
+            if later == "after_the_end":
+                await ended.wait()
+            yield StreamingInput(
+                prompt=TokensPrompt(prompt_token_ids=list(SECOND_INPUT))
+            )
+
+        outputs = []
+
+        async def run():
+            sampling = SamplingParams(
+                temperature=0, output_kind=RequestOutputKind.DELTA, **params
+            )
+            async for output in llm.generate(inputs(), sampling, "ended"):
+                outputs.append(output)
+                if output.outputs[0].finish_reason is not None:
+                    ended.set()
+
+        await asyncio.wait_for(run(), TIMEOUT)
+        final = outputs[-1].outputs[0]
+        assert [t for o in outputs for t in o.outputs[0].token_ids] == expected[0]
+        assert outputs[-1].finished
+        assert (final.finish_reason, final.stop_reason) == expected[1:]
+        assert not any(o.finished for o in outputs[:-1])
+        if later == "after_the_end":
+            assert sent == [(FIRST_INPUT, True)]
+        streams = [_Stream(llm, f"after-{i}") for i in range(2)]
+        for after in streams:
+            await after.wait_parked()
+        for after in streams:
+            assert (await after.finish())[0] == _llm_expected_turns(llm)
+    finally:
+        llm.shutdown()
+
+
 # The release fence on the worker (F3).
 
 
 # @spec F3
 def test_completion_waits_for_a_registered_writing_stream():
-    """A write enqueued on a registered auxiliary stream is still pending when
-    the step is fenced and its completion collected, and is complete once the
-    completion is delivered: the worker joins every registered stream into
-    the main stream before recording the event."""
+    """A write enqueued on a registered auxiliary stream holds back the step's
+    completion: the auxiliary stream is held by a host gate, so the write is
+    pending when the step is fenced, and the completion is collected only
+    after the gate opens and the write completes. The worker joins every
+    registered stream into the main stream before recording the event."""
+    import ctypes
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, wait
+
     from tests.v1.core.utils import create_state_spec
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheGroupSpec, StateSlotHandle
@@ -834,16 +926,44 @@ def test_completion_waits_for_a_registered_writing_stream():
     bindings.activate_requests()
     rows = bindings.bind_rows(STATE_LAYER, ("r",), (handle,))
     count = rows.component_pools["count"]
+
+    # The handshake: a host function holds the auxiliary stream until the
+    # test opens the gate (bounded, so a failure cannot hang the device).
+    gate, released = threading.Event(), threading.Event()
+
+    def hold(_):
+        gate.wait(TIMEOUT)
+        released.set()
+
+    host_fn = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(hold)
+    libcuda = ctypes.CDLL("libcuda.so.1")
     written = torch.cuda.Event()
-    with torch.cuda.stream(aux):
-        torch.cuda._sleep(1_000_000_000)
-        count[1].fill_(7)
-        written.record(aux)
-    completion = bindings.finish_step(ModelRunnerOutput(req_ids=["r"]), main)
-    # Precondition: the write is still pending when the step is fenced; a
-    # host slow enough to see it complete makes this test fail, not pass.
-    assert not written.query()
-    output = completion.get_output()
+    try:
+        with torch.cuda.stream(aux):
+            assert (
+                libcuda.cuLaunchHostFunc(
+                    ctypes.c_void_p(aux.cuda_stream), host_fn, None
+                )
+                == 0
+            )
+            count[1].fill_(7)
+            written.record(aux)
+        completion = bindings.finish_step(ModelRunnerOutput(req_ids=["r"]), main)
+        assert not written.query()
+        with ThreadPoolExecutor(1) as pool_executor:
+            collected = pool_executor.submit(
+                lambda: (completion.get_output(), released.is_set())
+            )
+            # A completion that did not wait for the auxiliary stream would
+            # arrive while the gate is still closed.
+            done, _ = wait([collected], timeout=1)
+            assert not done
+            gate.set()
+            output, after_release = collected.result(TIMEOUT)
+    finally:
+        gate.set()
+        torch.cuda.synchronize()
+    assert after_release
     assert written.query()
     assert output.state_completion is not None
     assert output.state_completion.handles == {"r": {STATE_LAYER: handle}}

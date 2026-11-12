@@ -684,3 +684,50 @@ def test_state_rows_only_for_the_current_steps_handles():
     with pytest.raises(ValueError, match="Stale state step access"):
         earlier.component_pools  # noqa: B018
     assert bindings.bind_rows("state", ("b",), (second,)).slot_indices_cpu == (2,)
+
+
+class _HostEvent:
+    """A CPU stand-in for the completion's CUDA event."""
+
+    def __init__(self, **kwargs):
+        pass
+
+    def record(self, stream):
+        pass
+
+    def synchronize(self):
+        pass
+
+
+# @spec F4
+def test_state_model_failure_reaches_the_steps_completion(monkeypatch):
+    """A failure the model reports during a live step is carried by that
+    step's completion; outside a live step (before it, during its cleanup
+    phase or after it) or for a request outside it, the report is refused."""
+    from vllm.v1.outputs import ModelRunnerOutput
+
+    monkeypatch.setattr(torch.cuda, "Event", _HostEvent)
+    bindings = _state_bindings()
+    handle = _handle()
+    stream = torch.Stream(device="cpu")
+    with pytest.raises(ValueError, match="No live state step"):
+        bindings.fail_requests({"r"})
+    step = SchedulerOutput.make_empty()
+    step.state_step_seq = 1
+    step.state_slot_handles = {"r": {"state": handle}}
+    step.state_cleanup_handles = {}
+    bindings.begin_step(step, stream)
+    with pytest.raises(ValueError, match="No live state step"):
+        bindings.fail_requests({"r"})
+    bindings.activate_requests()
+    with pytest.raises(ValueError, match="outside the active state step"):
+        bindings.fail_requests({"other"})
+    bindings.fail_requests({"r"})
+    completion = bindings.finish_step(ModelRunnerOutput(req_ids=["r"]), stream)
+    output = completion.get_output()
+    assert output.state_completion is not None
+    assert output.state_completion.step_seq == 1
+    assert output.state_completion.handles == {"r": {"state": handle}}
+    assert output.state_completion.failed_req_ids == {"r"}
+    with pytest.raises(ValueError, match="No live state step"):
+        bindings.fail_requests({"r"})
