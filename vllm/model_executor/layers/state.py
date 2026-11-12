@@ -20,6 +20,15 @@ class PersistentStateLayerBase(nn.Module):
     ) -> None:
         super().__init__()
         config = vllm_config or get_current_vllm_config()
+        # @spec M31
+        model_config = config.model_config
+        if model_config is not None and not model_config.has_persistent_state:
+            # Configuration applies the persistent-state defaults only to a
+            # declared model, so an undeclared state layer fails here.
+            raise ValueError(
+                f"{model_config.architecture} builds a persistent-state layer, "
+                "so its class must set supports_persistent_state = True"
+            )
         if not prefix:
             raise ValueError("persistent-state layer prefix must be nonempty")
         self._persistent_state_spec = spec

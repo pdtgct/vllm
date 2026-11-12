@@ -2074,6 +2074,12 @@ class ModelConfig:
         return self._model_info.has_inner_state
 
     @property
+    def has_persistent_state(self) -> bool:
+        """Whether the model class declares `supports_persistent_state`; see
+        docs/design/persistent_state.md."""
+        return self._model_info.has_persistent_state
+
+    @property
     def speculator_config_class(self) -> str | None:
         """For a speculative decoding draft model, the config class of the
         speculator it's for, if it declares one (see `SpeculativeDraftModel`)."""

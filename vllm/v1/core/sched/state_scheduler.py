@@ -28,6 +28,26 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 
+# Cache clears that would end a live stream are refused (M17).
+RESET_HELD = (
+    "persistent state: {n} state slot(s) are held, and resetting running "
+    "requests would end their streams. Abort the streams and wait until they "
+    "have retired, then reset again."
+)
+PAUSE_HELD = (
+    "persistent state: {n} state slot(s) are held, and clearing the cache would "
+    "end their streams. Pause with clear_cache=False; to clear the cache, abort "
+    "the streams, wait until they have retired, then reset the prefix cache."
+)
+RETIRING = (
+    "persistent state: {n} state slot(s) are still retiring; retry the reset "
+    "once they have retired."
+)
+RELEASE_REFUSED = (
+    "persistent state: the KV cache holds per-stream state, so it cannot be "
+    "released while the engine runs."
+)
+
 
 def has_persistent_state(kv_cache_config: KVCacheConfig) -> bool:
     return any(
@@ -230,17 +250,44 @@ class StateScheduler(Scheduler):
             request.resumable = False
         return super()._handle_stopped_request(request)
 
+    # @spec M32
     def add_request(self, request: Request) -> None:
-        if (
-            request.resumable
-            and request.request_id in self.requests
-            and self._misplaced_multimodal_input(request)
-        ):
+        session = self.requests.get(request.request_id) if request.resumable else None
+        if session is not None and self._misplaced_multimodal_input(request):
             # Every refusal precedes the first mutation; the replacement itself
-            # is applied later and must not be able to fail.
-            self._queue_state_error(request)
+            # is applied later and must not be able to fail. The stream ends at
+            # once, even mid-turn, so its slot retires.
+            self.finish_requests(request.request_id, RequestStatus.FINISHED_ERROR)
+            self._queue_state_error(session)
             return
         super().add_request(request)
+
+    def state_slot_counts(self) -> tuple[int, int]:
+        """The bound or parked state slots, and the retiring ones."""
+        held = sum(
+            any(m.get(req_id) is not None for m in self.state_managers.values())
+            for req_id in self.requests
+        )
+        return held, len(self.state_retirements)
+
+    # @spec M17
+    def check_cache_clear(self, held_message: str, refuse_retiring: bool) -> None:
+        """Refuse a cache clear that would end a live stream, before any change;
+        with `refuse_retiring`, also one that must wait for retiring slots."""
+        held, retiring = self.state_slot_counts()
+        if held:
+            raise RuntimeError(held_message.format(n=held))
+        if retiring and refuse_retiring:
+            raise RuntimeError(RETIRING.format(n=retiring))
+
+    def reset_prefix_cache(
+        self, reset_running_requests: bool = False, reset_connector: bool = False
+    ) -> bool:
+        # Without resetting running requests, held slots keep blocks in use, so
+        # the base reset returns False and changes nothing.
+        if reset_running_requests:
+            self.check_cache_clear(RESET_HELD, refuse_retiring=True)
+        return super().reset_prefix_cache(reset_running_requests, reset_connector)
 
     def _free_request_blocks(self, request: Request) -> None:
         # Retire the slot before the generic block free; it returns to the
