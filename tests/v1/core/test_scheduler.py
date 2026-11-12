@@ -9582,6 +9582,29 @@ def test_state_stream_misplaced_continuation_before_first_schedule(offset, lengt
     assert error.finish_reason == FinishReason.ERROR
 
 
+# @spec M32
+@_MISPLACED_MM
+def test_state_stream_misplaced_first_input_is_refused(offset, length):
+    """A new resumable request whose first input has a misplaced item is
+    refused: nothing is applied or queued, it never holds a slot, and the
+    client gets exactly one error output for it."""
+    scheduler = _state_scheduler()
+    manager = _state_manager(scheduler)
+    request = _misplaced_input(offset, length)
+    scheduler.add_request(request)
+    assert request.status == RequestStatus.FINISHED_ERROR
+    assert "stream" not in scheduler.requests
+    assert sum(scheduler.get_request_counts()) == 0
+    assert manager.num_free_slots == 2
+    assert not scheduler.state_retirements
+    step = scheduler.schedule()
+    assert not step.num_scheduled_tokens
+    outputs = scheduler.update_from_output(step, _state_output(step))
+    (error,) = _finished_outputs(outputs, "stream")
+    assert error.finish_reason == FinishReason.ERROR
+    assert not scheduler.has_requests()
+
+
 # Cache clearing never ends a live stream (M17).
 
 _RESET_HELD = (

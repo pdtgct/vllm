@@ -755,10 +755,9 @@ def _state_config(path, **overrides):
     return EngineArgs(
         model=path,
         load_format="dummy",
-        enable_prefix_caching=False,
         max_model_len=64,
         max_num_seqs=2,
-        **overrides,
+        **{"enable_prefix_caching": False, **overrides},
     ).create_engine_config(UsageContext.OPENAI_API_SERVER)
 
 
@@ -856,6 +855,40 @@ def test_persistent_state_extensible_kv_cache_requested_fails(
 ):
     with pytest.raises(ValueError, match="persistent state"):
         _state_config(dummy_state_model_path, enable_extensible_kv_cache=True)
+
+
+# @spec M34
+def test_persistent_state_prefix_caching_unset_resolves_off(
+    state_stub_models, dummy_state_model_path, caplog_vllm
+):
+    """Unset, prefix caching resolves off without a warning; the other
+    defaults are explicit so that they log nothing here."""
+    caplog_vllm.clear()
+    config = _state_config(
+        dummy_state_model_path,
+        enable_prefix_caching=None,
+        async_scheduling=False,
+        compilation_config={"cudagraph_mode": "NONE"},
+    )
+    assert config.cache_config.enable_prefix_caching is False
+    assert [r for r in caplog_vllm.records if r.levelname == "WARNING"] == [], (
+        caplog_vllm.text
+    )
+
+
+# @spec M34
+# @spec C6
+def test_persistent_state_prefix_caching_requested_fails_at_startup(
+    state_stub_models, dummy_state_model_path
+):
+    """An explicit request is kept, and KV cache planning refuses it as an
+    unsupported configuration."""
+    from tests.v1.core.utils import create_state_spec, get_kv_cache_configs
+
+    config = _state_config(dummy_state_model_path, enable_prefix_caching=True)
+    assert config.cache_config.enable_prefix_caching is True
+    with pytest.raises(ValueError, match="does not support prefix caching"):
+        get_kv_cache_configs(config, [{"state": create_state_spec()}], [4096])
 
 
 # @spec M33

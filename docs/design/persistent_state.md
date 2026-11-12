@@ -166,8 +166,10 @@ acknowledged is retried once; a second miss is a fatal engine error.
   joining every registered state-writing stream into it, and the completion
   reaches the scheduler only after that event has completed.
 - **F4.** A scheduled state step without a matching completion finishes its
-  request with an error. A completion for a handle of an older generation is
-  ignored.
+  request with an error, and so does a request that the matching completion
+  reports as failed (the model reports it through
+  `StateSlotBindings.fail_requests`). A completion for a handle of an older
+  generation is ignored.
 - **F5.** A cleanup that is not acknowledged quarantines the slot, and the
   cleanup is sent once more; when that is not acknowledged either, the
   scheduler raises `RuntimeError`, which ends the engine. Clients of the
@@ -259,7 +261,9 @@ following is configured:
 - sleep mode or the CuMem allocator
 - HiSparse
 
-Three defaults differ for a model that declares persistent state. Asynchronous
+Four defaults differ for a model that declares persistent state. Prefix
+caching is off by default, since a stream's state is not a function of a
+shared token prefix (M34). Asynchronous
 scheduling is off by default: it schedules a step before the previous step's
 output is processed, so a resumable request's next step can run on the EOS
 that ended its turn and advance the stream's state on input it never
@@ -293,6 +297,9 @@ unset option resolves to off and an explicit request fails:
   the model can capture its own graphs.` An explicit NONE logs nothing.
   `enforce_eager` gives NONE without a warning and, as without persistent
   state, takes precedence over an explicit mode.
+- **M34.** When the model declares persistent state and
+  `enable_prefix_caching` is unset, configuration resolves it to `False`
+  without a warning. When it is `True`, startup fails as C6 states.
 - **M31.** The model registry reports `has_persistent_state` as `True` exactly
   for a model class that sets `supports_persistent_state = True`, including an
   out-of-tree class registered lazily, and `ModelConfig.has_persistent_state`

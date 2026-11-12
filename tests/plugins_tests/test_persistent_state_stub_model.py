@@ -275,11 +275,11 @@ def _params(core: EngineCore, **kwargs) -> SamplingParams:
     return params
 
 
-def _feed(core, request_id, tokens, resumable=True, **params):
+def _feed(core, request_id, tokens, resumable=True, mm_features=None, **params):
     request = EngineCoreRequest(
         request_id=request_id,
         prompt_token_ids=list(tokens),
-        mm_features=None,
+        mm_features=mm_features,
         sampling_params=_params(core, **params),
         pooling_params=None,
         arrival_time=time.time(),
@@ -490,18 +490,32 @@ def test_in_process_reset_drains_retiring_slots(
         core.shutdown()
 
 
+# A pause without a cache clear leaves the slot retiring; the queued request
+# then waits in the scheduler, which a paused scheduler does not report as
+# unfinished.
+_ALREADY_PAUSED = pytest.mark.parametrize("paused", [None, "keep", "abort"])
+
+
+def _pause_without_clear(core, paused):
+    if paused is not None:
+        assert core.pause_scheduler(mode=paused, clear_cache=False) is None
+
+
 # @spec M17
 @create_new_process_for_each_test("spawn")
 @pytest.mark.parametrize("reset_running_requests", [True, False])
+@_ALREADY_PAUSED
 def test_in_process_reset_with_a_queued_request_does_not_step(
-    dummy_state_model_path, reset_running_requests
+    dummy_state_model_path, reset_running_requests, paused
 ):
     """With a slot retiring and a request queued, the in-process reset of
     running requests raises the retry message, and the reset without them
-    returns False; neither steps the engine or changes anything."""
+    returns False; neither steps the engine or changes anything, whether or
+    not the engine is already paused."""
     core = _engine_core(dummy_state_model_path)
     try:
         _retire(core)
+        _pause_without_clear(core, paused)
         _feed(core, "queued", FIRST_INPUT, resumable=False)
         before = _snapshot(core)
         if reset_running_requests:
@@ -517,14 +531,17 @@ def test_in_process_reset_with_a_queued_request_does_not_step(
 
 # @spec M17
 @create_new_process_for_each_test("spawn")
+@_ALREADY_PAUSED
 def test_in_process_clearing_keep_pause_with_a_queued_request_asks_for_a_retry(
-    dummy_state_model_path,
+    dummy_state_model_path, paused
 ):
     """With a slot retiring and a request queued, a keep pause that clears the
-    cache raises the retry message before any change."""
+    cache raises the retry message before any change, whether or not the
+    engine is already paused."""
     core = _engine_core(dummy_state_model_path)
     try:
         _retire(core)
+        _pause_without_clear(core, paused)
         _feed(core, "queued", FIRST_INPUT, resumable=False)
         before = _snapshot(core)
         with pytest.raises(RuntimeError) as refused:
@@ -550,6 +567,71 @@ def test_in_process_clearing_keep_pause_with_only_retiring_slots_drains(
         assert _retiring(core) == []
         assert _manager(core).num_free_slots == free
         assert core.scheduler.pause_state == PauseState.PAUSED_ALL
+    finally:
+        core.shutdown()
+
+
+def _end_with_misplaced_input(core, request_id="stream"):
+    """End a parked stream with an input whose image lies past its prompt: its
+    slot retires and its error output is queued for the next step (M32)."""
+    from vllm.multimodal.inputs import (
+        MultiModalFeatureSpec,
+        MultiModalKwargsItem,
+        PlaceholderRange,
+    )
+
+    image = MultiModalFeatureSpec(
+        data=MultiModalKwargsItem.dummy(),
+        mm_position=PlaceholderRange(offset=len(SECOND_INPUT), length=1),
+        identifier="image",
+        modality="image",
+    )
+    _feed(core, request_id, SECOND_INPUT, mm_features=[image])
+    assert request_id not in core.scheduler.requests
+    assert _retiring(core) == [request_id]
+
+
+# @spec M17
+# @spec M32
+@create_new_process_for_each_test("spawn")
+@pytest.mark.parametrize(
+    ("mode", "reset_connector"),
+    [(None, True), ("keep", True), ("keep", False), ("abort", False)],
+    ids=["reset", "keep-pause", "keep-pause-keeping-connector", "abort-pause"],
+)
+def test_in_process_cache_clear_delivers_a_queued_error_once(
+    dummy_state_model_path, mode, reset_connector
+):
+    """A stream that ended with an error just before a cache clear gets its
+    error output exactly once, after the clear: the steps that retire its slot
+    during the reset or the clearing pause deliver nothing and drop nothing."""
+    from vllm.v1.engine import FinishReason
+
+    core = _engine_core(dummy_state_model_path)
+    try:
+        _park(core)
+        _end_with_misplaced_input(core)
+        if mode is None:
+            assert core.reset_prefix_cache(reset_running_requests=True)
+        else:
+            assert (
+                core.pause_scheduler(
+                    mode=mode, clear_cache=True, reset_connector=reset_connector
+                )
+                is None
+            )
+            core.resume_scheduler()
+        assert _retiring(core) == []
+        ends = []
+        for _ in range(3):
+            outputs, _ = core.step_fn()
+            ends += [
+                output.finish_reason
+                for batch in outputs.values()
+                for output in batch.outputs
+                if output.request_id == "stream" and output.finish_reason is not None
+            ]
+        assert ends == [FinishReason.ERROR]
     finally:
         core.shutdown()
 
