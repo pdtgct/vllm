@@ -6,14 +6,15 @@ See docs/design/persistent_state.md for the slot and release-fence contracts
 this scheduler implements.
 """
 
-from contextlib import suppress
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 
 from vllm.config import SchedulerConfig, VllmConfig
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.core.state_slot_manager import StateSlotRetirement, validate_state_config
+from vllm.v1.core.state_slot_manager import StateSlotRetirement
 from vllm.v1.engine import (
     EngineCoreEventType,
     EngineCoreOutput,
@@ -56,6 +57,7 @@ def has_persistent_state(kv_cache_config: KVCacheConfig) -> bool:
     )
 
 
+# @spec C1
 def get_scheduler_cls(
     scheduler_config: SchedulerConfig, kv_cache_config: KVCacheConfig
 ) -> type[SchedulerInterface]:
@@ -87,7 +89,6 @@ class StateScheduler(Scheduler):
     ) -> None:
         if not has_persistent_state(kv_cache_config):
             raise ValueError("StateScheduler requires a persistent-state KV cache")
-        validate_state_config(vllm_config)
         super().__init__(vllm_config, kv_cache_config, *args, **kwargs)
         self.state_retirements: list[StateSlotRetirement] = []
         self.state_cleanup_misses: dict[StateSlotHandle, int] = {}
@@ -153,6 +154,7 @@ class StateScheduler(Scheduler):
         self._free_request(request)
         self._queue_state_error(request)
 
+    # @spec C4
     def _update_request_as_session(
         self, session: Request, update: StreamingUpdate
     ) -> None:
@@ -241,6 +243,7 @@ class StateScheduler(Scheduler):
             outputs[client_index].append(error_output)
         self.state_error_outputs.clear()
 
+    # @spec C3
     def _handle_stopped_request(self, request: Request) -> bool:
         # A state stream parks only at EOS; any other stop leaves model state
         # mid-turn, so the stream ends instead of resuming.
@@ -252,15 +255,37 @@ class StateScheduler(Scheduler):
 
     # @spec M32
     def add_request(self, request: Request) -> None:
-        session = self.requests.get(request.request_id) if request.resumable else None
-        if session is not None and self._misplaced_multimodal_input(request):
+        if request.resumable and self._misplaced_multimodal_input(request):
             # Every refusal precedes the first mutation; the replacement itself
-            # is applied later and must not be able to fail. The stream ends at
-            # once, even mid-turn, so its slot retires.
-            self.finish_requests(request.request_id, RequestStatus.FINISHED_ERROR)
-            self._queue_state_error(session)
+            # is applied later and must not be able to fail. A continuation
+            # ends its stream at once, even mid-turn, so its slot retires; a
+            # first input is never queued.
+            if request.request_id in self.requests:
+                ended = self.finish_requests(
+                    request.request_id, RequestStatus.FINISHED_ERROR
+                )
+            else:
+                request.status = RequestStatus.FINISHED_ERROR
+                ended = [request]
+            for ended_request in ended:
+                self._queue_state_error(ended_request)
             return
         super().add_request(request)
+
+    def has_queued_requests(self) -> bool:
+        """Whether a request waits or runs, whatever the pause state; a parked
+        stream waits only for its next input."""
+        return sum(self.get_request_counts()) > self.num_waiting_for_streaming_input
+
+    @contextmanager
+    def holding_queued_outputs(self) -> Iterator[None]:
+        """Hold queued error outputs back from steps whose outputs the caller
+        drops, so that the next step delivers them."""
+        held, self.state_error_outputs = self.state_error_outputs, []
+        try:
+            yield
+        finally:
+            self.state_error_outputs[:0] = held
 
     def state_slot_counts(self) -> tuple[int, int]:
         """The bound or parked state slots, and the retiring ones."""
@@ -270,7 +295,6 @@ class StateScheduler(Scheduler):
         )
         return held, len(self.state_retirements)
 
-    # @spec M17
     def check_cache_clear(self, held_message: str, refuse_retiring: bool) -> None:
         """Refuse a cache clear that would end a live stream, before any change;
         with `refuse_retiring`, also one that must wait for retiring slots."""
@@ -280,6 +304,7 @@ class StateScheduler(Scheduler):
         if retiring and refuse_retiring:
             raise RuntimeError(RETIRING.format(n=retiring))
 
+    # @spec M17
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
@@ -289,6 +314,8 @@ class StateScheduler(Scheduler):
             self.check_cache_clear(RESET_HELD, refuse_retiring=True)
         return super().reset_prefix_cache(reset_running_requests, reset_connector)
 
+    # @spec F1
+    # @spec F2
     def _free_request_blocks(self, request: Request) -> None:
         # Retire the slot before the generic block free; it returns to the
         # pool only once the worker acknowledges its release fence.
@@ -318,6 +345,8 @@ class StateScheduler(Scheduler):
             if not entry.allocator.release(entry.handle, entry.fence_step)
         ]
 
+    # @spec F4
+    # @spec F5
     def _complete_state_slots(
         self, scheduled: SchedulerOutput, output: ModelRunnerOutput
     ) -> None:

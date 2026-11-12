@@ -9,7 +9,7 @@ import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Generator, Sequence, Sized
 from concurrent.futures import Future
-from contextlib import ExitStack, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from enum import IntEnum
 from functools import partial
 from inspect import isclass, signature
@@ -950,6 +950,7 @@ class EngineCore:
 
         self.model_executor.reset_mm_cache()
 
+    # @spec M17
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
@@ -958,25 +959,36 @@ class EngineCore:
             reset_running_requests, reset_connector
         )
 
-    # @spec M17
     def _drain_retiring_state_slots(self) -> None:
-        """With only retiring state slots and no unfinished request, step until
+        """With only retiring state slots and no queued request, step until
         they have retired, so that a cache clear can proceed. Such a step
         carries cleanups and no request's work."""
         scheduler = self.scheduler
         if (
             not isinstance(scheduler, StateScheduler)
-            or scheduler.has_unfinished_requests()
+            or scheduler.has_queued_requests()
             or scheduler.state_slot_counts()[0]
         ):
             return
-        while scheduler.state_retirements:
-            _, model_executed = self.step_fn()
-            self.post_step(model_executed)
+        with scheduler.holding_queued_outputs():
+            while scheduler.state_retirements:
+                _, model_executed = self.step_fn()
+                self.post_step(model_executed)
 
-    def _check_state_cache_clear(self, refuse_retiring: bool) -> None:
+    def _holding_state_outputs(self) -> AbstractContextManager:
+        """Steps whose outputs are dropped leave the outputs that persistent
+        state queued, such as a stream's error, for the next step."""
         if isinstance(self.scheduler, StateScheduler):
-            self.scheduler.check_cache_clear(PAUSE_HELD, refuse_retiring)
+            return self.scheduler.holding_queued_outputs()
+        return nullcontext()
+
+    def _check_state_cache_clear(self, refuse_retiring_if_queued: bool) -> None:
+        scheduler = self.scheduler
+        if isinstance(scheduler, StateScheduler):
+            scheduler.check_cache_clear(
+                PAUSE_HELD,
+                refuse_retiring_if_queued and scheduler.has_queued_requests(),
+            )
 
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
@@ -1044,7 +1056,7 @@ class EngineCore:
             if clear_cache:
                 # Repeats the pause's entry check: nothing can bind or park a
                 # slot in between, so this is defensive.
-                self._check_state_cache_clear(refuse_retiring=False)
+                self._check_state_cache_clear(refuse_retiring_if_queued=False)
             # A completed pause promises an idle device: nothing else waits on
             # the last dummy batch an idle DP rank launches.
             self.model_executor.collective_rpc("synchronize_device")
@@ -1061,6 +1073,7 @@ class EngineCore:
                 raise
             self._fail_checkpoint(e)
 
+    # @spec M17
     def pause_scheduler(
         self,
         mode: PauseMode = "abort",
@@ -1090,9 +1103,7 @@ class EngineCore:
         if clear_cache and mode == "keep":
             # Only retiring slots drain before the reset, unless a request is
             # queued: stepping would run its work.
-            self._check_state_cache_clear(
-                refuse_retiring=self.scheduler.has_unfinished_requests()
-            )
+            self._check_state_cache_clear(refuse_retiring_if_queued=True)
 
         if mode == "abort":
             self.scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
@@ -1103,11 +1114,12 @@ class EngineCore:
             # Pending connector stores still read the KV cache that a sleep
             # discards. Step until they finish, as EngineCoreProc does before
             # it completes a pause.
-            while self.scheduler.has_requests() or self.batch_queue:
-                _, model_executed = self.step_fn()
-                self.post_step(model_executed)
-                if not model_executed:
-                    time.sleep(0.001)
+            with self._holding_state_outputs():
+                while self.scheduler.has_requests() or self.batch_queue:
+                    _, model_executed = self.step_fn()
+                    self.post_step(model_executed)
+                    if not model_executed:
+                        time.sleep(0.001)
         self._finish_pause(clear_cache, reset_connector)
 
         return None
@@ -1228,8 +1240,8 @@ class EngineCore:
         and all executor memory to be resident. Kept requests are recomputed
         after wake-up. `reset_connector` is as for `sleep`.
         """
+        # @spec M17
         if isinstance(self.scheduler, StateScheduler):
-            # @spec M17
             raise RuntimeError(RELEASE_REFUSED)
         if not (
             self.is_scheduler_paused()
@@ -2468,6 +2480,7 @@ class EngineCoreProc(EngineCore):
             RequestError(code="validation_error", message=str(error)),
         )
 
+    # @spec M17
     def pause_scheduler(
         self,
         mode: PauseMode = "abort",
@@ -2491,7 +2504,7 @@ class EngineCoreProc(EngineCore):
             raise ValueError(f"Invalid pause mode: {mode}")
         if clear_cache and mode != "abort":
             # Retiring slots release before the engine is idle.
-            self._check_state_cache_clear(refuse_retiring=False)
+            self._check_state_cache_clear(refuse_retiring_if_queued=False)
 
         def engine_idle_callback(engine: "EngineCoreProc", future: Future[Any]) -> None:
             try:

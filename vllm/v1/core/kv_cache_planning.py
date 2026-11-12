@@ -1598,6 +1598,7 @@ def get_kv_cache_configs(
     ]
 
     if has_state:
+        # @spec M7
         # The state pool's size is configured, not measured: plan exactly it.
         state_groups = projected_groups_per_worker[0]
         pool_bytes = _plan_persistent_state_pool(
@@ -1609,9 +1610,9 @@ def get_kv_cache_configs(
     # be allocated is decoupled from the profiled `available_memory`. Reflect
     # that in `available_memory` here so auto-fit, the admission check, and
     # the per-worker config builder all plan against the same effective
-    # capacity.
+    # capacity. A persistent-state pool already has the override's pages.
     override = vllm_config.cache_config.num_gpu_blocks_override
-    if override is not None:
+    if override is not None and not has_state:
         adjusted_memory: list[int] = []
         for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
             if not groups:
@@ -1708,7 +1709,6 @@ def get_kv_cache_configs(
     return kv_cache_configs
 
 
-# @spec M7
 def _plan_persistent_state_pool(
     builder: KVCacheConfigBuilder,
     vllm_config: VllmConfig,
@@ -1725,26 +1725,23 @@ def _plan_persistent_state_pool(
     fit = available_memory // page
     if fit >= planned:
         return planned * page
-    if override is not None:
-        need = f"num_gpu_blocks_override={planned} pages of {page} bytes"
-        advice = "Lower num_gpu_blocks_override or give"
-    else:
-        need = (
-            f"{planned} pages of {page} bytes (max_num_seqs={max_num_seqs} slots "
-            "and the null page)"
-        )
+    source, advice = "num_gpu_blocks_override", "lower num_gpu_blocks_override"
+    if override is None:
+        source = f"max_num_seqs={max_num_seqs} slots and the null page"
         advice = (
-            "No slot fits, since one page is the null page. Give"
-            if fit < 2
-            else f"The largest max_num_seqs that fits is {fit - 1}; lower it or give"
+            f"the largest max_num_seqs that fits is {fit - 1}; lower it"
+            if fit >= 2
+            else "no slot fits, since one page is the null page"
         )
     raise ValueError(
-        f"Persistent state needs {need}, but the KV cache budget holds {fit} "
-        f"pages. {advice} the KV cache more memory (gpu_memory_utilization or "
-        "kv_cache_memory_bytes)."
+        f"Persistent state needs {planned} pages of {page} bytes ({source}), but "
+        f"the KV cache budget holds {fit} pages: {advice}, or give the KV cache "
+        "more memory (gpu_memory_utilization or kv_cache_memory_bytes)."
     )
 
 
+# @spec C2
+# @spec C6
 def _check_persistent_state_layout(
     vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]
 ) -> KVCacheSpec | None:
@@ -1762,6 +1759,7 @@ def _check_persistent_state_layout(
     validate_state_config(vllm_config)
     override = vllm_config.cache_config.num_gpu_blocks_override
     if override is not None and override < 2:
+        # @spec M7
         # Checked before memory profiling; one page is the null page.
         raise ValueError(
             f"num_gpu_blocks_override={override} leaves the persistent-state "

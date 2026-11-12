@@ -62,6 +62,8 @@ class StateSlotViews:
         self._epoch: str | None = None
         self._owners: dict[int, tuple[str, StateSlotHandle]] = {}
 
+    # @spec C5
+    # @spec M5
     def bind(self, request_id: str, handle: StateSlotHandle) -> None:
         if not 0 < handle.slot < self.capacity or handle.generation <= 0:
             raise ValueError("Invalid state slot handle")
@@ -128,18 +130,9 @@ class StateSlotRows:
         slots._validate_rows(self.layer, self.request_ids, self.handles)
 
     @property
-    def spec(self) -> PersistentStateSpec:
-        self.validate_current()
-        return self._bindings.views[self.layer].spec
-
-    @property
     def component_pools(self) -> Mapping[str, torch.Tensor]:
         self.validate_current()
         return MappingProxyType(self._bindings.views[self.layer]._views)
-
-    @property
-    def views(self) -> Mapping[str, torch.Tensor]:
-        return self.component_pools
 
 
 class StateSlotBindings:
@@ -197,6 +190,7 @@ class StateSlotBindings:
                 raise ValueError("Stale or invalid state row handle/order")
             views.validate_handle(request_id, handle)
 
+    # @spec C5
     def bind_rows(
         self,
         layer: str,
@@ -251,14 +245,7 @@ class StateSlotBindings:
     def activate_requests(self) -> None:
         self._cleaning_up = False
 
-    def get_handle(self, request_id: str, layer_name: str) -> StateSlotHandle:
-        """Resolve a handle only while its request is scheduled on this worker."""
-        if self._completion is None:
-            raise ValueError("No state step is active")
-        if self._cleaning_up:
-            return self._completion.cleanup_handles[request_id][layer_name]
-        return self._completion.handles[request_id][layer_name]
-
+    # @spec F4
     def fail_requests(self, request_ids: set[str]) -> None:
         """Report model failures with the same fence and handle identity as writes."""
         if self._completion is None or self._cleaning_up:
@@ -270,6 +257,7 @@ class StateSlotBindings:
             failed_req_ids=self._completion.failed_req_ids.union(request_ids),
         )
 
+    # @spec F3
     def finish_step(
         self,
         output: AsyncModelRunnerOutput | ModelRunnerOutput,

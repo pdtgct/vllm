@@ -107,9 +107,6 @@ class KVCacheCoordinator(ABC):
         num_prefill_lookahead: int = 0,
         num_hash_lookahead_tokens: int = 0,
     ):
-        from vllm.v1.core.state_slot_manager import validate_state_groups
-
-        validate_state_groups(kv_cache_config.kv_cache_groups)
         self.kv_cache_config = kv_cache_config
         # The scheduling granularity (LCM of all group block sizes), must be a multiple
         # of the hash_block_size and the block size of each group.

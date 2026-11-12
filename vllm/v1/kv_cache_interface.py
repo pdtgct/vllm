@@ -1565,6 +1565,7 @@ class PersistentStateSpec(KVCacheSpec):
     state_name: str
     _page_size_bytes: int = field(compare=True, repr=False)
 
+    # @spec C2
     def __init__(
         self,
         *,

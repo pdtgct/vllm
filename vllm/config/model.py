@@ -2278,6 +2278,10 @@ class ModelConfig:
     def is_prefix_caching_supported(self) -> bool:
         attn_type = self.attn_type
 
+        if self.has_persistent_state:
+            # @spec M34
+            logger.debug("Persistent-state models do not support prefix caching.")
+            return False
         if pooler_config := self.pooler_config:
             # for pooling models
             if attn_type == "encoder_only":

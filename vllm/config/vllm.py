@@ -1734,7 +1734,7 @@ class VllmConfig:
                 )
                 self.kernel_config.enable_jit_warmup = False
 
-        if self.model_config is not None and self.model_config.has_persistent_state:
+        if has_persistent_state:
             # @spec M33
             # Checked before platform defaults, which may resolve the mode.
             mode = self.compilation_config.cudagraph_mode
@@ -2040,15 +2040,7 @@ class VllmConfig:
 
         self._disable_cudagraphs_for_stock_torch_compile()
         self._validate_model_runner()
-        if self.model_config is not None and self.model_config.has_persistent_state:
-            # @spec M29
-            if self.cache_config.enable_extensible_kv_cache:
-                raise ValueError(
-                    "enable_extensible_kv_cache: persistent state fixes its pool "
-                    "at startup, and the state bindings address every page."
-                )
-            self.cache_config.enable_extensible_kv_cache = False
-        self._resolve_extensible_kv_cache()
+        self._resolve_extensible_kv_cache(has_persistent_state)
 
         self._validate_profiler_config()
         self._validate_batch_sharded_sampling()
@@ -3231,7 +3223,8 @@ class VllmConfig:
 
         return unsupported
 
-    def _resolve_extensible_kv_cache(self) -> None:
+    # @spec M29
+    def _resolve_extensible_kv_cache(self, has_persistent_state: bool = False) -> None:
         """Settle `enable_extensible_kv_cache`: on where supported if unset, an
         error if explicitly requested where unsupported.
 
@@ -3252,7 +3245,12 @@ class VllmConfig:
             else self.kv_transfer_config.kv_cache_access()
         )
         unsupported = None
-        if not current_platform.is_cuda_alike():
+        if has_persistent_state:
+            unsupported = (
+                "persistent state fixes its pool at startup, and the state "
+                "bindings address every page"
+            )
+        elif not current_platform.is_cuda_alike():
             unsupported = "it is only supported on CUDA and ROCm"
         elif cache_config.kv_cache_memory_bytes is not None:
             unsupported = (

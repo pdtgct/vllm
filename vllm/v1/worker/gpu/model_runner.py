@@ -679,14 +679,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             for g in kv_cache_config.kv_cache_groups
             if isinstance(g.kv_cache_spec, PersistentStateSpec)
         ]
-        if state_groups:
-            from vllm.v1.core.state_slot_manager import (
-                validate_state_config,
-                validate_state_groups,
-            )
-
-            validate_state_config(self.vllm_config)
-            validate_state_groups(kv_cache_config.kv_cache_groups)
 
         block_table_max_model_len = self.max_model_len
         if self.is_encoder_decoder:
@@ -1872,9 +1864,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ) -> AsyncModelRunnerOutput | ModelRunnerOutput | IntermediateTensors | None:
-        if self.state_slots is not None or getattr(
-            getattr(self, "model", None), "supports_persistent_state", False
-        ):
+        # @spec C8
+        if self.state_slots is not None or self.model_config.has_persistent_state:
             self.model_state.prepare_step(
                 scheduler_output, dummy_run=dummy_run, is_profile=is_profile
             )

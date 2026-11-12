@@ -11,24 +11,8 @@ from vllm.config import VllmConfig
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import BlockHashList, KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
-from vllm.v1.kv_cache_interface import (
-    KVCacheGroupSpec,
-    PersistentStateSpec,
-    StateSlotHandle,
-)
+from vllm.v1.kv_cache_interface import PersistentStateSpec, StateSlotHandle
 from vllm.v1.request import Request
-
-
-def validate_state_groups(groups: list[KVCacheGroupSpec]) -> None:
-    state_groups = [
-        g for g in groups if isinstance(g.kv_cache_spec, PersistentStateSpec)
-    ]
-    if not state_groups:
-        return
-    if len(state_groups) != len(groups):
-        raise ValueError("Persistent state requires a state-only cache layout")
-    if len(groups) != 1 or len(groups[0].layer_names) != 1:
-        raise ValueError("Persistent state requires one aggregate state spec")
 
 
 def validate_state_config(config: VllmConfig) -> None:
@@ -127,6 +111,7 @@ class PersistentStateManager(SingleTypeKVCacheManager):
             raise ValueError("Persistent state cannot import computed blocks")
         return int(request_id not in self._requests)
 
+    # @spec C7
     def allocate_new_blocks(
         self,
         request_id: str,
