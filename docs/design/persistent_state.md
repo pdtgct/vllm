@@ -579,8 +579,9 @@ conformance.)* are obligations of the model, which a model's own tests check.
   `capture_cudagraphs` nor `clear_cudagraphs`; it still calls
   `prepare_execution_memory`, `post_warmup` and `shutdown`.
 - **Other runners.** A runner that overrides `capture_model` and
-  `needs_cudagraph_capture` without calling `GPUModelRunner`'s, as the
-  encoder-only runner does, calls none of the three graph-capture hooks. The
+  `needs_cudagraph_capture` without calling `GPUModelRunner`'s, and whose
+  predicate returns `False`, as the encoder-only runner's always does,
+  calls none of the three graph-capture hooks. The
   graph-memory estimate calls none for it either: under a `cudagraph_mode`
   other than NONE the estimate allocates its temporary cache, that runner's
   predicate returns `False`, and the estimate's teardown then runs and makes
@@ -633,8 +634,9 @@ conformance.)* are obligations of the model, which a model's own tests check.
   `enforce_eager`, compilation or JIT-warmup setting, and whether or not it
   holds persistent state. Startup runs that warmup once.
 - **Post-warmup order.** In the startup run of the GPU worker's warmup,
-  `post_warmup` runs after the compile dummy runs, the kernel and JIT
-  warmups, graph capture, the final dummy run and the sampler warmup, and
+  `post_warmup` runs after those of the compile dummy runs, the kernel and
+  JIT warmups, graph capture, the final dummy run and the sampler warmup that
+  run, and
   immediately before the worker resets the random seed. Inductor's lazy
   initialization, JIT monitoring, GC freezing and the GPU sync check follow
   the seed reset, in that order. In a later run of the warmup the hook has
