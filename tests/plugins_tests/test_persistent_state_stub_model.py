@@ -2528,8 +2528,9 @@ def test_warmup_entry_points_execute_no_step_on_a_started_runner(started, scenar
 @pytest.mark.parametrize("scenario", ["capturing", "plain"])
 def test_registered_attention_warmup_skips_under_a_state_layout(started, scenario):
     """`mixed_batch_attention_warmup`, a registered warmup built on
-    `run_mixed_prefill_decode_warmup`, runs on the started worker, executes
-    no step and logs that it skipped."""
+    `run_mixed_prefill_decode_warmup`, runs on the started worker and
+    executes no step. Its skip message, which is logged once per process, is
+    among the records of the start."""
     seen = started(scenario)
     again = seen["warmup_again"]
     assert again["error"] is None
@@ -2658,8 +2659,12 @@ def test_post_warmup_precedes_inductor_lazy_initialization(started):
     assert seen["inductor_expected"] is True
     (hook,) = _calls(seen, "post_warmup")
     after = seen["after_startup"]
-    if hook["inductor_initialized"] is None or after["inductor_initialized"] is None:
-        pytest.skip("unsupported oracle: torch does not expose lazy_init.cache_info")
+    oracle = (hook["inductor_initialized"], after["inductor_initialized"])
+    assert None not in oracle, (
+        "unsupported test infrastructure: this torch does not expose "
+        "torch._inductor.fx_passes.joint_graph.lazy_init.cache_info, the "
+        "oracle of this test"
+    )
     assert hook["inductor_initialized"] is False
     assert after["inductor_initialized"] is True
 

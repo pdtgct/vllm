@@ -12,6 +12,8 @@ See https://github.com/vllm-project/vllm/issues/49224.
 
 import contextlib
 import gc
+import multiprocessing
+import threading
 from types import SimpleNamespace
 from typing import Any
 
@@ -558,10 +560,18 @@ class _RecordingModelState(DefaultModelState):
                 and self.encoder_runner.cudagraph_manager.is_captured()
             ),
         )
+        # A fresh allocation: with the caching allocator emptied, the 64 MiB
+        # cannot come out of memory that an earlier capture left reserved.
+        torch.cuda.synchronize(self.device)
+        torch.cuda.empty_cache()
         free = torch.cuda.mem_get_info(self.device)[0]
+        reserved = torch.cuda.memory_reserved(self.device)
         self._scratch = torch.zeros(64 * MiB, dtype=torch.uint8, device=self.device)
         torch.cuda.synchronize(self.device)
         info["device_bytes_taken"] = free - torch.cuda.mem_get_info(self.device)[0]
+        info["reserved_bytes_taken"] = (
+            torch.cuda.memory_reserved(self.device) - reserved
+        )
 
     def clear_cudagraphs(self) -> None:
         _record("clear_cudagraphs", has_bindings=self.state_slots is not None)
@@ -839,6 +849,39 @@ def _infos(seen: dict, hook: str) -> list[dict]:
     return [info for called, info in seen["calls"] if called == hook]
 
 
+# `call_in_spawned_process`, which the scenarios above start through.
+
+
+def _double(value: int) -> int:
+    return 2 * value
+
+
+def _refuse(value: int) -> int:
+    raise ValueError(f"refused {value}")
+
+
+def _never_return(value: int) -> int:
+    threading.Event().wait()
+    return value
+
+
+def test_call_in_spawned_process_returns_the_result():
+    assert call_in_spawned_process(_double, 21, timeout=START_TIMEOUT) == 42
+
+
+def test_call_in_spawned_process_raises_with_the_childs_traceback():
+    with pytest.raises(RuntimeError, match="ValueError: refused 3"):
+        call_in_spawned_process(_refuse, 3, timeout=START_TIMEOUT)
+
+
+def test_call_in_spawned_process_ends_a_call_that_does_not_finish():
+    """A call that outlasts its timeout raises, and its process is gone when
+    the helper returns."""
+    with pytest.raises(RuntimeError, match="did not finish within 1 s"):
+        call_in_spawned_process(_never_return, 0, timeout=1)
+    assert multiprocessing.active_children() == []
+
+
 _GRAPH_HOOKS = {"capture_cudagraphs", "clear_cudagraphs"}
 
 _NEEDS_DEVICE = pytest.mark.skipif(
@@ -897,11 +940,13 @@ def test_capture_result_includes_what_the_model_state_call_added(opt_started):
     for allocator rounding between the two starts."""
     seen = opt_started("capturing")
     (capture,) = _infos(seen, "capture_cudagraphs")
+    assert capture["reserved_bytes_taken"] >= 64 * MiB
     assert capture["device_bytes_taken"] >= 64 * MiB
     ((profile_only, captured),) = seen["capture_results"]
     ((_, without_call),) = opt_started("default-predicate")["capture_results"]
     assert profile_only is True
-    assert captured - without_call >= (64 - 8) * MiB
+    # Both figures, for the record of a failure.
+    assert captured - without_call >= (64 - 8) * MiB, (captured, without_call)
 
 
 @_NEEDS_DEVICE
