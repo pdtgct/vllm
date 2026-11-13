@@ -157,6 +157,7 @@ def test_profile_run_creates_aux_output_connector_before_forward(
     runner.vllm_config = vllm_config
     runner.model = model
     runner.aux_output_connector = None
+    runner.model_state = SimpleNamespace(prepare_execution_memory=lambda: None)
     runner.supports_mm_inputs = False
     runner.is_last_pp_rank = False
     runner.max_num_tokens = 8

@@ -144,14 +144,19 @@ class StartupPoolAccess:
     _window: object
     layer: str
 
+    def _live_views(self) -> StateSlotViews:
+        if self._bindings._startup_window is not self._window:
+            raise ValueError("Stale startup pool access")
+        return self._bindings.views[self.layer]
+
     @property
     def spec(self) -> PersistentStateSpec:
-        raise NotImplementedError
+        return self._live_views().spec
 
     @property
     def component_pools(self) -> Mapping[str, torch.Tensor]:
         """One tensor per descriptor, covering every page."""
-        raise NotImplementedError
+        return MappingProxyType(self._live_views()._views)
 
 
 class StateSlotBindings:
@@ -170,6 +175,7 @@ class StateSlotBindings:
         self._main_stream: torch.cuda.Stream | None = None
         self._cleaning_up = False
         self._step_id: object | None = None
+        self._startup_window: object | None = None
 
     @contextmanager
     def _startup_access_window(self) -> Iterator[None]:
@@ -178,13 +184,24 @@ class StateSlotBindings:
         For the runner only: it opens the window around the call, and a model
         never opens one. Leaving it invalidates every access object it issued.
         """
-        raise NotImplementedError
-        yield
+        if self._startup_window is not None:
+            raise RuntimeError("A startup-access window is already open")
+        self._startup_window = object()
+        try:
+            yield
+        finally:
+            self._startup_window = None
 
     def startup_pool_access(self, layer: str) -> StartupPoolAccess:
         """Expose every page of a state layer's pools, including the null page
         and unbound slots, while a startup-access window is open."""
-        raise NotImplementedError
+        if self._startup_window is None:
+            raise ValueError(
+                "Startup pool access is available only during capture_cudagraphs"
+            )
+        if layer not in self.views:
+            raise ValueError("Unknown state group")
+        return StartupPoolAccess(self, self._startup_window, layer)
 
     def pool_layout(self, layer: str) -> Mapping[str, StatePoolLayout]:
         """Snapshot a state layer's pool layout, keyed by descriptor name.
@@ -192,7 +209,19 @@ class StateSlotBindings:
         The snapshot holds plain values only, so a model can compare it with
         what a capture recorded without keeping the pools alive.
         """
-        raise NotImplementedError
+        if layer not in self.views:
+            raise ValueError("Unknown state group")
+        return MappingProxyType(
+            {
+                name: StatePoolLayout(
+                    pool.data_ptr(),
+                    tuple(pool.shape),
+                    tuple(pool.stride()),
+                    pool.dtype,
+                )
+                for name, pool in self.views[layer]._views.items()
+            }
+        )
 
     def _validate_rows(
         self,

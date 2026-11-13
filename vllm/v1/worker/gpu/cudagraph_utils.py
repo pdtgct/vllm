@@ -45,7 +45,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import current_stream
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.hisparse.binding import unbind_hisparse_caches
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, PersistentStateSpec
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
@@ -1043,6 +1043,7 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
         original_pools: dict[int, Any] = {}
         speculator = runner.speculator
         spec_manager_names: list[str] = []
+        capture_failed = False
         try:
             if not runner.needs_cudagraph_capture():
                 return 0
@@ -1078,7 +1079,12 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
             num_full_graphs = len(manager._capture_descs.get(CUDAGraphMode.FULL, []))
             full_estimate = _extrapolate_full_graph_memory(mem_samples, num_full_graphs)
             return max(measured - sum(mem_samples) + full_estimate, 0)
+        except BaseException:
+            capture_failed = True
+            raise
         finally:
+            # First, while the model state still holds the profiling bindings.
+            clear_error = _clear_model_state_cudagraphs(runner)
             compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
             compilation_counter.num_gpu_runner_capture_triggers = saved_capture_triggers
             CUDAGraphWrapper.clear_all_graphs()
@@ -1095,8 +1101,38 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
             # manager and flushes the allocator.
             del manager
             _teardown_profiling_state(runner)
+            if clear_error is not None:
+                if not capture_failed:
+                    raise clear_error
+                logger.error(
+                    "The model state failed to release its profiling CUDA "
+                    "graphs after an earlier failure",
+                    exc_info=clear_error,
+                )
     finally:
         platform_cls._global_graph_pool = saved_global_pool
+
+
+def _model_state_captures(runner: "GPUModelRunner") -> bool:
+    """Whether the runner's capture_model() calls the model state's
+    `capture_cudagraphs`. A runner with its own capture is asked first, so one
+    that captures nothing never reaches the model state."""
+    return (
+        runner.needs_cudagraph_capture()
+        and runner.model_state_needs_cudagraph_capture()
+    )
+
+
+def _clear_model_state_cudagraphs(runner: "GPUModelRunner") -> Exception | None:
+    """Have the model state release what it captured against the profiling
+    state. Returns its failure, so that the caller finishes its teardown before
+    deciding whether that failure propagates."""
+    try:
+        if _model_state_captures(runner):
+            runner.model_state.clear_cudagraphs()
+    except Exception as e:
+        return e
+    return None
 
 
 def _extrapolate_full_graph_memory(mem_samples: list[int], total_graphs: int) -> int:
@@ -1113,7 +1149,10 @@ def _extrapolate_full_graph_memory(mem_samples: list[int], total_graphs: int) ->
 def _init_minimal_kv_cache_for_profiling(runner: "GPUModelRunner") -> None:
     """Allocate the smallest KV cache that still lets every graph be captured."""
     from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
-    from vllm.v1.core.kv_cache_planning import get_kv_cache_groups_from_builder
+    from vllm.v1.core.kv_cache_planning import (
+        get_kv_cache_groups_from_builder,
+        planned_persistent_state_pages,
+    )
 
     builder = get_kv_cache_config_builder(runner.vllm_config)
     kv_cache_groups = get_kv_cache_groups_from_builder(
@@ -1124,6 +1163,14 @@ def _init_minimal_kv_cache_for_profiling(runner: "GPUModelRunner") -> None:
         min(runner.max_num_reqs, runner.compilation_config.max_cudagraph_capture_size)
         or 1
     )
+    if any(
+        isinstance(spec, PersistentStateSpec)
+        for group in kv_cache_groups
+        for spec in group.distinct_specs
+    ) and _model_state_captures(runner):
+        # The model state captures over its state pool, so the profiling
+        # capture needs the pool the serving capture will see.
+        min_blocks = planned_persistent_state_pages(runner.vllm_config)
     minimal_config = builder.get_kv_cache_config_from_groups(
         runner.vllm_config, kv_cache_groups, num_blocks=min_blocks
     )

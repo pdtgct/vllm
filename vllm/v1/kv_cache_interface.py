@@ -987,6 +987,24 @@ class KVCacheGroup:
         )
 
 
+def memory_contributors_note(groups: Sequence[KVCacheGroup]) -> str | None:
+    """State which options the persistent-state specs of `groups` declare as
+    using device memory; `None` when they declare none."""
+    names = [
+        name
+        for group in groups
+        for spec in group.distinct_specs
+        if isinstance(spec, PersistentStateSpec)
+        for name in spec.memory_contributors
+    ]
+    if not names:
+        return None
+    return (
+        "The model declares these options as using device memory: "
+        f"{', '.join(dict.fromkeys(names))}."
+    )
+
+
 class PrefixLookupGroup(NamedTuple):
     """KV cache groups looked up jointly for cache hits: they share a manager
     policy, block size and DCP sharding."""
