@@ -15,10 +15,15 @@ only repeat the setup.
 """
 
 import asyncio
+import gc
+import logging
+import os
 import re
 import time
+from contextlib import contextmanager
 
 import pytest
+import torch
 
 from tests.utils import create_new_process_for_each_test
 from tests.v1.core.utils import mentions_number
@@ -1466,3 +1471,878 @@ async def test_multiprocess_draining_shutdown_does_not_wait_for_a_never_fed_stre
         assert [o for batch in batches for o in batch.outputs] == []
     finally:
         client.shutdown()
+
+
+# Model-state hooks: execution memory, the model state's own CUDA graphs,
+# post-warmup and shutdown. Each test starts one in-process engine and reads
+# what the stub's hooks recorded. An engine here is not eager unless the test
+# says so; the persistent-state defaults then resolve `cudagraph_mode` to
+# NONE, so the only graph is the one the stub captures when asked.
+
+CAPTURING = {"capture_graphs": True}
+CONTRIBUTORS = ["stub_capture_mib", "stub_execution_mib"]
+FIXED_BUDGET = dict(kv_cache_memory_bytes=8 * MiB)
+# 64 pages of 16 GiB: a pool that no device holds.
+OVERSIZED_POOL = dict(max_num_seqs=63)
+OVERSIZED_PAGE_MIB = 16 * 1024
+
+
+def _stub_module():
+    """The stub's module, with the records of earlier engines of this process
+    cleared."""
+    import vllm_add_dummy_model.my_persistent_state as stub
+
+    for record in (stub.EVENTS, stub.BINDINGS, stub.RAISED):
+        record.clear()
+    return stub
+
+
+def _hook_core(path, options=None, **overrides) -> EngineCore:
+    """An in-process engine whose stub has `options`: the stub's `hf_overrides`
+    fields, named without their `stub_` prefix."""
+    fields = {f"stub_{name}": value for name, value in (options or {}).items()}
+    return _engine_core(
+        path, **{"enforce_eager": False, "hf_overrides": fields, **overrides}
+    )
+
+
+def _worker(core: EngineCore):
+    return core.model_executor.driver_worker.worker
+
+
+def _calls(stub, hook: str) -> list[dict]:
+    """What each call of `hook` recorded, in call order."""
+    return [event[1] for event in stub.EVENTS if event[0] == hook]
+
+
+def _positions(stub, kind: str) -> list[int]:
+    return [index for index, event in enumerate(stub.EVENTS) if event[0] == kind]
+
+
+def _scheduled_steps(stub) -> list:
+    """The steps the model ran with `dummy_run=False`."""
+    return [e for e in stub.EVENTS if e[0] == "prepare_step" and not e[1]]
+
+
+@contextmanager
+def _vllm_log_records():
+    """The records vLLM's loggers emit inside the block."""
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign]
+    logger = logging.getLogger("vllm")
+    logger.addHandler(handler)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(handler)
+
+
+def _contributor_notes(error: BaseException) -> list[str]:
+    """The notes on `error` that name every declared contributor."""
+    return [
+        note
+        for note in getattr(error, "__notes__", [])
+        if all(name in note for name in CONTRIBUTORS)
+    ]
+
+
+# Execution memory.
+
+
+@create_new_process_for_each_test("spawn")
+@pytest.mark.parametrize("budget", [{}, FIXED_BUDGET], ids=["profiled", "fixed"])
+def test_execution_memory_is_prepared_once_before_the_profiling_pass(
+    dummy_state_model_path, budget
+):
+    """The model state's `prepare_execution_memory` runs once, before the
+    profiling forward pass and before any state pool exists, whether the KV
+    cache budget is profiled or fixed."""
+    stub = _stub_module()
+    core = _hook_core(dummy_state_model_path, **budget)
+    try:
+        (prepared,) = _calls(stub, "prepare_execution_memory")
+        assert prepared["slots_bound"] is False
+        (position,) = _positions(stub, "prepare_execution_memory")
+        assert position < _positions(stub, "profile_run")[0]
+        assert position < _positions(stub, "forward")[0]
+        assert position < _positions(stub, "initialize_state_slots")[0]
+    finally:
+        core.shutdown()
+
+
+@create_new_process_for_each_test("spawn")
+def test_execution_memory_is_counted_in_the_profiled_budget(dummy_state_model_path):
+    """With a profiled budget the hook runs with the current vLLM
+    configuration set and before the worker limits allocator block splitting,
+    which it does for the profiling pass only; the 1 GiB that the hook leaves
+    allocated is not available to the KV cache."""
+    stub = _stub_module()
+    execution_mib = 1024
+    core = _hook_core(dummy_state_model_path, {"execution_mib": execution_mib})
+    try:
+        (prepared,) = _calls(stub, "prepare_execution_memory")
+        assert prepared["config_set"] is True
+        profiling = _calls(stub, "profile_run")[0]
+        assert "max_split_size_mb" in profiling["allocator_settings"]
+        assert prepared["allocator_settings"] != profiling["allocator_settings"]
+        assert prepared["allocator_settings"] == stub.allocator_settings()
+        worker = _worker(core)
+        unavailable = worker.requested_memory - worker.available_kv_cache_memory_bytes
+        assert unavailable >= execution_mib * MiB
+    finally:
+        core.shutdown()
+
+
+@create_new_process_for_each_test("spawn")
+def test_execution_memory_failure_fails_startup(dummy_state_model_path):
+    """An exception from `prepare_execution_memory` is the one that fails
+    startup, before the model runs."""
+    stub = _stub_module()
+    with pytest.raises(stub.StubHookError) as failed:
+        _hook_core(dummy_state_model_path, {"fail": ["prepare_execution_memory"]})
+    assert failed.value is stub.RAISED[0]
+    assert _positions(stub, "forward") == []
+
+
+@create_new_process_for_each_test("spawn")
+@pytest.mark.parametrize("profiling_pass", ["ends", "raises"])
+def test_allocator_settings_are_restored_after_the_profiling_pass(
+    dummy_state_model_path, profiling_pass
+):
+    """Once the profiling pass has ended or raised, the allocator settings
+    are again those in effect when `prepare_execution_memory` ran."""
+    stub = _stub_module()
+    if profiling_pass == "raises":
+        with pytest.raises(stub.StubHookError):
+            _hook_core(dummy_state_model_path, {"fail": ["profile_run"]})
+        core = None
+    else:
+        core = _hook_core(dummy_state_model_path)
+    try:
+        (prepared,) = _calls(stub, "prepare_execution_memory")
+        assert stub.allocator_settings() == prepared["allocator_settings"]
+    finally:
+        if core is not None:
+            core.shutdown()
+
+
+# The model state's own graphs: whether the runner captures.
+
+
+@create_new_process_for_each_test("spawn")
+def test_capture_predicate_is_first_asked_before_any_state_pool(
+    dummy_state_model_path,
+):
+    """Under NONE with the graph-memory estimate, the runner first asks the
+    model state whether it captures before any state binding exists. The
+    stub's predicate takes no argument, so the runner passes none."""
+    stub = _stub_module()
+    core = _hook_core(dummy_state_model_path, CAPTURING)
+    try:
+        first = _positions(stub, "needs_cudagraph_capture")[0]
+        assert first < _positions(stub, "initialize_state_slots")[0]
+        assert _calls(stub, "needs_cudagraph_capture")[0]["slots_bound"] is False
+    finally:
+        core.shutdown()
+
+
+@create_new_process_for_each_test("spawn")
+@pytest.mark.parametrize("captures", [True, False])
+def test_runner_needs_capture_when_the_model_state_does(
+    dummy_state_model_path, captures
+):
+    """Without eager mode, and with no encoder or decoder graph to capture,
+    the runner has graphs to capture exactly when the model state says it
+    captures, although `cudagraph_mode` is NONE."""
+    _stub_module()
+    core = _hook_core(dummy_state_model_path, {"capture_graphs": captures})
+    try:
+        config = core.vllm_config
+        assert config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+        assert _worker(core).model_runner.needs_cudagraph_capture() is captures
+    finally:
+        core.shutdown()
+
+
+@create_new_process_for_each_test("spawn")
+def test_eager_mode_never_asks_the_capture_predicate(dummy_state_model_path):
+    """With `enforce_eager` the runner has nothing to capture and does not
+    ask the model state, at startup or later."""
+    stub = _stub_module()
+    core = _hook_core(dummy_state_model_path, CAPTURING, enforce_eager=True)
+    try:
+        assert _worker(core).model_runner.needs_cudagraph_capture() is False
+        assert _calls(stub, "needs_cudagraph_capture") == []
+    finally:
+        core.shutdown()
+
+
+# The capture calls.
+
+
+@create_new_process_for_each_test("spawn")
+def test_estimate_and_warmup_each_capture_exactly_once(dummy_state_model_path):
+    """With no encoder or decoder graph, each `capture_model` call still
+    invokes `capture_cudagraphs` once: one call from the graph-memory
+    estimate, then one from the worker's warmup."""
+    stub = _stub_module()
+    core = _hook_core(dummy_state_model_path, CAPTURING)
+    try:
+        captures = _calls(stub, "capture_cudagraphs")
+        assert [capture["profile_only"] for capture in captures] == [True, False]
+    finally:
+        core.shutdown()
+
+
+@create_new_process_for_each_test("spawn")
+def test_estimate_captures_into_its_throwaway_pool(dummy_state_model_path):
+    """The estimate's capture call has `profile_only=True` and runs while the
+    platform's global graph pool is the estimate's throwaway pool, which is
+    not the pool that serves afterwards."""
+    stub = _stub_module()
+    core = _hook_core(dummy_state_model_path, CAPTURING)
+    try:
+        profiling = _calls(stub, "capture_cudagraphs")[0]
+        assert profiling["profile_only"] is True
+        assert profiling["graph_pool"] == profiling["global_graph_pool"]
+        assert profiling["graph_pool"] != current_platform.get_global_graph_pool()
+    finally:
+        core.shutdown()
+
+
+@create_new_process_for_each_test("spawn")
+def test_serving_capture_gets_the_global_pool_and_a_capture_stream(
+    dummy_state_model_path,
+):
+    """The serving call receives `profile_only=False`, the platform's global
+    graph pool, and a stream that is current during the call and is not the
+    main stream; the runner has left that stream when the next hook runs."""
+    stub = _stub_module()
+    core = _hook_core(dummy_state_model_path, CAPTURING)
+    try:
+        serving = _calls(stub, "capture_cudagraphs")[-1]
+        assert serving["profile_only"] is False
+        assert serving["graph_pool"] == current_platform.get_global_graph_pool()
+        assert serving["stream_is_current"] is True
+        assert serving["stream_is_main"] is False
+        (after,) = _calls(stub, "post_warmup")
+        assert after["on_main_stream"] is True
+    finally:
+        core.shutdown()
+
+
+@create_new_process_for_each_test("spawn")
+@pytest.mark.parametrize("budget", [{}, FIXED_BUDGET], ids=["estimate", "no-estimate"])
+def test_warmup_captures_once_over_the_serving_bindings(dummy_state_model_path, budget):
+    """Whether or not the estimate runs, the worker's warmup makes exactly one
+    `profile_only=False` call, while the model state holds the serving
+    bindings, before the final dummy run and before `post_warmup`."""
+    stub = _stub_module()
+    core = _hook_core(dummy_state_model_path, CAPTURING, **budget)
+    try:
+        captures = _calls(stub, "capture_cudagraphs")
+        (serving,) = [c for c in captures if not c["profile_only"]]
+        assert serving["bindings"] == len(stub.BINDINGS) - 1
+        position = _positions(stub, "capture_cudagraphs")[-1]
+        assert position > _positions(stub, "initialize_state_slots")[-1]
+        assert position < _positions(stub, "prepare_step")[-1]
+        assert position < _positions(stub, "post_warmup")[0]
+    finally:
+        core.shutdown()
+
+
+@create_new_process_for_each_test("spawn")
+def test_model_state_graphs_are_part_of_the_graph_memory_estimate(
+    dummy_state_model_path,
+):
+    """The 64 MiB that the profiling capture kept is in the worker's
+    graph-memory estimate, and the estimate is taken from the KV cache
+    budget."""
+    stub = _stub_module()
+    core = _hook_core(dummy_state_model_path, {**CAPTURING, "capture_mib": 64})
+    try:
+        profiling = _calls(stub, "capture_cudagraphs")[0]
+        assert profiling["profile_only"] is True
+        assert profiling["scratch_bytes"] == 64 * MiB
+        worker = _worker(core)
+        assert worker.cudagraph_memory_estimate >= profiling["scratch_bytes"]
+        assert worker.available_kv_cache_memory_bytes <= (
+            worker.requested_memory - worker.cudagraph_memory_estimate
+        )
+    finally:
+        core.shutdown()
+
+
+@create_new_process_for_each_test("spawn")
+@pytest.mark.parametrize("serving_capture", ["returns", "raises"])
+def test_stub_capture_finishes_its_device_work(dummy_state_model_path, serving_capture):
+    """The stub keeps its side of the capture contract: when a capture call
+    returns or raises, the capture on the runner's stream and the replay on
+    the stub's own stream have completed."""
+    stub = _stub_module()
+    if serving_capture == "raises":
+        with pytest.raises(stub.StubHookError):
+            _hook_core(
+                dummy_state_model_path, {**CAPTURING, "fail": ["capture_serving"]}
+            )
+        core = None
+    else:
+        core = _hook_core(dummy_state_model_path, CAPTURING)
+    try:
+        captures = _calls(stub, "capture_cudagraphs")
+        assert [capture["profile_only"] for capture in captures] == [True, False]
+        assert [capture["work_completed"] for capture in captures] == [True, True]
+    finally:
+        if core is not None:
+            core.shutdown()
+
+
+@create_new_process_for_each_test("spawn")
+@pytest.mark.parametrize("call", ["capture_profile", "capture_serving"])
+def test_capture_failure_fails_startup(dummy_state_model_path, call):
+    """An exception from `capture_cudagraphs`, in the estimate or in the
+    warmup, is the one that fails startup."""
+    stub = _stub_module()
+    with pytest.raises(stub.StubHookError) as failed:
+        _hook_core(dummy_state_model_path, {**CAPTURING, "fail": [call]})
+    assert failed.value is stub.RAISED[0]
+    assert call in str(failed.value)
+
+
+@create_new_process_for_each_test("spawn")
+@pytest.mark.parametrize("captures", [True, False])
+def test_workspace_is_locked_by_a_serving_capture_only(
+    dummy_state_model_path, captures
+):
+    """After the serving capture the workspace is locked, so `post_warmup`
+    sees it locked and a new workspace resource is refused; the profiling
+    capture leaves it unlocked. When nothing is captured it stays unlocked."""
+    from vllm.v1.worker.workspace import current_workspace_manager
+
+    stub = _stub_module()
+    core = _hook_core(dummy_state_model_path, {"capture_graphs": captures})
+    try:
+        assert [c["workspace_locked"] for c in _calls(stub, "clear_cudagraphs")] == (
+            [False] if captures else []
+        )
+        (after,) = _calls(stub, "post_warmup")
+        assert after["workspace_locked"] is captures
+        manager = current_workspace_manager()
+        if captures:
+            with pytest.raises(AssertionError, match="locked"):
+                manager.get_persistent_resource(("stub", "growth"), list)
+        else:
+            assert manager.get_persistent_resource(("stub", "growth"), list) == []
+    finally:
+        core.shutdown()
+
+
+# The profiling capture: its pool, its release and its failures.
+
+
+@create_new_process_for_each_test("spawn")
+@pytest.mark.parametrize(
+    ("sizing", "pages"),
+    [(dict(max_num_seqs=4), 5), (dict(num_gpu_blocks_override=7), 7)],
+    ids=["max_num_seqs", "override"],
+)
+def test_profiling_pool_has_the_planned_page_count(
+    dummy_state_model_path, sizing, pages
+):
+    """When the model state captures, the estimate's temporary state pool has
+    the planned page count, `max_num_seqs + 1` or the override, so the
+    profiling capture sees the pool shape of the serving capture."""
+    stub = _stub_module()
+    core = _hook_core(dummy_state_model_path, CAPTURING, **sizing)
+    try:
+        profiling, serving = _calls(stub, "capture_cudagraphs")
+        assert profiling["profile_only"] is True
+        assert profiling["pool_pages"] == pages
+        assert serving["pool_pages"] == pages
+        assert [binding["pages"] for binding in stub.BINDINGS] == [pages, pages]
+    finally:
+        core.shutdown()
+
+
+@create_new_process_for_each_test("spawn")
+def test_profiling_pool_allocation_failure_fails_startup_as_it_is(
+    dummy_state_model_path,
+):
+    """When the device cannot hold the temporary pool of the planned size,
+    the allocation's own exception fails startup: it is not the
+    planned-capacity `ValueError`, it states no `max_num_seqs`, and neither
+    the capture nor `clear_cudagraphs` runs."""
+    stub = _stub_module()
+    with pytest.raises(torch.OutOfMemoryError) as failed:
+        _hook_core(
+            dummy_state_model_path,
+            {**CAPTURING, "page_mib": OVERSIZED_PAGE_MIB},
+            **OVERSIZED_POOL,
+        )
+    assert "max_num_seqs" not in str(failed.value)
+    assert _positions(stub, "initialize_state_slots") == []
+    assert _calls(stub, "capture_cudagraphs") == []
+    assert _calls(stub, "clear_cudagraphs") == []
+
+
+@create_new_process_for_each_test("spawn")
+@pytest.mark.parametrize("profiling_capture", ["returns", "raises"])
+def test_estimate_teardown_clears_the_profiling_capture_once(
+    dummy_state_model_path, profiling_capture
+):
+    """The estimate's teardown calls `clear_cudagraphs` once, after the
+    profiling capture returned or raised, while the model state still holds
+    the profiling bindings and before the serving pool is bound."""
+    stub = _stub_module()
+    if profiling_capture == "raises":
+        with pytest.raises(stub.StubHookError):
+            _hook_core(
+                dummy_state_model_path, {**CAPTURING, "fail": ["capture_profile"]}
+            )
+        core = None
+    else:
+        core = _hook_core(dummy_state_model_path, CAPTURING)
+    try:
+        (cleared,) = _calls(stub, "clear_cudagraphs")
+        assert cleared["held_graph"] is True
+        assert cleared["bindings"] == 0
+        (position,) = _positions(stub, "clear_cudagraphs")
+        assert position > _positions(stub, "capture_cudagraphs")[0]
+        later_bindings = _positions(stub, "initialize_state_slots")[1:]
+        assert all(position < later for later in later_bindings)
+        assert len(later_bindings) == (0 if core is None else 1)
+    finally:
+        if core is not None:
+            core.shutdown()
+
+
+@create_new_process_for_each_test("spawn")
+def test_failed_release_fails_startup(dummy_state_model_path):
+    """With no other exception propagating, the exception from
+    `clear_cudagraphs` is the one that fails startup."""
+    stub = _stub_module()
+    with pytest.raises(stub.StubHookError) as failed:
+        _hook_core(dummy_state_model_path, {**CAPTURING, "fail": ["clear_cudagraphs"]})
+    assert failed.value is stub.RAISED[0]
+    assert "clear_cudagraphs" in str(failed.value)
+
+
+@create_new_process_for_each_test("spawn")
+def test_estimate_teardown_completes_after_a_failed_release(dummy_state_model_path):
+    """When `clear_cudagraphs` raises, the teardown still drops the profiling
+    bindings and restores the platform's global graph pool: the pool is no
+    longer the throwaway pool that the profiling capture was given."""
+    stub = _stub_module()
+    with pytest.raises(stub.StubHookError):
+        _hook_core(dummy_state_model_path, {**CAPTURING, "fail": ["clear_cudagraphs"]})
+    (profiling,) = _calls(stub, "capture_cudagraphs")
+    assert profiling["graph_pool"] == profiling["global_graph_pool"]
+    assert current_platform.get_global_graph_pool() != profiling["graph_pool"]
+    gc.collect()
+    assert [binding["ref"]() for binding in stub.BINDINGS] == [None]
+
+
+@create_new_process_for_each_test("spawn")
+def test_earlier_failure_outranks_a_failed_release(dummy_state_model_path):
+    """When the profiling capture raised and `clear_cudagraphs` then raises
+    too, the capture's exception fails startup, with its contributor note,
+    and the exception from `clear_cudagraphs` is logged with its traceback."""
+    stub = _stub_module()
+    options = {
+        **CAPTURING,
+        "memory_contributors": CONTRIBUTORS,
+        "fail": ["capture_profile", "clear_cudagraphs"],
+    }
+    with _vllm_log_records() as records, pytest.raises(stub.StubHookError) as failed:
+        _hook_core(dummy_state_model_path, options)
+    capture_error, clear_error = stub.RAISED
+    assert failed.value is capture_error
+    assert len(_contributor_notes(capture_error)) == 1
+    logged = [record for record in records if record.exc_info]
+    assert [r for r in logged if r.exc_info[1] is clear_error]
+    assert [r for r in logged if r.exc_info[1] is clear_error][0].exc_info[2]
+
+
+@create_new_process_for_each_test("spawn")
+@pytest.mark.parametrize("estimate", ["fixed-budget", "switched-off"])
+def test_without_the_estimate_only_the_serving_capture_runs(
+    dummy_state_model_path, estimate
+):
+    """With a fixed budget, or with the graph-memory estimate switched off,
+    there is no `profile_only=True` call and no `clear_cudagraphs` call; the
+    serving capture still runs."""
+    stub = _stub_module()
+    budget = {}
+    if estimate == "fixed-budget":
+        budget = FIXED_BUDGET
+    else:
+        os.environ["VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"] = "0"
+    core = _hook_core(dummy_state_model_path, CAPTURING, **budget)
+    try:
+        captures = _calls(stub, "capture_cudagraphs")
+        assert [capture["profile_only"] for capture in captures] == [False]
+        assert _calls(stub, "clear_cudagraphs") == []
+    finally:
+        core.shutdown()
+
+
+@create_new_process_for_each_test("spawn")
+def test_eager_mode_runs_the_other_hooks_but_no_capture(dummy_state_model_path):
+    """With `enforce_eager`, a model state that would capture gets neither
+    `capture_cudagraphs` nor `clear_cudagraphs`; it still gets
+    `prepare_execution_memory`, `post_warmup` and `shutdown`, once each."""
+    stub = _stub_module()
+    core = _hook_core(dummy_state_model_path, CAPTURING, enforce_eager=True)
+    core.shutdown()
+    assert _calls(stub, "capture_cudagraphs") == []
+    assert _calls(stub, "clear_cudagraphs") == []
+    for hook in ("prepare_execution_memory", "post_warmup", "shutdown"):
+        assert len(_calls(stub, hook)) == 1, hook
+
+
+@create_new_process_for_each_test("spawn")
+@pytest.mark.parametrize("captures", [True, False])
+def test_serving_bindings_replace_the_profiling_bindings(
+    dummy_state_model_path, captures
+):
+    """When the runner has graphs to capture, `initialize_state_slots` gets
+    bindings over the temporary pool and then, once, new bindings over the
+    serving pool; by then the runner has dropped the profiling bindings and
+    cleared the model state's. Otherwise there is no temporary pool and the
+    serving bindings are the only ones."""
+    stub = _stub_module()
+    core = _hook_core(dummy_state_model_path, {"capture_graphs": captures})
+    try:
+        if not captures:
+            assert len(stub.BINDINGS) == 1
+            return
+        profiling, serving = stub.BINDINGS
+        assert profiling["ref"]() is None
+        assert serving["previous_alive"] is False
+        assert serving["slots_cleared"] is True
+        assert serving["ref"]() is _worker(core).model_runner.state_slots
+    finally:
+        core.shutdown()
+
+
+# Startup pool access during the capture calls.
+
+
+@create_new_process_for_each_test("spawn")
+@pytest.mark.parametrize("serving_capture", ["returns", "raises"])
+def test_startup_access_is_open_during_each_capture_call_only(
+    dummy_state_model_path, serving_capture
+):
+    """Each capture call can take startup access to the pools of its
+    bindings, and that access is refused once the call has returned or
+    raised: at `clear_cudagraphs` after the profiling call, and at
+    `post_warmup`, or at `shutdown` after a failure, for the serving call."""
+    stub = _stub_module()
+    if serving_capture == "raises":
+        with pytest.raises(stub.StubHookError):
+            _hook_core(
+                dummy_state_model_path, {**CAPTURING, "fail": ["capture_serving"]}
+            )
+        core = None
+    else:
+        core = _hook_core(dummy_state_model_path, CAPTURING)
+    try:
+        captures = _calls(stub, "capture_cudagraphs")
+        assert [capture["pool_pages"] for capture in captures] == [3, 3]
+        (cleared,) = _calls(stub, "clear_cudagraphs")
+        assert cleared["stale_access_refused"] is True
+        after = "shutdown" if core is None else "post_warmup"
+        assert _calls(stub, after)[0]["stale_access_refused"] is True
+    finally:
+        if core is not None:
+            core.shutdown()
+
+
+# Memory contributors on allocation and capture failures.
+
+
+@create_new_process_for_each_test("spawn")
+@pytest.mark.parametrize("failure", ["error", "oom"])
+def test_capture_failure_notes_the_memory_contributors(dummy_state_model_path, failure):
+    """When `capture_cudagraphs` raises, whatever the exception's type, the
+    same exception object fails startup with one note that names each memory
+    contributor the spec declares. The note gives no advice: it names none of
+    the options that size the pool or the budget."""
+    stub = _stub_module()
+    options = {
+        **CAPTURING,
+        "memory_contributors": CONTRIBUTORS,
+        "fail": ["capture_serving"],
+        "fail_oom": failure == "oom",
+    }
+    expected = torch.OutOfMemoryError if failure == "oom" else stub.StubHookError
+    with pytest.raises(expected) as failed:
+        _hook_core(dummy_state_model_path, options, **FIXED_BUDGET)
+    assert failed.value is stub.RAISED[0]
+    (note,) = _contributor_notes(failed.value)
+    assert "memory" in note
+    for advice in ("max_num_seqs", "gpu_memory_utilization", "kv_cache_memory_bytes"):
+        assert advice not in note
+
+
+@create_new_process_for_each_test("spawn")
+def test_capture_failure_without_contributors_gets_no_note(dummy_state_model_path):
+    """When the spec declares no memory contributors, the exception from
+    `capture_cudagraphs` reaches the caller without a note."""
+    stub = _stub_module()
+    with pytest.raises(stub.StubHookError) as failed:
+        _hook_core(
+            dummy_state_model_path,
+            {**CAPTURING, "fail": ["capture_serving"]},
+            **FIXED_BUDGET,
+        )
+    assert failed.value is stub.RAISED[0]
+    assert getattr(failed.value, "__notes__", []) == []
+
+
+@create_new_process_for_each_test("spawn")
+@pytest.mark.parametrize("pool", ["temporary", "serving"])
+@pytest.mark.parametrize("contributors", [CONTRIBUTORS, []], ids=["named", "none"])
+def test_state_pool_allocation_failure_notes_the_memory_contributors(
+    dummy_state_model_path, pool, contributors
+):
+    """When the device cannot hold a state pool, the estimate's temporary
+    pool or the serving pool, the allocation's exception carries one note
+    naming each declared memory contributor, and none that names a model
+    option when the spec declares no contributors."""
+    _stub_module()
+    options = {
+        "page_mib": OVERSIZED_PAGE_MIB,
+        "memory_contributors": contributors,
+        # Only a model state that captures gets a temporary pool of this size.
+        "capture_graphs": pool == "temporary",
+    }
+    budget = {}
+    if pool == "serving":
+        # A fixed budget that holds the planned pages, so planning passes.
+        budget = dict(kv_cache_memory_bytes=64 * OVERSIZED_PAGE_MIB * MiB)
+    with pytest.raises(torch.OutOfMemoryError) as failed:
+        _hook_core(dummy_state_model_path, options, **OVERSIZED_POOL, **budget)
+    assert len(_contributor_notes(failed.value)) == (1 if contributors else 0)
+    if not contributors:
+        notes = getattr(failed.value, "__notes__", [])
+        assert not [note for note in notes if "stub_" in note]
+
+
+# Warmup under a persistent-state layout.
+
+
+@create_new_process_for_each_test("spawn")
+@pytest.mark.parametrize("captures", [True, False])
+def test_warmup_executes_no_scheduled_step(dummy_state_model_path, captures):
+    """Under NONE without `enforce_eager`, JIT warmup is enabled, yet the
+    model runs no step with `dummy_run=False` during startup, whatever the
+    model state's capture predicate returns. Called again on the started
+    runner, `warmup_kernels` executes no step, and
+    `run_mixed_prefill_decode_warmup` executes none and returns `False`."""
+    from vllm.v1.worker.gpu.warmup import (
+        run_mixed_prefill_decode_warmup,
+        warmup_kernels,
+    )
+
+    stub = _stub_module()
+    core = _hook_core(dummy_state_model_path, {"capture_graphs": captures})
+    try:
+        assert core.vllm_config.kernel_config.enable_jit_warmup is True
+        assert _scheduled_steps(stub) == []
+        worker = _worker(core)
+        runner = worker.model_runner
+        warmup_kernels(runner, worker.execute_model, worker.sample_tokens)
+        assert _scheduled_steps(stub) == []
+        ran = run_mixed_prefill_decode_warmup(
+            runner,
+            worker.execute_model,
+            worker.sample_tokens,
+            num_tokens=runner.max_num_tokens,
+        )
+        assert ran is False
+        assert _scheduled_steps(stub) == []
+    finally:
+        core.shutdown()
+
+
+@create_new_process_for_each_test("spawn")
+def test_capturing_model_starts_and_serves_without_eager_mode(dummy_state_model_path):
+    """With NONE and without `enforce_eager`, a model state that captures its
+    own graph starts through `LLM` and generates the stub's tokens. The
+    remaining warmup stages ran: the final dummy run follows the serving
+    capture, and JIT monitoring is on, as for any layout with JIT warmup."""
+    from vllm_add_dummy_model.my_persistent_state import expected_tokens
+
+    from vllm.utils import jit_monitor
+
+    stub = _stub_module()
+    llm = LLM(
+        **_engine_kwargs(
+            dummy_state_model_path,
+            enforce_eager=False,
+            compilation_config={"cudagraph_mode": "NONE"},
+            hf_overrides={"stub_capture_graphs": True},
+        )
+    )
+    capture = _positions(stub, "capture_cudagraphs")[-1]
+    dummy_runs = [i for i, e in enumerate(stub.EVENTS) if e[0] == "forward" and e[1]]
+    assert capture > _positions(stub, "initialize_state_slots")[-1]
+    assert [i for i in dummy_runs if i > capture]
+    assert jit_monitor.is_active() is True
+
+    model = _model(llm.llm_engine.engine_core.engine_core)
+    prompts = [[11 * i + 1, 11 * i + 2, 11 * i + 3] for i in range(4)]
+    params = SamplingParams(temperature=0, max_tokens=8)
+    outputs = llm.generate([{"prompt_token_ids": p} for p in prompts], params)
+    assert [list(output.outputs[0].token_ids) for output in outputs] == [
+        expected_tokens(0, prompt[-1], model.vocab_size, model.eos_token_id)
+        for prompt in prompts
+    ]
+
+
+# Post-warmup.
+
+
+@create_new_process_for_each_test("spawn")
+@pytest.mark.parametrize(
+    "configuration",
+    [
+        dict(enforce_eager=True),
+        dict(enforce_eager=False),
+        dict(enforce_eager=False, kernel_config={"enable_jit_warmup": False}),
+    ],
+    ids=["eager", "jit-warmup", "no-jit-warmup"],
+)
+def test_warmup_calls_post_warmup_once(dummy_state_model_path, configuration):
+    """A successful startup calls `post_warmup` exactly once, with or without
+    eager mode and JIT warmup."""
+    stub = _stub_module()
+    core = _hook_core(dummy_state_model_path, CAPTURING, **configuration)
+    try:
+        assert len(_calls(stub, "post_warmup")) == 1
+    finally:
+        core.shutdown()
+
+
+@create_new_process_for_each_test("spawn")
+def test_post_warmup_follows_the_model_runs_and_precedes_the_seed_reset(
+    dummy_state_model_path,
+):
+    """`post_warmup` runs after the capture, the final dummy run and the
+    sampler warmup: no model run or capture follows it at startup. It runs
+    before the seed reset, so the random numbers the stub draws there leave
+    the generator as a reset leaves it; and JIT monitoring and GC freezing,
+    which follow the reset, are not yet on."""
+    from vllm.utils import jit_monitor
+    from vllm.utils.torch_utils import set_random_seed
+
+    stub = _stub_module()
+    core = _hook_core(dummy_state_model_path, CAPTURING)
+    try:
+        (position,) = _positions(stub, "post_warmup")
+        assert position > _positions(stub, "capture_cudagraphs")[-1]
+        assert position > _positions(stub, "forward")[-1]
+        assert position > _positions(stub, "prepare_step")[-1]
+
+        (hook,) = _calls(stub, "post_warmup")
+        assert hook["jit_monitor_active"] is False
+        assert jit_monitor.is_active() is True
+        assert gc.get_freeze_count() > hook["gc_frozen_objects"]
+
+        config = core.vllm_config
+        after_startup = torch.get_rng_state()
+        set_random_seed(
+            config.model_config.seed, config.parallel_config.data_parallel_index
+        )
+        assert torch.equal(after_startup, torch.get_rng_state())
+    finally:
+        core.shutdown()
+
+
+@create_new_process_for_each_test("spawn")
+def test_post_warmup_failure_fails_startup(dummy_state_model_path):
+    """An exception from `post_warmup` is the one that fails startup."""
+    stub = _stub_module()
+    with pytest.raises(stub.StubHookError) as failed:
+        _hook_core(dummy_state_model_path, {"fail": ["post_warmup"]})
+    assert failed.value is stub.RAISED[0]
+    assert "post_warmup" in str(failed.value)
+
+
+@create_new_process_for_each_test("spawn")
+def test_post_warmup_sees_the_pools_where_the_capture_saw_them(
+    dummy_state_model_path,
+):
+    """The layout snapshot the stub takes in `post_warmup` equals the one it
+    took in the serving capture: the pages did not move during warmup."""
+    stub = _stub_module()
+    core = _hook_core(dummy_state_model_path, CAPTURING)
+    try:
+        (hook,) = _calls(stub, "post_warmup")
+        assert hook["layout_unchanged"] is True
+        assert hook["bindings"] == len(stub.BINDINGS) - 1
+    finally:
+        core.shutdown()
+
+
+# Shutdown.
+
+
+@create_new_process_for_each_test("spawn")
+def test_runner_shutdown_calls_the_hook_before_it_releases_the_state(
+    dummy_state_model_path,
+):
+    """`GPUModelRunner.shutdown` calls the model state's `shutdown` once the
+    device is idle and while the state bindings and their pool still exist."""
+    stub = _stub_module()
+    core = _hook_core(dummy_state_model_path)
+    assert _calls(stub, "shutdown") == []
+    core.shutdown()
+    (hook,) = _calls(stub, "shutdown")
+    assert hook["slots_bound"] is True
+    assert hook["pool_pages"] == 3
+    assert hook["device_idle"] is True
+
+
+@create_new_process_for_each_test("spawn")
+def test_second_runner_shutdown_does_not_call_the_hook_again(dummy_state_model_path):
+    """Once a shutdown has released the model state, shutting the runner down
+    again calls no hook."""
+    stub = _stub_module()
+    core = _hook_core(dummy_state_model_path)
+    runner = _worker(core).model_runner
+    core.shutdown()
+    runner.shutdown()
+    assert len(_calls(stub, "shutdown")) == 1
+
+
+@create_new_process_for_each_test("spawn")
+def test_failed_startup_shuts_the_model_state_down(dummy_state_model_path):
+    """After a startup that fails once the model state exists, the runner's
+    shutdown calls the hook on that model state, once, after everything else
+    it did."""
+    stub = _stub_module()
+    with pytest.raises(stub.StubHookError):
+        _hook_core(dummy_state_model_path, {"fail": ["post_warmup"]})
+    assert _positions(stub, "shutdown") == [len(stub.EVENTS) - 1]
+
+
+@create_new_process_for_each_test("spawn")
+def test_shutdown_hook_failure_is_logged_and_cleanup_continues(
+    dummy_state_model_path,
+):
+    """An exception from the model state's `shutdown` does not leave
+    `GPUModelRunner.shutdown`: it is logged with its traceback, and the runner
+    still releases the state bindings and the model state."""
+    stub = _stub_module()
+    core = _hook_core(dummy_state_model_path, {"fail": ["shutdown"]})
+    runner = _worker(core).model_runner
+    with _vllm_log_records() as records:
+        core.shutdown()
+    (error,) = stub.RAISED
+    logged = [r for r in records if r.exc_info and r.exc_info[1] is error]
+    assert logged and logged[0].exc_info[2] is not None
+    assert runner.state_slots is None
+    assert not hasattr(runner, "model_state")

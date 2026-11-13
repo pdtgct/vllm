@@ -1599,6 +1599,12 @@ def get_kv_cache_configs(
     return kv_cache_configs
 
 
+def planned_persistent_state_pages(vllm_config: VllmConfig) -> int:
+    """The page count of the persistent-state pool: `num_gpu_blocks_override`
+    when set, else `max_num_seqs` slots plus the null page."""
+    raise NotImplementedError
+
+
 def _plan_persistent_state_pool(
     builder: KVCacheConfigBuilder,
     vllm_config: VllmConfig,

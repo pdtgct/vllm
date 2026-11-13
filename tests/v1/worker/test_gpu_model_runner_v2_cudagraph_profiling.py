@@ -21,9 +21,11 @@ import torch
 from tests.utils import create_new_process_for_each_test
 from vllm.compilation.counter import compilation_counter
 from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.worker import gpu_worker
 from vllm.v1.worker.gpu import cudagraph_utils as cgu
 from vllm.v1.worker.gpu import model_runner as mrv2
 from vllm.v1.worker.gpu.eplb_utils import EPLBController
+from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 
 GLOBAL_POOL = "global-pool"
 THROWAWAY_POOL = "throwaway-pool"
@@ -66,9 +68,11 @@ def _make_profiling_runner(
     )
     runner.speculator = None
     runner.vllm_config = SimpleNamespace()
+    runner.model_config = SimpleNamespace(enforce_eager=False)
     runner.model_state = SimpleNamespace(
         supports_mm_inputs=encoder_only,
         encoder_runner=SimpleNamespace(has_cudagraph=lambda: encoder_only),
+        needs_cudagraph_capture=lambda: False,
     )
 
     events: list[str] = []
@@ -396,7 +400,9 @@ def test_profile_cudagraph_memory_frees_throwaway_pool(monkeypatch):
 
     runner = _make_profiling_runner(CUDAGraphMode.FULL_AND_PIECEWISE)
     runner.compilation_config.static_forward_context = {}
-    runner.model_state = SimpleNamespace(supports_mm_inputs=False)
+    runner.model_state = SimpleNamespace(
+        supports_mm_inputs=False, needs_cudagraph_capture=lambda: False
+    )
     runner.cache_config = SimpleNamespace(num_gpu_blocks=1)
     runner.kv_caches = []
     runner.attn_groups = []
@@ -456,6 +462,7 @@ def test_teardown_profiling_state_clears_mamba_align_metadata(monkeypatch):
     runner.model_state = SimpleNamespace(
         supports_mm_inputs=False,
         _mamba_ctx=object(),
+        needs_cudagraph_capture=lambda: False,
     )
     runner.cache_config = SimpleNamespace(num_gpu_blocks=1)
     runner.kv_caches = []
@@ -471,3 +478,118 @@ def test_teardown_profiling_state_clears_mamba_align_metadata(monkeypatch):
     cgu._teardown_profiling_state(runner)
 
     assert runner.model_state._mamba_ctx is None
+
+
+# The model-state graph hooks through the real estimate: a worker built with
+# its real constructors (facebook/opt-125m config, dummy weights) under the
+# default `cudagraph_mode`, whose model state records the hook calls.
+
+_HOOK_CALLS: list[str] = []
+
+
+class _RecordingModelState(DefaultModelState):
+    """Records the graph-capture hook calls and each KV cache it is given.
+    It keeps the default capture predicate."""
+
+    def initialize_kv_cache(self, kv_cache_config, block_tables) -> None:
+        super().initialize_kv_cache(kv_cache_config, block_tables)
+        _HOOK_CALLS.append("initialize_kv_cache")
+
+    def capture_cudagraphs(self, *, graph_pool, stream, profile_only) -> None:
+        _HOOK_CALLS.append("capture_cudagraphs")
+
+    def clear_cudagraphs(self) -> None:
+        _HOOK_CALLS.append("clear_cudagraphs")
+
+
+class _CapturingModelState(_RecordingModelState):
+    """A model state that says it captures graphs of its own."""
+
+    def needs_cudagraph_capture(self) -> bool:
+        _HOOK_CALLS.append("needs_cudagraph_capture")
+        return True
+
+
+class _OwnCaptureRunner(mrv2.GPUModelRunner):
+    """Replaces capture and its predicate without calling `GPUModelRunner`'s,
+    as the encoder-only runner does."""
+
+    def needs_cudagraph_capture(self) -> bool:
+        return False
+
+    def capture_model(self, *, profile_only: bool = False) -> int:
+        return 0
+
+
+class _OwnCaptureRunnerWorker(gpu_worker.Worker):
+    def _make_model_runner(self) -> mrv2.GPUModelRunner:
+        return _OwnCaptureRunner(self.vllm_config, self.device)
+
+
+def _profiled_worker(model_state_cls: type[DefaultModelState], **engine_args: Any):
+    """Start a worker for OPT with `model_state_cls` and profile its KV cache
+    budget, which runs the graph-memory estimate. Returns the executor, to
+    shut down, and the worker."""
+    from vllm import ModelRegistry
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.model_executor.models.opt import OPTForCausalLM
+    from vllm.v1.executor.uniproc_executor import UniProcExecutor
+
+    class RecordingOPTForCausalLM(OPTForCausalLM):
+        @classmethod
+        def get_model_state_cls(cls) -> type[DefaultModelState]:
+            return model_state_cls
+
+    ModelRegistry.register_model("RecordingOPTForCausalLM", RecordingOPTForCausalLM)
+    config = EngineArgs(
+        model="facebook/opt-125m",
+        hf_overrides={"architectures": ["RecordingOPTForCausalLM"]},
+        load_format="dummy",
+        max_model_len=64,
+        max_num_seqs=2,
+        **engine_args,
+    ).create_engine_config()
+    assert config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+    executor = UniProcExecutor(config)
+    _HOOK_CALLS.clear()
+    executor.determine_available_memory()
+    return executor, executor.driver_worker.worker
+
+
+_NEEDS_DEVICE = pytest.mark.skipif(
+    not cgu.current_platform.is_cuda_alike(), reason="requires CUDA or ROCm"
+)
+
+
+@create_new_process_for_each_test("spawn")
+@_NEEDS_DEVICE
+def test_estimate_calls_no_capture_hook_with_the_default_predicate():
+    """A model state that keeps the default predicate gets no capture call
+    and no `clear_cudagraphs` call, although the estimate captured the
+    runner's own graphs over its temporary KV cache."""
+    executor, worker = _profiled_worker(_RecordingModelState)
+    try:
+        assert worker.cudagraph_memory_estimate > 0
+        assert _HOOK_CALLS == ["initialize_kv_cache"]
+    finally:
+        executor.shutdown()
+
+
+@create_new_process_for_each_test("spawn")
+@_NEEDS_DEVICE
+def test_estimate_calls_no_capture_hook_for_a_runner_with_its_own_capture():
+    """For a runner that replaces `capture_model` and
+    `needs_cudagraph_capture`, and whose predicate returns `False`, the
+    estimate allocates its temporary KV cache, captures nothing and tears
+    down. None of the three graph-capture hooks is called, although the
+    model state's predicate would return `True`."""
+    executor, worker = _profiled_worker(
+        _CapturingModelState,
+        worker_cls=f"{__name__}.{_OwnCaptureRunnerWorker.__qualname__}",
+    )
+    try:
+        assert isinstance(worker.model_runner, _OwnCaptureRunner)
+        assert worker.cudagraph_memory_estimate == 0
+        assert _HOOK_CALLS == ["initialize_kv_cache"]
+    finally:
+        executor.shutdown()
