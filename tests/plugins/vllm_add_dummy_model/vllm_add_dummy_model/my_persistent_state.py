@@ -31,12 +31,16 @@ the output, which is what the regression, pause and cache-clear tests rely on.
 `EVENTS` records, in order, the hook calls and forward passes of every stub
 built in this process, so an in-process engine test can tell how far startup
 got even when it fails. `BINDINGS` records each `initialize_state_slots` call
-and `RAISED` each exception a hook raised.
+and `RAISED` each exception a hook raised. `shutdown` reports whether the
+streams a test put in `WATCHED_STREAMS` were idle when it ran.
+
+Every stub registers one JIT warmup kernel and overrides
+`dummy_sampler_run`; both only record that the worker reached that stage.
 """
 
 import gc
-import random
 import weakref
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -45,9 +49,10 @@ import torch.nn as nn
 from vllm.compilation.cudagraph_pool import capture_pool
 from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.model_executor.layers.state import PersistentStateLayerBase
+from vllm.model_executor.warmup.jit_warmup import VllmJitKernel
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.utils import jit_monitor
+from vllm.utils import gpu_sync_debug, jit_monitor
 from vllm.v1.kv_cache_interface import (
     PersistentStateDescriptor,
     PersistentStateSpec,
@@ -62,8 +67,9 @@ MiB = 1 << 20
 # ("initialize_state_slots",), ("prepare_step", dummy_run, is_profile,
 # slots_bound) and ("forward", dummy_run) records, and one (name, info) record
 # per call of "needs_cudagraph_capture", "prepare_execution_memory",
-# "profile_run", "capture_cudagraphs", "clear_cudagraphs", "post_warmup" and
-# "shutdown", where info is a dict of what the hook observed.
+# "profile_run", "capture_cudagraphs", "clear_cudagraphs", "post_warmup",
+# "shutdown", "jit_warmup" and "dummy_sampler_run", where info is a dict of
+# what the hook observed.
 EVENTS: list[tuple[Any, ...]] = []
 
 # One dict per `initialize_state_slots` call: a weak reference to the bindings
@@ -74,6 +80,13 @@ BINDINGS: list[dict[str, Any]] = []
 
 # The exceptions that hooks raised, in order.
 RAISED: list[BaseException] = []
+
+# Streams whose outstanding work `shutdown` reports on.
+WATCHED_STREAMS: list[torch.cuda.Stream] = []
+
+# What `post_warmup` seeds torch's generator with. The worker resets the seed
+# after the hook, so this seed must not survive startup.
+POST_WARMUP_SEED = 20261113
 
 
 class StubHookError(RuntimeError):
@@ -96,9 +109,38 @@ def allocator_settings() -> str:
     ]
 
 
+def inductor_initialized() -> bool | None:
+    """Whether Inductor's once-per-process lazy initialization has run;
+    `None` when this torch does not expose it."""
+    try:
+        from torch._inductor.fx_passes.joint_graph import lazy_init
+
+        return lazy_init.cache_info().currsize > 0
+    except (ImportError, AttributeError):
+        return None
+
+
 def _record(name: str, **info: Any) -> dict[str, Any]:
     EVENTS.append((name, info))
     return info
+
+
+class _RecordingJitKernel(VllmJitKernel["_RecordingJitKernel.CompileKey"]):
+    """A registered JIT warmup whose only work is to record that it ran."""
+
+    @dataclass(frozen=True)
+    class CompileKey:
+        value: int
+
+    def get_warmup_keys(self) -> list[CompileKey]:
+        return [self.CompileKey(0)]
+
+    def compile(self, compile_key: CompileKey) -> None:
+        _record("jit_warmup")
+        self._compiled_cache[compile_key] = True
+
+
+_JIT_KERNEL = _RecordingJitKernel()
 
 
 def expected_tokens(
@@ -167,6 +209,13 @@ class StubPersistentStateModelState(ModelState):
             return True
         return False
 
+    def _free_device_bytes(self) -> int:
+        return torch.cuda.mem_get_info(self.device)[0]
+
+    def dummy_sampler_run(self, sampler, hidden_states) -> bool:
+        _record("dummy_sampler_run")
+        return False
+
     def _on_main_stream(self) -> bool:
         return torch.cuda.current_stream(self.device) == torch.cuda.default_stream(
             self.device
@@ -195,16 +244,18 @@ class StubPersistentStateModelState(ModelState):
             self._maybe_fail("profile_run")
 
     def prepare_execution_memory(self) -> None:
-        _record(
+        info = _record(
             "prepare_execution_memory",
             slots_bound=self.state_slots is not None,
             config_set=get_current_vllm_config_or_none() is not None,
             allocator_settings=allocator_settings(),
-            allocated_bytes=self._execution_bytes,
         )
+        free = self._free_device_bytes()
         self._execution_memory = torch.empty(
             self._execution_bytes, dtype=torch.uint8, device=self.device
         )
+        # What the device lost to this call, as memory profiling measures it.
+        info["device_bytes_taken"] = free - self._free_device_bytes()
         self._maybe_fail("prepare_execution_memory")
 
     def needs_cudagraph_capture(self) -> bool:
@@ -226,6 +277,7 @@ class StubPersistentStateModelState(ModelState):
         )
         # The validation replay runs on a stream of the model's own.
         own_stream = torch.cuda.Stream(self.device)
+        free = self._free_device_bytes()
         try:
             self._access = bindings.startup_pool_access(STATE_LAYER)
             counts = self._access.component_pools["count"]
@@ -248,6 +300,9 @@ class StubPersistentStateModelState(ModelState):
                 graph.replay()
             if not profile_only:
                 self._layout = bindings.pool_layout(STATE_LAYER)
+            # What the device lost to this call, as `capture_model` measures
+            # it; everything the call allocated is still held.
+            info["device_bytes_taken"] = free - self._free_device_bytes()
             self._maybe_fail("capture_profile" if profile_only else "capture_serving")
         finally:
             # Whether the call returns or raises, the device work it started
@@ -278,14 +333,16 @@ class StubPersistentStateModelState(ModelState):
             on_main_stream=self._on_main_stream(),
             jit_monitor_active=jit_monitor.is_active(),
             gc_frozen_objects=gc.get_freeze_count(),
+            sync_check_enabled=gpu_sync_debug._sync_check_enabled,
+            inductor_initialized=inductor_initialized(),
         )
         if self._layout is not None and self.state_slots is not None:
             # Nothing the captured graph reads moved during warmup.
             layout = self.state_slots.pool_layout(STATE_LAYER)
             info["layout_unchanged"] = dict(layout) == dict(self._layout)
-        # The worker resets the seed after this hook, so drawing is allowed.
-        torch.rand(8)
-        random.random()
+        # The worker resets the seed after this hook, so the hook may change
+        # the global random state.
+        torch.manual_seed(POST_WARMUP_SEED)
         self._maybe_fail("post_warmup")
 
     def shutdown(self) -> None:
@@ -297,7 +354,7 @@ class StubPersistentStateModelState(ModelState):
             if bindings is None
             else bindings.views[STATE_LAYER].capacity,
             stale_access_refused=self._stale_access_refused(),
-            device_idle=torch.cuda.current_stream(self.device).query(),
+            watched_streams_idle=all(stream.query() for stream in WATCHED_STREAMS),
         )
         self._graph = None
         self._layout = None
@@ -360,6 +417,8 @@ class StubPersistentStateForCausalLM(nn.Module):
             spec, prefix=f"{prefix}{STATE_LAYER}", vllm_config=vllm_config
         )
         self.embed = nn.Embedding(self.vocab_size, 8)
+        # Collected by the runner's warmup registry while it builds the model.
+        _JIT_KERNEL.register_warmup()
 
     @classmethod
     def get_model_state_cls(cls) -> type[ModelState]:

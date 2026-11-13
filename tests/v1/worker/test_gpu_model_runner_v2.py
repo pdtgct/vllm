@@ -728,7 +728,8 @@ def test_state_rows_only_for_the_current_steps_handles():
 
 
 # Startup pool access and the pool layout: what a model that captures CUDA
-# graphs over its state pools reads before any request exists.
+# graphs over its state pools reads before any request exists. The tests open
+# the startup-access window as the runner does around `capture_cudagraphs`.
 
 
 def test_startup_pool_access_is_refused_outside_a_window():
@@ -737,7 +738,7 @@ def test_startup_pool_access_is_refused_outside_a_window():
     bindings = _state_bindings()
     with pytest.raises(ValueError):
         bindings.startup_pool_access("state")
-    with bindings.startup_access_window():
+    with bindings._startup_access_window():
         bindings.startup_pool_access("state")
     with pytest.raises(ValueError):
         bindings.startup_pool_access("state")
@@ -748,7 +749,7 @@ def test_startup_pool_access_exposes_every_page_of_each_component():
     descriptor that covers every page, the null page and unbound slots
     included."""
     bindings = _state_bindings()
-    with bindings.startup_access_window():
+    with bindings._startup_access_window():
         access = bindings.startup_pool_access("state")
         assert access.spec == bindings.views["state"].spec
         pools = access.component_pools
@@ -765,7 +766,7 @@ def test_state_pool_accessors_reject_an_unknown_layer(accessor):
     """Both accessors raise for a layer that is not a state layer of the
     bindings, also inside a window."""
     bindings = _state_bindings()
-    with bindings.startup_access_window():
+    with bindings._startup_access_window():
         getattr(bindings, accessor)("state")
         with pytest.raises(ValueError):
             getattr(bindings, accessor)("other")
@@ -776,12 +777,12 @@ def test_startup_access_is_stale_once_its_window_has_closed(use):
     """An access object is refused on every use after its window has closed,
     also while a later window, which issues its own access, is open."""
     bindings = _state_bindings()
-    with bindings.startup_access_window():
+    with bindings._startup_access_window():
         stale = bindings.startup_pool_access("state")
         getattr(stale, use)
     with pytest.raises(ValueError):
         getattr(stale, use)
-    with bindings.startup_access_window():
+    with bindings._startup_access_window():
         getattr(bindings.startup_pool_access("state"), use)
         with pytest.raises(ValueError):
             getattr(stale, use)
@@ -792,7 +793,7 @@ def test_startup_access_binds_no_slot():
     every slot is still a first bind, which accepts a first-generation handle
     and writes the descriptors' initial values over the zeroed pool."""
     bindings = _state_bindings()
-    with bindings.startup_access_window():
+    with bindings._startup_access_window():
         hidden = bindings.startup_pool_access("state").component_pools["hidden"]
         assert hidden.tolist() == [[0.0] * 4] * 3
     first, second = _handle(slot=1), _handle(slot=2)
@@ -807,7 +808,7 @@ def test_pool_layout_describes_the_tensors_the_bindings_expose():
     `bind_rows` expose for the same bindings."""
     bindings = _state_bindings()
     layout = bindings.pool_layout("state")
-    with bindings.startup_access_window():
+    with bindings._startup_access_window():
         startup = dict(bindings.startup_pool_access("state").component_pools)
     handle = _handle()
     _begin_state_step(bindings, 1, {"r": handle})
@@ -828,7 +829,7 @@ def test_pool_layout_is_a_new_snapshot_at_any_time():
     is open, a window is open, or a step is live."""
     bindings = _state_bindings()
     outside = bindings.pool_layout("state")
-    with bindings.startup_access_window():
+    with bindings._startup_access_window():
         inside = bindings.pool_layout("state")
     _begin_state_step(bindings, 1, {"r": _handle()})
     in_step = bindings.pool_layout("state")

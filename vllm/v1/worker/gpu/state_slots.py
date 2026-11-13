@@ -172,11 +172,11 @@ class StateSlotBindings:
         self._step_id: object | None = None
 
     @contextmanager
-    def startup_access_window(self) -> Iterator[None]:
+    def _startup_access_window(self) -> Iterator[None]:
         """Admit `startup_pool_access` for one `capture_cudagraphs` call.
 
-        The runner opens the window around the call. Leaving it invalidates
-        every access object it issued.
+        For the runner only: it opens the window around the call, and a model
+        never opens one. Leaving it invalidates every access object it issued.
         """
         raise NotImplementedError
         yield
