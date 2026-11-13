@@ -121,13 +121,14 @@ def _cap_num_warmup_reqs(
     )
 
 
-def _holds_persistent_state(kv_cache_groups: list[KVCacheGroup]) -> bool:
+def _holds_persistent_state(model_runner: GPUModelRunner) -> bool:
     """Whether a synthetic scheduler step cannot run on this layout: its
     requests carry no scheduler-issued state handles and assume token prefill
     and decode, while a persistent-state request's step is model-defined."""
-    return any(
+    kv_cache_config = getattr(model_runner, "kv_cache_config", None)
+    return kv_cache_config is not None and any(
         isinstance(spec, PersistentStateSpec)
-        for group in kv_cache_groups
+        for group in kv_cache_config.kv_cache_groups
         for spec in group.distinct_specs
     )
 
@@ -171,6 +172,8 @@ def run_mixed_prefill_decode_warmup(
     with_decode = model_runner.max_num_reqs >= 2
     if model_runner.is_pooling_model or not (with_decode or prefill_only_fallback):
         return False
+    if _holds_persistent_state(model_runner):
+        return False
 
     max_prefill_len = model_runner.max_model_len - 1
     if with_decode and prefill_only_fallback:
@@ -197,8 +200,6 @@ def run_mixed_prefill_decode_warmup(
             - num_warmup_reqs * spec_config.max_num_new_slots_for_drafting,
         )
     if num_tokens < 3:
-        return False
-    if _holds_persistent_state(model_runner.kv_cache_config.kv_cache_groups):
         return False
 
     decode_req_id = f"{req_id_prefix}_decode_"
@@ -533,7 +534,7 @@ def _warmup_kernels(
 ) -> None:
     if model_runner.vllm_config.is_mm_encoder_only:
         return
-    if _holds_persistent_state(model_runner.kv_cache_config.kv_cache_groups):
+    if _holds_persistent_state(model_runner):
         return
 
     num_spec_steps = model_runner.vllm_config.num_scheduled_spec_tokens

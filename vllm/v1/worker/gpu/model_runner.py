@@ -20,7 +20,7 @@ import functools
 import gc
 import time
 from collections.abc import Iterable, Iterator
-from contextlib import AbstractContextManager, ExitStack, contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import replace
 from typing import Any, NamedTuple
@@ -220,7 +220,7 @@ def _note_memory_contributors(state_groups: list[KVCacheGroup]) -> Iterator[None
     """
     try:
         yield
-    except Exception as e:
+    except BaseException as e:
         note = memory_contributors_note(state_groups)
         if note is not None and note not in getattr(e, "__notes__", ()):
             e.add_note(note)
@@ -1195,12 +1195,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         state_slots = self.state_slots
         with (
             _note_memory_contributors(self.kv_cache_config.state_groups),
-            ExitStack() as stack,
+            # The pools are readable outside a step for this call only.
+            nullcontext()
+            if state_slots is None
+            else state_slots._startup_access_window(),
+            graph_capture(self.device) as context,
         ):
-            if state_slots is not None:
-                # The pools are readable outside a step for this call only.
-                stack.enter_context(state_slots._startup_access_window())
-            context = stack.enter_context(graph_capture(self.device))
             self.model_state.capture_cudagraphs(
                 graph_pool=current_platform.get_global_graph_pool(),
                 stream=context.stream,
@@ -2578,11 +2578,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
         torch.accelerator.synchronize()
-        if (model_state := getattr(self, "model_state", None)) is not None:
-            try:
-                model_state.shutdown()
-            except Exception:
-                logger.exception("The model state's shutdown hook failed")
+        try:
+            if hasattr(self, "model_state"):
+                self.model_state.shutdown()
+        except Exception:
+            logger.exception("The model state's shutdown hook failed")
+        finally:
+            # Also when the hook is interrupted.
+            self._release_gpu_tensors()
+
+    def _release_gpu_tensors(self) -> None:
         if current_platform.is_rocm():
             # RCCL's ncclCommAbort waits for live graphs that captured the comm:
             # https://github.com/ROCm/rocm-systems/issues/13018
