@@ -582,9 +582,9 @@ conformance.)* are obligations of the model, which a model's own tests check.
   `needs_cudagraph_capture` without calling `GPUModelRunner`'s, as the
   encoder-only runner does, calls none of the three graph-capture hooks. The
   graph-memory estimate calls none for it either: under a `cudagraph_mode`
-  other than NONE the estimate allocates its temporary cache and runs its
-  teardown before that runner's predicate returns `False`, and the teardown
-  then makes no `clear_cudagraphs` call.
+  other than NONE the estimate allocates its temporary cache, that runner's
+  predicate returns `False`, and the estimate's teardown then runs and makes
+  no `clear_cudagraphs` call.
 - **Profiling bindings.** When the graph-memory estimate runs for a
   persistent-state layout and `GPUModelRunner.needs_cudagraph_capture()`
   returns `True`, `initialize_state_slots` receives bindings over the
