@@ -540,6 +540,7 @@ class _RecordingModelState(DefaultModelState):
         self._maybe_fail("capture_inner_cudagraphs")
 
     def needs_cudagraph_capture(self) -> bool:
+        _record("needs_cudagraph_capture")
         return self.captures
 
     def capture_cudagraphs(self, *, graph_pool, stream, profile_only) -> None:
@@ -916,7 +917,8 @@ def test_estimate_calls_no_capture_hook_for_a_runner_with_its_own_capture(
     assert seen["cudagraph_mode"] != "NONE" and not seen["extensible_kv_cache"]
     assert seen["after_estimate"]["own_capture_runner"] is True
     assert seen["after_estimate"]["estimate"] == 0
-    assert _hooks(seen) == ["initialize_kv_cache"]
+    assert "initialize_kv_cache" in _hooks(seen)
+    assert not (_GRAPH_HOOKS | {"needs_cudagraph_capture"}) & set(_hooks(seen))
 
 
 @_NEEDS_DEVICE

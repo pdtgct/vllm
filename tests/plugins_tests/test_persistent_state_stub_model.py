@@ -1573,12 +1573,13 @@ def _scenario(
 
 
 # The stub with a vision encoder: one encoder CUDA graph, for four tokens,
-# under `cudagraph_mode` NONE. The pool is planned at seven pages, well above
-# the minimal temporary pool of the estimate. The stub's processor processes
-# nothing, so multimodal profiling is skipped.
+# under `cudagraph_mode` NONE. With four slots and no page-count override the
+# pool is planned at five pages, above the temporary pool that the estimate
+# allocates by its own rule. The stub's processor processes nothing, so
+# multimodal profiling is skipped.
 ENCODER = dict(
     encoder=True,
-    num_gpu_blocks_override=7,
+    max_num_seqs=4,
     limit_mm_per_prompt={"image": 1},
     skip_mm_profiling=True,
     compilation_config={
@@ -1944,11 +1945,13 @@ def _observe(path: str, name: str) -> dict:
             and compilation.backend == "inductor"
         ),
         seed=config.model_config.seed,
-        # The estimate's temporary KV cache when the model state captures no
-        # graph of its own: one block per sequence a graph can hold, at least
-        # one.
-        minimal_pool_pages=(
-            min(
+        # The estimate's own rule for its temporary KV cache, which applies
+        # when the model state captures no graph of its own: one block per
+        # sequence a graph can hold, at least one, replaced by
+        # `num_gpu_blocks_override` when that is set.
+        estimate_pool_pages=(
+            config.cache_config.num_gpu_blocks_override
+            or min(
                 config.scheduler_config.max_num_seqs,
                 compilation.max_cudagraph_capture_size or 0,
             )
@@ -2475,25 +2478,28 @@ def test_without_graphs_the_serving_bindings_are_the_only_ones(started):
 
 def test_encoder_graphs_alone_keep_the_minimal_temporary_pool(started):
     """With encoder graphs and a model state that captures none of its own,
-    the estimate's temporary state pool keeps its minimal size, not the
-    planned seven pages; the serving pool has the planned pages."""
+    the estimate's temporary state pool keeps the size the estimate gives
+    any temporary KV cache, which here is not the planned five pages; the
+    serving pool has the planned pages."""
     seen = started("encoder")
     assert seen["cudagraph_mode"] == "NONE"
-    assert seen["minimal_pool_pages"] < 7
+    assert seen["estimate_pool_pages"] != 5
     temporary, serving = seen["bindings"]
-    assert temporary["pages"] == seen["minimal_pool_pages"]
-    assert serving["pages"] == 7
+    assert temporary["pages"] == seen["estimate_pool_pages"]
+    assert serving["pages"] == 5
 
 
 def test_encoder_graphs_with_model_state_graphs_get_the_planned_pool(started):
     """The same model with a model state that captures: the temporary state
-    pool has the planned seven pages, as the serving pool has."""
+    pool has the planned five pages, as the serving pool has, and not the
+    size of the estimate's own rule."""
     seen = started("encoder-capturing")
     assert seen["cudagraph_mode"] == "NONE"
-    assert [binding["pages"] for binding in seen["bindings"]] == [7, 7]
+    assert seen["estimate_pool_pages"] != 5
+    assert [binding["pages"] for binding in seen["bindings"]] == [5, 5]
     profiling = _calls(seen, "capture_cudagraphs")[0]
     assert profiling["profile_only"] is True
-    assert profiling["pool_pages"] == 7
+    assert profiling["pool_pages"] == 5
 
 
 @pytest.mark.parametrize("scenario", ["encoder", "encoder-capturing"])
