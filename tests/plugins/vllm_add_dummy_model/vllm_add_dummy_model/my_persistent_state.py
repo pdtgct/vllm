@@ -40,7 +40,8 @@ streams a test put in `WATCHED_STREAMS` were idle when it ran.
 encoder that supports encoder CUDA graphs.
 
 Every stub registers one JIT warmup kernel and overrides
-`dummy_sampler_run`; both only record that the worker reached that stage.
+`dummy_sampler_run`; both only record that the worker reached that stage,
+the latter with the number of objects the collector holds frozen there.
 """
 
 import gc
@@ -243,7 +244,7 @@ class StubPersistentStateModelState(ModelState):
         return torch.cuda.mem_get_info(self.device)[0]
 
     def dummy_sampler_run(self, sampler, hidden_states) -> bool:
-        _record("dummy_sampler_run")
+        _record("dummy_sampler_run", gc_frozen_objects=gc.get_freeze_count())
         return False
 
     def _on_main_stream(self) -> bool:

@@ -2825,14 +2825,21 @@ def test_post_warmup_precedes_the_seed_reset(started):
 
 def test_post_warmup_precedes_jit_monitoring_and_gc_freezing(started):
     """When `post_warmup` runs at startup, JIT monitoring is not yet on and
-    the worker has not yet frozen the heap; both hold after startup."""
-    seen = started("capturing")
+    the worker has not yet frozen the heap; both hold after startup.
+
+    Only a freeze adds to the collector's frozen objects, and it adds every
+    tracked object. So the heap was not frozen between the sampler warmup,
+    the last stage before the hook, and the hook if the hook sees no more
+    frozen objects than that stage did, whatever the process had frozen by
+    then; a freeze after the hook leaves more of them after startup."""
+    seen = _startup_events_only(started("capturing"))
     (hook,) = _calls(seen, "post_warmup")
+    before = _calls(seen, "dummy_sampler_run")[-1]
     after = seen["after_startup"]
     assert hook["jit_monitor_active"] is False
     assert after["jit_monitor_active"] is True
-    assert hook["gc_frozen_objects"] == 0
-    assert after["gc_frozen_objects"] > 0
+    assert hook["gc_frozen_objects"] <= before["gc_frozen_objects"]
+    assert after["gc_frozen_objects"] > hook["gc_frozen_objects"]
 
 
 def test_post_warmup_precedes_the_gpu_sync_check(started):
