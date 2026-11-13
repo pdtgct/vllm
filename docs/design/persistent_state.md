@@ -120,22 +120,33 @@ A persistent-state model uses these Model Runner V2 hooks:
   `ModelState.capture_cudagraphs(*, graph_pool, stream, profile_only)` and
   `ModelState.clear_cudagraphs()` let a model state capture its own CUDA graphs
   inside `GPUModelRunner.capture_model`, whatever `cudagraph_mode` is; see
-  [Model-state graph capture](#model-state-graph-capture).
+  [Model-state graph capture](#model-state-graph-capture). The predicate
+  answers from configuration alone and returns the same value for the model
+  state's lifetime. `clear_cudagraphs` must tolerate a model state that
+  captured nothing.
 - `ModelState.post_warmup()` is called once, after every warmup stage and
   before the worker serves. Use it to check that nothing a captured graph reads
   moved during warmup, and to warm up kernels that only a scheduled step would
   otherwise compile.
 - `ModelState.shutdown()` is called at the start of `GPUModelRunner.shutdown`,
   before the runner releases the state bindings and the KV cache. Release
-  captured graphs and model-owned buffers there.
+  captured graphs and model-owned buffers there. The hook must tolerate a
+  model state whose initialization did not complete, because the runner also
+  shuts down after a failed startup.
 
 `prepare_execution_memory`, `capture_cudagraphs`, `clear_cudagraphs`,
 `post_warmup` and `shutdown` do nothing by default, and
 `needs_cudagraph_capture` returns `False`. These six hooks belong to every
-model state, with or without persistent state, on the GPU worker's Model
-Runner V2 path. The GPU worker's warmup calls `post_warmup`, and so do workers
-that inherit that warmup, such as XPU; the CPU worker has its own warmup, which
-captures no graphs and does not call `post_warmup`.
+model state of Model Runner V2 (`GPUModelRunner`), with or without persistent
+state, within these limits:
+
+- The three graph-capture hooks are called by `GPUModelRunner.capture_model`
+  and by the graph-memory estimate around it. A runner that replaces
+  `capture_model` and `needs_cudagraph_capture`, as the encoder-only runner
+  does, does not call them.
+- The GPU worker's warmup calls `post_warmup`, and so do workers that inherit
+  that warmup, such as XPU. The CPU worker has its own warmup, which captures
+  no graphs and does not call `post_warmup`.
 
 `StateSlotBindings.bind_rows` authorizes the current step's handles; the
 `StateSlotRows` it returns expose the complete component pools, but a model
@@ -160,8 +171,9 @@ in this order:
    then the final dummy run and the sampler warmup.
 7. `post_warmup()`, then serving, and `shutdown()` when the runner shuts down.
 
-Step 3 does not run with a fixed budget (`kv_cache_memory_bytes`) or with the
-estimate disabled (`VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0`). With
+Step 3 does not run with a fixed budget (`kv_cache_memory_bytes`), with the
+estimate disabled (`VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0`), or on a
+platform for which the worker runs no graph-memory estimate. With
 `enforce_eager`, step 3 and the capture in step 6 do not run.
 
 ### Execution memory
@@ -179,7 +191,9 @@ makes the call inside the memory-profiling window, so what the hook leaves
 allocated is subtracted from the budget, and before it limits allocator block
 splitting for the profiling pass: under that limit a cached block at or above
 the limit is not reused for a smaller request, so mid-size buffers would each
-keep a segment of their own. With a fixed budget the call still runs, at the
+keep a segment of their own. The worker therefore enters the memory-profiling
+window first, calls the hook, and only then enters the scope that limits
+splitting around the profiling pass. With a fixed budget the call still runs, at the
 configured allocator settings, and does not change the budget.
 
 Execution memory and graph memory are counted in different places and must not
@@ -202,7 +216,9 @@ earlier bindings.
 
 When the model state captures its own graphs, the temporary state pool has the
 serving page count, so the profiling capture sees the shapes of the serving
-capture. The `profile_only` argument of `capture_cudagraphs` tells the model
+capture. That pool is allocated before any budget exists; see
+[State capacity](#state-capacity) for what happens when it does not fit the
+device. The `profile_only` argument of `capture_cudagraphs` tells the model
 which pools it captures over. A model must not serve anything it captured
 against profiling bindings: `clear_cudagraphs` releases those graphs and
 whatever else the model retained from the profiling pools.
@@ -214,10 +230,14 @@ whole step over its state pools, captures them through the runner, so that
 their memory is counted where the runner counts its own graphs:
 
 - `needs_cudagraph_capture()` answers from configuration alone, because the
-  runner asks it before any KV cache exists. When it returns `True` and
-  `enforce_eager` is off, the runner reports that it has graphs to capture, so
-  memory profiling runs its graph-memory estimate and `capture_model` does not
-  return early, even with `cudagraph_mode` NONE and no other graphs.
+  runner asks it before any KV cache or state binding exists, and it returns
+  the same value every time, because the runner asks it at several points of
+  startup. A model state that cannot capture on the current platform returns
+  `False`. When it returns `True` and `enforce_eager` is off, the runner
+  reports that it has graphs to capture, so memory profiling runs its
+  graph-memory estimate and `capture_model` does not return early, even with
+  `cudagraph_mode` NONE and no other graphs. With `enforce_eager` the runner
+  does not ask.
 - `capture_model` calls `capture_cudagraphs` once, after the encoder, decoder,
   inner and speculator graphs and before it releases the allocator cache and
   reads free memory for the last time, so the call's memory is part of the
@@ -231,13 +251,18 @@ their memory is counted where the runner counts its own graphs:
   serving call, or graphs whose memory is at least as large: the runner does
   not extrapolate a model state's graphs. The memory it adds is part of the
   graph-memory estimate, which is subtracted from the KV cache budget before
-  the state pages are planned. Profiling's teardown calls `clear_cudagraphs`,
-  also when the capture raised or was never reached, so `clear_cudagraphs`
-  must tolerate a model state that captured nothing.
-- With the estimate disabled, a fixed budget, or the extensible KV cache
-  (which a persistent-state model cannot use), no profiling capture runs and,
-  as for the runner's own graphs, the model state's graphs are not subtracted
-  from the budget. The serving call still runs.
+  the state pages are planned. Profiling's teardown calls `clear_cudagraphs`
+  first, also when the capture raised or was never reached, and then releases
+  the profiling bindings, pools and graphs whether or not `clear_cudagraphs`
+  raised. An exception from `clear_cudagraphs` fails startup. When the capture
+  raised as well, the capture's exception is the one that propagates, and the
+  exception from `clear_cudagraphs` is logged with its traceback.
+- With the estimate disabled, a fixed budget, the extensible KV cache (which a
+  persistent-state model cannot use), or a platform for which the worker runs
+  no graph-memory estimate, no profiling capture runs and, as for the runner's
+  own graphs, the model state's graphs are not subtracted from the budget. The
+  serving call still runs whenever the predicate returns `True` and
+  `enforce_eager` is off.
 - With `enforce_eager`, the worker captures nothing: none of the three hooks
   runs, and the model state runs its steps eagerly.
 - After a serving capture the runner locks the workspace, as it does after
@@ -248,19 +273,36 @@ Dummy runs before the serving capture (the compile dummy runs) and after it
 authorization (current handle only), so the model runs them eagerly, replays
 no graph over the pools, and stores to no resident page.
 
-The kernel warmup that runs scheduler-shaped steps does not run for a
-persistent-state layout: its synthetic requests carry no scheduler-issued
-state handles and assume token prefill and decode, while a persistent-state
-request's step is model-defined. A model warms up what its scheduled step
-needs in `capture_cudagraphs` or `post_warmup`; both run before the worker
-starts monitoring for unexpected JIT compilation.
+Warmup that executes synthetic scheduler-shaped steps does not run for a
+persistent-state layout, whether or not the model state captures graphs. Such
+a step is a `SchedulerOutput` that warmup builds itself: its requests carry no
+scheduler-issued state handles and assume token prefill and decode, while a
+persistent-state request's step is model-defined. `cudagraph_mode` NONE
+without `enforce_eager` is a supported configuration and leaves JIT warmup
+enabled, so without the skip the worker would execute those steps against a
+model that holds no slot for them. In Model Runner V2 the steps come from
+`warmup_kernels` and `run_mixed_prefill_decode_warmup`;
+`run_context_prefill_warmup` builds such steps too, but only the
+extensible KV cache reaches it, which a persistent-state model cannot use.
+The standalone CPU runner has its own `warmup_kernels`, which this design
+does not change.
+
+The skip leaves JIT monitoring as it is: after warmup the worker still
+monitors for unexpected JIT compilation whenever JIT warmup is enabled. A
+persistent-state model therefore warms up what its scheduled step needs in
+`capture_cudagraphs` or `post_warmup`, both of which run before monitoring
+starts. A model that does not will report a JIT compilation on its first
+scheduled step, which is a warning under `jit_monitor_mode` `warn` and an
+error under `error`.
 
 The existing `ModelState.capture_inner_cudagraphs` hook is called only while
 decoder graphs are captured, with the decoder's buffers and stream. A model
 state whose graphs are its whole step needs capture without decoder graphs, a
 profiling capture that it can release, and a predicate that the runner can ask
-before the KV cache exists, so these are separate hooks. They do not depend on
-how the runner organizes its own graphs.
+before the KV cache exists, so these are separate hooks. They touch the
+runner's own graph capture at three points only: the runner's predicate, one
+call inside `capture_model`'s measured window, and one call in the estimate's
+teardown.
 
 ### Startup pool access
 
@@ -275,8 +317,9 @@ accessors for that:
   `capture_cudagraphs` call.
 - `pool_layout(layer)` returns a new, immutable snapshot keyed by descriptor
   name: each component pool's data address, shape, element strides and dtype,
-  as plain values. It holds no tensor and no reference to the bindings, and it
-  is available for the lifetime of the bindings, so `post_warmup` can compare
+  as plain values. It holds no tensor and no reference to the bindings. It can
+  be called at any time in the lifetime of the bindings, inside or outside a
+  window, and each call builds a new snapshot, so `post_warmup` can compare
   the serving pools' layout with what the capture recorded.
 
 Startup access grants no ownership and authorizes no stores to resident pages,
@@ -300,6 +343,16 @@ A profiled budget is measured again at the next startup, and graph memory can
 depend on `max_num_seqs`, so the reported value is a starting point for the
 next attempt, not a guarantee.
 
+Two failures are distinct. Planning's failure, above, is a `ValueError` that
+reports the largest `max_num_seqs` that fits. The other can come earlier: when
+the model state captures its own graphs and the graph-memory estimate runs,
+the estimate allocates a temporary state pool of the planned page count before
+any budget exists. When the device cannot hold that pool, the allocation's own
+exception, usually an out-of-memory error, fails startup. It carries the
+memory contributors' note ([Memory contributors](#memory-contributors)) and no
+computed `max_num_seqs`, because nothing has been measured yet. A model state
+that captures no graphs of its own never meets this failure.
+
 The serving pool is allocated once, in full, before the state bindings are
 built and before the serving graph capture, and its pages keep their addresses
 for the engine's lifetime, so the state views that the bindings give the model,
@@ -318,15 +371,28 @@ strings that is empty by default. The names are diagnostic only: they are not
 part of the layout or of spec equality, and core does not measure what each
 one consumed. When the state pages do not fit, or allocating the pool or
 capturing the model state's graphs fails, core names them, so the user learns
-which model settings compete with the state pages. With a fixed budget,
-reducing these allocations eases device memory pressure but does not change
-whether the planned pages fit.
+which model settings compete with the state pages. On an allocation or capture
+failure the names are a note on the exception that states only that the model
+declares these options as using device memory. It gives no advice and does not
+claim that memory caused the failure, so it is also correct on an exception
+that has another cause. The note appears in the logged traceback, not in
+`str(exception)`; the multiprocess executor sends a worker's error to the
+engine as a string, so there the names appear only in the worker's log. With a
+fixed budget, reducing these allocations eases device memory pressure but does
+not change whether the planned pages fit.
 
 The spec carries the names because it is the one model-supplied record that
 reaches both the engine core's KV cache planning and the worker's KV cache
 allocation.
 
 ### Startup and shutdown criteria
+
+These criteria apply to Model Runner V2 (`GPUModelRunner`) under the GPU
+worker and the workers that inherit its warmup. "The graph-memory estimate
+runs" means that the budget is profiled,
+`VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS` is on, the extensible KV cache is
+off, and the worker runs the estimate on the platform. Criteria marked *(Model
+conformance.)* are obligations of the model, which a model's own tests check.
 
 - **Slot initialization.** The first bind of a slot, and every bind to a newer generation,
   writes the descriptors' initial values to its page; binding the same handle
@@ -344,94 +410,172 @@ allocation.
   would hold no slot, before memory profiling allocates any state pool. When
   the planned pages fit, the pool has exactly the planned page count; planning
   never reduces it.
+- **Hook defaults.** A model state that overrides none of
+  `prepare_execution_memory`, `needs_cudagraph_capture`, `capture_cudagraphs`,
+  `clear_cudagraphs`, `post_warmup` and `shutdown` starts, serves and shuts
+  down as it does without these hooks: the predicate returns `False`, the
+  other five do nothing, and no graph is captured that was not captured
+  before.
 - **Execution memory preparation.** `GPUModelRunner.prepare_execution_memory`
   calls the model state's `prepare_execution_memory` the first time it is
-  invoked on a runner and does nothing afterwards. `profile_run` invokes it
-  before its dummy forward pass, so every path that profiles prepares. An
-  exception from the hook fails startup.
-- **Execution memory in the budget.** When the KV cache budget is profiled, the
-  worker invokes `GPUModelRunner.prepare_execution_memory` inside the
-  memory-profiling window and before it limits allocator block splitting for
-  the profiling pass, and restores the allocator settings when the pass ends
-  or raises.
+  invoked on a runner and does nothing afterwards.
+- **Execution memory before profiling.** `GPUModelRunner.profile_run` invokes
+  `GPUModelRunner.prepare_execution_memory` before its dummy forward pass, so
+  the hook also runs when the budget is fixed (`kv_cache_memory_bytes`).
+- **Execution memory failure.** An exception from the model state's
+  `prepare_execution_memory` propagates and fails startup.
+- **Execution memory in the budget.** When the KV cache budget is profiled,
+  the GPU worker invokes `GPUModelRunner.prepare_execution_memory` inside the
+  memory-profiling window and outside the scope that limits allocator block
+  splitting, which it enters afterwards for the profiling pass only.
+- **Allocator settings restored.** When the profiling pass ends or raises, the
+  allocator settings are those in effect when
+  `prepare_execution_memory` ran.
+- **Configuration-only predicate.** The runner calls
+  `ModelState.needs_cudagraph_capture()` before any KV cache, state pool or
+  state binding exists, and again later in startup; it passes no argument.
+- **Stable predicate.** *(Model conformance.)* A model state's
+  `needs_cudagraph_capture()` returns the same value on every call for the
+  model state's lifetime, and `False` on a platform where the model state
+  cannot capture CUDA graphs.
 - **Capture need.** `GPUModelRunner.needs_cudagraph_capture()` returns `True`
-  when the model state's `needs_cudagraph_capture()` returns `True` and
-  `enforce_eager` is off, whatever `cudagraph_mode` is. A model state that
-  does not override the predicate sees no change in when or whether graphs
-  are captured.
-- **Capture call.** When the model state needs capture (capture need), each
-  `capture_model` call invokes `capture_cudagraphs` exactly once, after the
-  encoder, decoder, inner and speculator graphs and before its last
-  free-memory reading, so the graph memory it returns includes what the call
-  added. The call receives `capture_model`'s `profile_only`, the platform's
-  global graph pool, and the stream of a `graph_capture` context that the
-  runner opens for the call. An exception from it propagates and fails
-  startup.
-- **Serving capture.** When the model state needs capture, the worker's warmup
-  makes the serving call (`profile_only=False`) once, after the kernel warmups
-  and before the final dummy run and `post_warmup`; under a persistent-state
-  layout it runs while the serving bindings are the model state's bindings.
-- **Profiling capture.** When memory profiling runs the graph-memory estimate
-  and the model state needs capture, the estimate invokes `capture_model` with
+  when `ModelState.needs_cudagraph_capture()` returns `True` and
+  `enforce_eager` is off, whatever `cudagraph_mode` is.
+- **No predicate call in eager mode.** With `enforce_eager` set, the runner
+  does not call `ModelState.needs_cudagraph_capture()`.
+- **Capture call.** When `ModelState.needs_cudagraph_capture()` returns `True`
+  and `enforce_eager` is off, each `GPUModelRunner.capture_model` call invokes
+  `capture_cudagraphs` exactly once, also when no encoder or decoder graph is
+  captured.
+- **Capture order.** `GPUModelRunner.capture_model` invokes
+  `capture_cudagraphs` after the encoder, decoder, inner and speculator
+  graphs and before its last free-memory reading, so the graph memory it
+  returns includes what the call added.
+- **Capture arguments.** `capture_cudagraphs` receives `capture_model`'s
+  `profile_only`, the platform's global graph pool as `graph_pool`, and as
+  `stream` the stream of a `graph_capture` context that the runner opens for
+  the call and closes when the call returns or raises.
+- **Capture failure.** An exception from `capture_cudagraphs` propagates out
+  of `GPUModelRunner.capture_model` and fails startup.
+- **Serving capture.** When `ModelState.needs_cudagraph_capture()` returns
+  `True` and `enforce_eager` is off, the GPU worker's warmup makes exactly one
+  `capture_cudagraphs` call with `profile_only=False`, after the kernel
+  warmups and before the final dummy run and `post_warmup`. Under a
+  persistent-state layout the model state's bindings during that call are the
+  serving bindings.
+- **Workspace lock.** After a `GPUModelRunner.capture_model` call with
+  `profile_only=False` that invoked `capture_cudagraphs`, the workspace is
+  locked, also under `cudagraph_mode` NONE; after a call with
+  `profile_only=True` it is not.
+- **Profiling capture.** When the graph-memory estimate runs,
+  `ModelState.needs_cudagraph_capture()` returns `True` and `enforce_eager` is
+  off, the estimate invokes `GPUModelRunner.capture_model` with
   `profile_only=True`, also under `cudagraph_mode` NONE, while the platform's
-  global graph pool is the throwaway pool, and the memory that
-  `capture_cudagraphs` added is part of the estimate subtracted from the KV
+  global graph pool is the estimate's throwaway pool.
+- **Model-state graphs in the budget.** The memory that the profiling
+  `capture_cudagraphs` call added is part of the graph-memory estimate, in
+  full and without extrapolation, and the estimate is subtracted from the KV
   cache budget.
+- **Profiling footprint.** *(Model conformance.)* A model state's
+  `capture_cudagraphs` call with `profile_only=True` allocates at least as
+  much device memory as its call with `profile_only=False` under the same
+  configuration and pool page count.
 - **Profiling pool size.** When the graph-memory estimate runs for a
-  persistent-state layout whose model state needs capture, the temporary state
-  pool has the planned page count: `num_gpu_blocks_override` when it is set,
-  and `max_num_seqs + 1` otherwise.
-- **Profiling release.** When the graph-memory estimate's teardown runs and
-  the model state needs capture, it calls `clear_cudagraphs` exactly once,
-  before the runner drops the profiling bindings and pools and before the
-  serving KV cache is allocated, also when `capture_cudagraphs` raised or was
-  not reached.
-- **No estimate.** When the graph-memory estimate does not run (it is
-  disabled, the budget is fixed, or the extensible KV cache is on), the runner
-  makes no `profile_only=True` call and no `clear_cudagraphs` call.
-- **Eager mode.** With `enforce_eager` set, the runner reports no need for
-  the model state (capture need) and calls neither `capture_cudagraphs` nor
-  `clear_cudagraphs`; it still calls `prepare_execution_memory`, `post_warmup`
-  and `shutdown`.
+  persistent-state layout, `ModelState.needs_cudagraph_capture()` returns
+  `True` and `enforce_eager` is off, the temporary state pool has the planned
+  page count: `num_gpu_blocks_override` when it is set, and
+  `max_num_seqs + 1` otherwise. When the predicate returns `False`, the
+  temporary pool's size is unchanged.
+- **Profiling pool allocation failure.** When allocating that temporary pool
+  raises, the same exception propagates and fails startup before any budget
+  is computed; it is not the planned-capacity `ValueError` and states no
+  `max_num_seqs`. When the spec declares memory contributors it carries their
+  note (contributors on allocation failure).
+- **Profiling release.** When the graph-memory estimate's teardown runs,
+  `ModelState.needs_cudagraph_capture()` returns `True` and `enforce_eager` is
+  off, the teardown calls `clear_cudagraphs` exactly once, before the runner
+  drops the profiling bindings and pools and before the serving KV cache is
+  allocated, also when `capture_cudagraphs` raised or was not reached.
+- **Teardown after a failed release.** When `clear_cudagraphs` raises, the
+  estimate's teardown still releases the profiling bindings, pools, graph
+  manager and graphs, and restores the platform's global graph pool.
+- **Release failure.** When `clear_cudagraphs` raises and nothing raised
+  before it, its exception propagates and fails startup.
+- **Capture failure precedence.** When `capture_cudagraphs` raised during the
+  estimate and `clear_cudagraphs` then raises too, the exception that
+  propagates is the one from `capture_cudagraphs`, with its contributor note
+  when it has one, and the exception from `clear_cudagraphs` is logged with
+  its traceback and not raised.
+- **No estimate.** When the graph-memory estimate does not run (the budget is
+  fixed, `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS` is off, the extensible KV
+  cache is on, or the worker runs no estimate on the platform), the runner
+  makes no `capture_cudagraphs` call with `profile_only=True` and no
+  `clear_cudagraphs` call.
+- **Serving capture without the estimate.** When the graph-memory estimate
+  does not run, `ModelState.needs_cudagraph_capture()` returns `True` and
+  `enforce_eager` is off, the serving capture still runs (serving capture).
+- **Eager mode.** With `enforce_eager` set, the runner calls neither
+  `capture_cudagraphs` nor `clear_cudagraphs`; it still calls
+  `prepare_execution_memory`, `post_warmup` and `shutdown`.
+- **Other runners.** A runner that overrides `capture_model` and
+  `needs_cudagraph_capture` without calling `GPUModelRunner`'s, as the
+  encoder-only runner does, calls none of the three graph-capture hooks.
 - **Profiling bindings.** When the graph-memory estimate runs for a
   persistent-state layout, `initialize_state_slots` receives bindings over the
   temporary pools and later, once, new bindings over the serving pools; the
   runner drops its own references to the profiling bindings, and clears
   `ModelState.state_slots`, before it allocates the serving KV cache.
 - **Scheduler-shaped warmup.** When the KV cache layout holds persistent
-  state, the kernel warmups that build their own scheduler outputs
-  (`warmup_kernels` and `run_mixed_prefill_decode_warmup`) execute no step,
-  and `run_mixed_prefill_decode_warmup` returns `False`. The other warmup
-  stages are unchanged.
+  state, Model Runner V2 warmup executes no step whose `SchedulerOutput` it
+  built itself, whatever `ModelState.needs_cudagraph_capture()` returns:
+  `warmup_kernels` executes no step, and `run_mixed_prefill_decode_warmup`
+  executes no step and returns `False`.
+- **Other warmup stages.** Under a persistent-state layout the remaining
+  warmup stages run as they do for other layouts: the compile dummy runs, the
+  registered JIT kernel warmups, graph capture, the final dummy run and the
+  sampler warmup; and JIT monitoring is enabled after warmup under the same
+  condition as for other layouts.
+- **Dummy runs.** *(Model conformance.)* In a run with `dummy_run=True`, a
+  persistent-state model replays no captured graph over the state pools and
+  stores to no resident page.
 - **Startup access window.** Each `capture_cudagraphs` call made while state
   bindings exist opens a startup-access window on those bindings, and the
   runner closes it when the call returns or raises. A `capture_cudagraphs`
   call without state bindings opens no window.
-- **Startup access validity.** `startup_pool_access` called outside a window
-  raises `ValueError`, as does a call that names an unknown layer, and as does
-  every use of an access object whose window has closed, including while a
-  later window is open.
+- **Startup access outside a window.** `startup_pool_access` called while no
+  window is open on the bindings raises `ValueError`.
+- **Unknown layer.** `startup_pool_access` and `pool_layout` called with a
+  layer that is not a state layer of the bindings raise `ValueError`.
+- **Stale startup access.** Every use of an access object whose window has
+  closed raises `ValueError`, including while a later window is open.
 - **Startup access and ownership.** Startup access binds no slot and changes
   no handle: after a window closes, the first bind of every slot still writes
   the descriptors' initial values (slot initialization).
-- **Pool layout.** `pool_layout` reports the data address, shape, strides and
-  dtype of the tensors that `startup_pool_access` and `bind_rows` expose for
-  the same bindings, and the snapshot holds no tensor and no reference to the
-  bindings.
+- **Pool layout.** `pool_layout` reports, keyed by descriptor name, the data
+  address, shape, strides and dtype of the tensors that `startup_pool_access`
+  and `bind_rows` expose for the same bindings.
+- **Pool layout snapshot.** Each `pool_layout` call returns a new, immutable
+  mapping that holds no tensor and no reference to the bindings, and the call
+  succeeds at any time in the lifetime of the bindings, inside or outside a
+  startup-access window.
 - **Post-warmup.** On a successful startup through the GPU worker's warmup,
   the model state receives `post_warmup` exactly once, whatever the pooling,
   `enforce_eager`, compilation or JIT-warmup setting, and whether or not it
-  holds persistent state. It runs after every enabled warmup stage (compile
-  dummy runs, kernel and JIT warmups, graph capture, the final dummy run, the
-  sampler warmup and Inductor's lazy initialization), and before JIT
-  monitoring, GC freezing and the GPU sync check are enabled. An exception
-  from it fails startup.
+  holds persistent state.
+- **Post-warmup order.** `post_warmup` runs after every enabled warmup stage
+  (compile dummy runs, kernel and JIT warmups, graph capture, the final dummy
+  run, the sampler warmup and Inductor's lazy initialization), and before JIT
+  monitoring, GC freezing and the GPU sync check are enabled.
+- **Post-warmup failure.** An exception from `post_warmup` propagates and
+  fails startup.
 - **Shutdown hook.** Once the device has synchronized,
   `GPUModelRunner.shutdown` calls `shutdown` on the model state, if one
-  exists, before it clears the state bindings or the KV cache. A second
-  `GPUModelRunner.shutdown`, after the model state is gone, does not call it
-  again. The hook must tolerate a model state whose initialization did not
-  complete.
+  exists, before it clears the state bindings or the KV cache.
+- **Shutdown once.** A second `GPUModelRunner.shutdown`, after the model state
+  is gone, does not call the hook again.
+- **Shutdown after a failed startup.** When startup fails after the model
+  state was created, `GPUModelRunner.shutdown` calls the hook on that
+  partially initialized model state.
 - **Shutdown hook failure.** An exception from the model state's `shutdown`
   is logged with its traceback, and `GPUModelRunner.shutdown` continues its
   cleanup.
@@ -447,13 +591,17 @@ allocation.
 - **Contributors on allocation failure.** When allocating the KV cache in
   `GPUModelRunner.initialize_kv_cache` raises for a persistent-state layout
   whose spec declares memory contributors, including the temporary pools of
-  the graph-memory estimate and a device out-of-memory error, the runner
-  re-raises the same exception object with a note (`add_note`) that names each
-  contributor. An exception from `capture_cudagraphs` under such a layout gets
-  the same note. Without contributors the exception propagates unchanged. The
-  note appears in the logged traceback, not in `str(exception)`; the
-  multiprocess executor sends a worker's error to the engine as a string, so
-  there the names appear only in the worker's log.
+  the graph-memory estimate, the runner re-raises the same exception object
+  with one note (`add_note`) that names each contributor.
+- **Contributors on capture failure.** When `capture_cudagraphs` raises under
+  a persistent-state layout whose spec declares memory contributors, whatever
+  the exception's type, the runner re-raises the same exception object with
+  the same note.
+- **Contributor note text.** The note states that the model declares the
+  named options as using device memory, and nothing else: no advice and no
+  cause.
+- **No contributors.** When the spec declares no memory contributors, the
+  exceptions of the two criteria above propagate unchanged, without a note.
 
 ## Release fence
 
@@ -1114,7 +1262,9 @@ A model state that captures its own graphs
 ([Model-state graph capture](#model-state-graph-capture)) is therefore served
 with `cudagraph_mode` NONE and without `enforce_eager`: under NONE the runner
 still calls the model state's capture (capture need), and under
-`enforce_eager` it does not (eager mode).
+`enforce_eager` it does not (eager mode). Such a configuration leaves JIT
+warmup enabled; the warmup stages that execute synthetic scheduler-shaped
+steps are skipped for a persistent-state layout (scheduler-shaped warmup).
 As for other unsupported options, an
 unset option resolves to off and an explicit request fails:
 
