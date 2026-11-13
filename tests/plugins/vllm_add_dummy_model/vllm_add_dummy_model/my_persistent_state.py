@@ -40,11 +40,9 @@ streams a test put in `WATCHED_STREAMS` were idle when it ran.
 encoder that supports encoder CUDA graphs.
 
 Every stub registers one JIT warmup kernel and overrides
-`dummy_sampler_run`; both only record that the worker reached that stage,
-the latter with the number of objects the collector holds frozen there.
+`dummy_sampler_run`; both only record that the worker reached that stage.
 """
 
-import gc
 import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -92,7 +90,7 @@ MiB = 1 << 20
 # per call of "needs_cudagraph_capture", "prepare_execution_memory",
 # "profile_run", "capture_cudagraphs", "clear_cudagraphs", "post_warmup",
 # "shutdown", "jit_warmup" and "dummy_sampler_run", where info is a dict of
-# what the hook observed.
+# what the hook observed. A test may add records of its own kinds.
 EVENTS: list[tuple[Any, ...]] = []
 
 # One dict per `initialize_state_slots` call: a weak reference to the bindings
@@ -244,7 +242,7 @@ class StubPersistentStateModelState(ModelState):
         return torch.cuda.mem_get_info(self.device)[0]
 
     def dummy_sampler_run(self, sampler, hidden_states) -> bool:
-        _record("dummy_sampler_run", gc_frozen_objects=gc.get_freeze_count())
+        _record("dummy_sampler_run")
         return False
 
     def _on_main_stream(self) -> bool:
@@ -363,7 +361,6 @@ class StubPersistentStateModelState(ModelState):
             workspace_locked=current_workspace_manager().is_locked(),
             on_main_stream=self._on_main_stream(),
             jit_monitor_active=jit_monitor.is_active(),
-            gc_frozen_objects=gc.get_freeze_count(),
             sync_check_enabled=gpu_sync_debug._sync_check_enabled,
             inductor_initialized=inductor_initialized(),
         )

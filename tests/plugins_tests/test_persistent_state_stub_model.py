@@ -39,6 +39,7 @@ from vllm.v1.engine.core import EngineCore
 from vllm.v1.engine.core_client import InprocClient
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 from vllm.v1.request import RequestStatus
+from vllm.v1.worker import gpu_worker
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu_worker import Worker
 
@@ -1553,9 +1554,46 @@ class RecordingRunner(GPUModelRunner):
         super().shutdown()
 
 
+@contextmanager
+def _recording_worker_gc_freezes():
+    """Inside the block, each heap freeze the worker module makes is recorded
+    in the stub's `EVENTS` as ("worker_gc_freeze", {}) before it happens. The
+    worker module's own binding of the name is the one replaced, so the
+    freezes of other modules are not recorded."""
+    from vllm_add_dummy_model.my_persistent_state import EVENTS
+
+    freeze = gpu_worker.freeze_gc_heap
+
+    def recorded_freeze() -> None:
+        EVENTS.append(("worker_gc_freeze", {}))
+        freeze()
+
+    gpu_worker.freeze_gc_heap = recorded_freeze
+    try:
+        yield
+    finally:
+        gpu_worker.freeze_gc_heap = freeze
+
+
 class RecordingWorker(Worker):
+    """The standard worker with a recording runner. It records, in the
+    stub's `EVENTS`, each heap freeze of its warmup and each time it reaches
+    the JIT monitor's activation; the worker's own work is unchanged."""
+
     def _make_model_runner(self) -> GPUModelRunner:
         return RecordingRunner(self.vllm_config, self.device)
+
+    def compile_or_warm_up_model(self):
+        with _recording_worker_gc_freezes():
+            return super().compile_or_warm_up_model()
+
+    def _maybe_activate_jit_monitor(self) -> None:
+        from vllm_add_dummy_model.my_persistent_state import EVENTS
+
+        from vllm.utils import jit_monitor
+
+        super()._maybe_activate_jit_monitor()
+        EVENTS.append(("worker_jit_monitor", {"active": jit_monitor.is_active()}))
 
 
 def _scenario(
@@ -1856,7 +1894,6 @@ def _observe_engine(stub, seen: dict, config, scenario: dict) -> None:
     seen["after_startup"] = dict(
         _device_state(stub),
         jit_monitor_active=jit_monitor.is_active(),
-        gc_frozen_objects=gc.get_freeze_count(),
         sync_check_enabled=gpu_sync_debug._sync_check_enabled,
         inductor_initialized=stub.inductor_initialized(),
         initial_seed=torch.initial_seed(),
@@ -2824,22 +2861,22 @@ def test_post_warmup_precedes_the_seed_reset(started):
 
 
 def test_post_warmup_precedes_jit_monitoring_and_gc_freezing(started):
-    """When `post_warmup` runs at startup, JIT monitoring is not yet on and
-    the worker has not yet frozen the heap; both hold after startup.
+    """The worker's warmup activates the JIT monitor once and freezes the
+    heap once, in that order, both after the sampler warmup and after
+    `post_warmup`; JIT monitoring is off when the hook runs.
 
-    Only a freeze adds to the collector's frozen objects, and it adds every
-    tracked object. So the heap was not frozen between the sampler warmup,
-    the last stage before the hook, and the hook if the hook sees no more
-    frozen objects than that stage did, whatever the process had frozen by
-    then; a freeze after the hook leaves more of them after startup."""
+    The recording worker records its own activation step and its own heap
+    freeze in the stub's event log, so the engine core's later freeze is not
+    among them."""
     seen = _startup_events_only(started("capturing"))
-    (hook,) = _calls(seen, "post_warmup")
-    before = _calls(seen, "dummy_sampler_run")[-1]
-    after = seen["after_startup"]
-    assert hook["jit_monitor_active"] is False
-    assert after["jit_monitor_active"] is True
-    assert hook["gc_frozen_objects"] <= before["gc_frozen_objects"]
-    assert after["gc_frozen_objects"] > hook["gc_frozen_objects"]
+    (hook,) = _positions(seen, "post_warmup")
+    (monitor,) = _positions(seen, "worker_jit_monitor")
+    (freeze,) = _positions(seen, "worker_gc_freeze")
+    assert _positions(seen, "dummy_sampler_run")[-1] < hook < monitor < freeze
+    (at_hook,) = _calls(seen, "post_warmup")
+    (at_monitor,) = _calls(seen, "worker_jit_monitor")
+    assert at_hook["jit_monitor_active"] is False
+    assert at_monitor["active"] is True
 
 
 def test_post_warmup_precedes_the_gpu_sync_check(started):
