@@ -232,9 +232,9 @@ their memory is counted where the runner counts its own graphs:
 
 - `needs_cudagraph_capture()` answers from configuration alone, because the
   runner can ask it before any KV cache or state binding exists (it does so
-  when the worker reaches the graph-memory estimate), and it returns the same
-  value every time, because the runner asks it at several points of startup. A model state that cannot capture on the current platform returns
-  `False`. When it returns `True` and `enforce_eager` is off, the runner
+  when the graph-memory estimate runs), and it returns the same value every
+  time, because the runner asks it at several points of startup. A model
+  state that cannot capture on the current platform returns `False`. When it returns `True` and `enforce_eager` is off, the runner
   reports that it has graphs to capture, so memory profiling runs its
   graph-memory estimate and `capture_model` does not return early, even with
   `cudagraph_mode` NONE and no other graphs. With `enforce_eager` the runner
@@ -273,8 +273,9 @@ their memory is counted where the runner counts its own graphs:
   scheduled step, and a locked workspace refuses to grow. A model whose
   state captures graphs therefore sizes all workspace-backed memory in
   `capture_cudagraphs` or earlier; `post_warmup` and scheduled steps may use
-  the workspace but must not enlarge it. Without a model-state capture the
-  workspace of a persistent-state model is not locked.
+  the workspace but must not enlarge it. When `capture_model` captures
+  nothing (no model-state graphs and no encoder graphs), the workspace is
+  not locked.
 - `reload_weights` calls none of these hooks, and model-state graphs are not
   validated with it.
 
@@ -356,7 +357,8 @@ depend on `max_num_seqs`, so the reported value is a starting point for the
 next attempt, not a guarantee.
 
 Two failures are distinct. Planning's failure, above, is a `ValueError` that
-reports, without an override, the largest `max_num_seqs` that fits. The other can come earlier: when
+reports, without an override, the largest `max_num_seqs` that fits. The other
+can come earlier: when
 the model state captures its own graphs and the graph-memory estimate runs,
 the estimate allocates a temporary state pool of the planned page count before
 any budget exists. When the device cannot hold that pool, the allocation's own
@@ -364,7 +366,7 @@ exception, usually an out-of-memory error, fails startup. It carries the
 memory contributors' note ([Memory contributors](#memory-contributors)) and no
 computed `max_num_seqs`, because nothing has been measured yet. Only a model
 state that captures its own graphs gets a temporary pool of the planned size.
-For any other model the estimate, when it runs, keeps its minimal temporary
+For any other persistent-state model the estimate, when it runs, keeps its minimal temporary
 pool, whose allocation can fail in the same way.
 
 The serving pool is allocated once, in full, before the state bindings are
@@ -446,7 +448,7 @@ conformance.)* are obligations of the model, which a model's own tests check.
   allocator settings are those in effect when
   `prepare_execution_memory` ran.
 - **Configuration-only predicate.** When `enforce_eager` is off and the
-  worker reaches the graph-memory estimate, the runner's first call of
+  graph-memory estimate runs, the runner's first call of
   `ModelState.needs_cudagraph_capture()` precedes any KV cache, state pool or
   state binding. In other configurations the first call can come later. The
   runner passes no argument.
