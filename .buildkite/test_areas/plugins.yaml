@@ -53,6 +53,7 @@ steps:
   - tests/conftest.py
   - tests/plugins/vllm_add_dummy_model/
   - tests/plugins_tests/test_persistent_state_stub_model.py
+  - tests/utils.py
   - tests/v1/core/utils.py
   - vllm/config/cache.py
   - vllm/config/compilation.py

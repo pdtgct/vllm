@@ -19,13 +19,14 @@ import gc
 import logging
 import os
 import re
+import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 import pytest
 import torch
 
-from tests.utils import create_new_process_for_each_test
+from tests.utils import call_in_spawned_process, create_new_process_for_each_test
 from tests.v1.core.utils import mentions_number
 from vllm import LLM, SamplingParams
 from vllm.config import CompilationMode, CUDAGraphMode
@@ -1503,13 +1504,53 @@ START_TIMEOUT = 600
 CAPTURE_RESULTS: list[tuple[bool, int]] = []
 
 
+# The exceptions that left the KV cache allocation of a recording runner, as
+# they were when they left it.
+ALLOCATION_FAILURES: list[BaseException] = []
+
+# Set when a recording runner enters `shutdown`.
+SHUTDOWN_ENTERED = threading.Event()
+
+
+@contextmanager
+def _recording_allocation_failures(allocation_context):
+    """The worker's allocation context, with a record of the exception that
+    leaves the allocation inside it."""
+    with allocation_context or nullcontext():
+        try:
+            yield
+        except BaseException as error:
+            ALLOCATION_FAILURES.append(error)
+            raise
+
+
 class RecordingRunner(GPUModelRunner):
-    """The standard runner; it records what each `capture_model` returns."""
+    """The standard runner. It records what each `capture_model` returns,
+    the exception of a failed KV cache allocation, and when `shutdown` is
+    entered; every method does the runner's own work."""
 
     def capture_model(self, *, profile_only: bool = False) -> int:
         captured = super().capture_model(profile_only=profile_only)
         CAPTURE_RESULTS.append((profile_only, int(captured)))
         return captured
+
+    def initialize_kv_cache(
+        self,
+        kv_cache_config,
+        is_profiling: bool = False,
+        kv_cache_allocation_context=None,
+        extensible: bool = False,
+    ) -> None:
+        super().initialize_kv_cache(
+            kv_cache_config,
+            is_profiling,
+            _recording_allocation_failures(kv_cache_allocation_context),
+            extensible,
+        )
+
+    def shutdown(self) -> None:
+        SHUTDOWN_ENTERED.set()
+        super().shutdown()
 
 
 class RecordingWorker(Worker):
@@ -1535,6 +1576,16 @@ SCENARIOS = {
     "profile-run-fails": _scenario({"fail": ["profile_run"]}),
     "capturing": _scenario(CAPTURING),
     "capturing-sync-check": _scenario(CAPTURING, env={"VLLM_GPU_SYNC_CHECK": "warn"}),
+    # Compilation pinned to the mode in which the worker's warmup triggers
+    # Inductor's lazy initialization; the stub itself compiles nothing.
+    "capturing-inductor": _scenario(
+        CAPTURING,
+        compilation_config={
+            "mode": int(CompilationMode.VLLM_COMPILE),
+            "backend": "inductor",
+            "cudagraph_mode": "NONE",
+        },
+    ),
     "capturing-eager": _scenario(CAPTURING, enforce_eager=True),
     "capturing-fixed": _scenario(CAPTURING, **FIXED_BUDGET),
     "capturing-estimate-off": _scenario(
@@ -1584,6 +1635,8 @@ def _stub_module():
     for record in (stub.EVENTS, stub.BINDINGS, stub.RAISED, stub.WATCHED_STREAMS):
         record.clear()
     CAPTURE_RESULTS.clear()
+    ALLOCATION_FAILURES.clear()
+    SHUTDOWN_ENTERED.clear()
     return stub
 
 
@@ -1623,7 +1676,9 @@ def _hook_config(path, scenario: dict):
 
 def _error(stub, error: BaseException) -> dict:
     """A failure as plain data. `raised` is the position of the exception
-    object among those the stub's hooks raised, if it is one of them."""
+    object among those the stub's hooks raised, if it is one of them;
+    `left_allocation` is whether it is the very object that left a KV cache
+    allocation, out of `allocation_failures` such objects."""
     raised = [i for i, e in enumerate(stub.RAISED) if e is error]
     context = None if error.__suppress_context__ else error.__context__
     return dict(
@@ -1632,6 +1687,8 @@ def _error(stub, error: BaseException) -> dict:
         notes=list(getattr(error, "__notes__", [])),
         raised=raised[0] if raised else None,
         chained=error.__cause__ is not None or context is not None,
+        left_allocation=any(e is error for e in ALLOCATION_FAILURES),
+        allocation_failures=len(ALLOCATION_FAILURES),
     )
 
 
@@ -1659,9 +1716,9 @@ def _device_state(stub) -> dict:
 def _shutdown_behind_held_stream(stub, core: EngineCore) -> dict:
     """Shut the engine down while a stream other than the main one has
     outstanding work: a host function holds it until this function lets it
-    go (bounded, so a failure cannot hang the device)."""
+    go (bounded, so a failure cannot hang the device). The absence window
+    starts only once the runner has entered its shutdown."""
     import ctypes
-    import threading
 
     release = threading.Event()
 
@@ -1677,25 +1734,43 @@ def _shutdown_behind_held_stream(stub, core: EngineCore) -> dict:
     )
     assert launched == 0
     assert not stream.query()
-    shutdown = threading.Thread(target=core.shutdown)
+
+    failures: list[str] = []
+
+    def shut_down() -> None:
+        try:
+            core.shutdown()
+        except BaseException as error:
+            failures.append(repr(error))
+
+    shutdown = threading.Thread(target=shut_down)
     shutdown.start()
     try:
-        # Bounded wait for something that must not happen: a shutdown that
-        # waits for the device is still waiting when the second has passed.
+        runner_entered = SHUTDOWN_ENTERED.wait(TIMEOUT)
+        # Bounded wait for something that must not happen: the runner is in
+        # its shutdown, and one that waits for the device is still waiting
+        # when the second has passed.
         shutdown.join(1)
         still_waiting = shutdown.is_alive()
         hook_ran_while_held = any(e[0] == "shutdown" for e in stub.EVENTS)
     finally:
         release.set()
         shutdown.join(TIMEOUT)
+        # The host function has returned before its callback object goes.
+        stream.synchronize()
     return dict(
+        runner_entered=runner_entered,
         still_waiting=still_waiting,
         hook_ran_while_held=hook_ran_while_held,
         finished=not shutdown.is_alive(),
+        failures=failures,
     )
 
 
 def _observe_engine(stub, seen: dict, config, scenario: dict) -> None:
+    from vllm.model_executor.warmup.attention_warmup import (
+        mixed_batch_attention_warmup,
+    )
     from vllm.utils import gpu_sync_debug, jit_monitor
     from vllm.v1.worker.gpu.warmup import (
         run_mixed_prefill_decode_warmup,
@@ -1755,6 +1830,9 @@ def _observe_engine(stub, seen: dict, config, scenario: dict) -> None:
             num_tokens=runner.max_num_tokens,
         )
         steps["after_mixed_warmup"] = len(_scheduled_steps(stub.EVENTS))
+        # A registered warmup that is built on that function.
+        mixed_batch_attention_warmup(worker)
+        steps["after_attention_warmup"] = len(_scheduled_steps(stub.EVENTS))
     except Exception as error:
         steps["error"] = repr(error)
 
@@ -1804,6 +1882,7 @@ def _observe_estimate(stub, seen: dict, config, records: list) -> None:
         seen["logged_raised"] = _logged_raised(stub, records)
         records.clear()
         stub.RAISED.clear()
+        ALLOCATION_FAILURES.clear()
         gc.collect()
         torch.cuda.empty_cache()
         seen["after_estimate"] = dict(
@@ -1846,6 +1925,10 @@ def _observe(path: str, name: str) -> dict:
         else:
             _observe_engine(stub, seen, config, scenario)
             seen["logged_raised"] = _logged_raised(stub, records)
+        seen["attention_warmup_skip_logged"] = any(
+            "Skipping mixed prefill+decode attention warmup" in record.getMessage()
+            for record in records
+        )
     seen["events"] = list(stub.EVENTS)
     seen["bindings"] = [
         {key: value for key, value in binding.items() if key != "ref"}
@@ -1863,10 +1946,9 @@ def _observed_starts() -> dict:
 
 @pytest.fixture
 def started(_observed_starts, dummy_state_model_path):
-    """Returns what `_observe` saw of a scenario; each scenario starts once
-    per module, in a new process."""
-    import multiprocessing
-    from concurrent.futures import ProcessPoolExecutor
+    """Returns what `_observe` saw of a scenario. Each scenario starts once
+    per module, in a new process; a start that failed or timed out is not
+    repeated, and every test of its scenario fails with its error."""
 
     def start(name: str) -> dict:
         if name not in _observed_starts:
@@ -1874,19 +1956,21 @@ def started(_observed_starts, dummy_state_model_path):
             saved = {variable: os.environ.get(variable) for variable in env}
             os.environ.update(env)
             try:
-                with ProcessPoolExecutor(
-                    1, mp_context=multiprocessing.get_context("spawn")
-                ) as pool:
-                    _observed_starts[name] = pool.submit(
-                        _observe, dummy_state_model_path, name
-                    ).result(START_TIMEOUT)
+                _observed_starts[name] = call_in_spawned_process(
+                    _observe, dummy_state_model_path, name, timeout=START_TIMEOUT
+                )
+            except RuntimeError as error:
+                _observed_starts[name] = error
             finally:
                 for variable, value in saved.items():
                     if value is None:
                         del os.environ[variable]
                     else:
                         os.environ[variable] = value
-        return _observed_starts[name]
+        seen = _observed_starts[name]
+        if isinstance(seen, RuntimeError):
+            raise RuntimeError(f"scenario {name!r} did not start: {seen}")
+        return seen
 
     return start
 
@@ -2190,10 +2274,13 @@ def test_profiling_pool_has_the_planned_page_count(started, scenario, pages):
 
 def _assert_pool_allocation_failed(seen: dict) -> None:
     """Startup failed in the allocation of the oversized pool itself: an
-    out-of-memory error for the pool's whole size, raised as it was."""
+    out-of-memory error for the pool's whole size, and the exception that
+    fails startup is the object that left that allocation, not a copy."""
     error = seen["error"]
     assert error["type"] == "OutOfMemoryError"
     assert f"Tried to allocate {seen['oversized_gib']}.00 GiB" in error["message"]
+    assert error["allocation_failures"] == 1
+    assert error["left_allocation"] is True
     assert error["chained"] is False
     assert _positions(seen, "initialize_state_slots") == []
 
@@ -2438,6 +2525,18 @@ def test_warmup_entry_points_execute_no_step_on_a_started_runner(started, scenar
     assert again["after_mixed_warmup"] == 0
 
 
+@pytest.mark.parametrize("scenario", ["capturing", "plain"])
+def test_registered_attention_warmup_skips_under_a_state_layout(started, scenario):
+    """`mixed_batch_attention_warmup`, a registered warmup built on
+    `run_mixed_prefill_decode_warmup`, runs on the started worker, executes
+    no step and logs that it skipped."""
+    seen = started(scenario)
+    again = seen["warmup_again"]
+    assert again["error"] is None
+    assert again["after_attention_warmup"] == 0
+    assert seen["attention_warmup_skip_logged"] is True
+
+
 @pytest.mark.parametrize(
     ("scenario", "jit_warmup"),
     [("capturing", True), ("capturing-no-jit-warmup", False)],
@@ -2537,7 +2636,8 @@ def test_post_warmup_precedes_jit_monitoring_and_gc_freezing(started):
     after = seen["after_startup"]
     assert hook["jit_monitor_active"] is False
     assert after["jit_monitor_active"] is True
-    assert after["gc_frozen_objects"] > hook["gc_frozen_objects"]
+    assert hook["gc_frozen_objects"] == 0
+    assert after["gc_frozen_objects"] > 0
 
 
 def test_post_warmup_precedes_the_gpu_sync_check(started):
@@ -2550,14 +2650,18 @@ def test_post_warmup_precedes_the_gpu_sync_check(started):
 
 
 def test_post_warmup_precedes_inductor_lazy_initialization(started):
-    """The stub compiles nothing, so Inductor's lazy initialization has not
-    run when `post_warmup` does; after startup it has run exactly when the
-    configuration makes the worker trigger it."""
-    seen = started("capturing")
+    """With compilation pinned to vLLM's Inductor mode, the worker triggers
+    Inductor's lazy initialization after `post_warmup`: the stub compiles
+    nothing, so it has not run when the hook does, and it has run after
+    startup."""
+    seen = started("capturing-inductor")
+    assert seen["inductor_expected"] is True
     (hook,) = _calls(seen, "post_warmup")
-    assert hook["inductor_initialized"] is False
     after = seen["after_startup"]
-    assert after["inductor_initialized"] is seen["inductor_expected"]
+    if hook["inductor_initialized"] is None or after["inductor_initialized"] is None:
+        pytest.skip("unsupported oracle: torch does not expose lazy_init.cache_info")
+    assert hook["inductor_initialized"] is False
+    assert after["inductor_initialized"] is True
 
 
 def test_post_warmup_failure_fails_startup(started):
@@ -2594,11 +2698,14 @@ def test_runner_shutdown_calls_the_hook_before_it_releases_the_state(started):
 
 
 def test_runner_shutdown_waits_for_the_device_before_the_hook(started):
-    """While a stream other than the main one has outstanding work, the
-    shutdown has not reached the hook after a second; once that work is let
-    go the shutdown finishes, and the hook found the stream idle."""
+    """While a stream other than the main one has outstanding work, a
+    shutdown that the runner has entered has not reached the hook a second
+    later; once that work is let go the shutdown finishes, and the hook found
+    the stream idle."""
     seen = started("plain-held-shutdown")
     held = seen["held_shutdown"]
+    assert held["failures"] == []
+    assert held["runner_entered"] is True
     assert held["still_waiting"] is True
     assert held["hook_ran_while_held"] is False
     assert held["finished"] is True

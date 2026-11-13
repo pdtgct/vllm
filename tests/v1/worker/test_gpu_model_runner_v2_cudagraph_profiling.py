@@ -18,7 +18,7 @@ from typing import Any
 import pytest
 import torch
 
-from tests.utils import create_new_process_for_each_test
+from tests.utils import call_in_spawned_process, create_new_process_for_each_test
 from vllm.compilation.counter import compilation_counter
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker import gpu_worker
@@ -26,6 +26,12 @@ from vllm.v1.worker.gpu import cudagraph_utils as cgu
 from vllm.v1.worker.gpu import model_runner as mrv2
 from vllm.v1.worker.gpu.eplb_utils import EPLBController
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+from vllm.v1.worker.gpu.spec_decode.standalone_ar.config import (
+    StandaloneARSpeculatorConfig,
+)
+from vllm.v1.worker.gpu.spec_decode.standalone_ar.speculator import (
+    StandaloneARSpeculator,
+)
 
 GLOBAL_POOL = "global-pool"
 THROWAWAY_POOL = "throwaway-pool"
@@ -482,10 +488,11 @@ def test_teardown_profiling_state_clears_mamba_align_metadata(monkeypatch):
 
 # The model-state graph hooks for a model without persistent state, through
 # the real estimate and the real warmup. A scenario is a model-state class and
-# engine arguments for facebook/opt-125m (dummy weights) under the default
-# `cudagraph_mode`, with the extensible KV cache off so that the estimate
-# runs. `_observe_opt` starts it once, in a new process, with the real
-# constructors, and returns plain data that the tests below assert on.
+# engine arguments for a real model with dummy weights: facebook/opt-125m
+# under the default `cudagraph_mode`, or SmolVLM-256M for encoder graphs,
+# with the extensible KV cache off so that the estimate runs. `_observe_opt`
+# starts it once, in a new process, with the real constructors, and returns
+# plain data that the tests below assert on.
 
 MiB = 1 << 20
 START_TIMEOUT = 900
@@ -545,6 +552,11 @@ class _RecordingModelState(DefaultModelState):
             dummy_loras=(
                 None if lora_manager is None else sorted(lora_manager.list_adapters())
             ),
+            encoder_graphs_captured=(
+                self.supports_mm_inputs
+                and self.encoder_runner.cudagraph_manager is not None
+                and self.encoder_runner.cudagraph_manager.is_captured()
+            ),
         )
         free = torch.cuda.mem_get_info(self.device)[0]
         self._scratch = torch.zeros(64 * MiB, dtype=torch.uint8, device=self.device)
@@ -603,6 +615,18 @@ class _RecordingWorker(gpu_worker.Worker):
         return _RecordingRunner(self.vllm_config, self.device)
 
 
+class _RecordingSpeculator(StandaloneARSpeculator):
+    """The draft-model speculator; it records when its capture is done."""
+
+    def capture(self) -> None:
+        super().capture()
+        _record("speculator_capture")
+
+
+class _RecordingSpeculatorConfig(StandaloneARSpeculatorConfig):
+    speculator_class = f"{__name__}.{_RecordingSpeculator.__qualname__}"
+
+
 class _OwnCaptureRunner(mrv2.GPUModelRunner):
     """Replaces capture and its predicate without calling `GPUModelRunner`'s,
     as the encoder-only runner does."""
@@ -619,8 +643,28 @@ class _OwnCaptureRunnerWorker(_RecordingWorker):
         return _OwnCaptureRunner(self.vllm_config, self.device)
 
 
+_OPT = dict(
+    model="facebook/opt-125m",
+    base="vllm.model_executor.models.opt.OPTForCausalLM",
+    max_model_len=64,
+)
+# A small model whose vision encoder supports CUDA graphs. `cudagraph_mode`
+# is NONE, so the encoder graphs are the runner's only ones.
+_SMOLVLM = dict(
+    model="HuggingFaceTB/SmolVLM-256M-Instruct",
+    base="vllm.model_executor.models.idefics3.Idefics3ForConditionalGeneration",
+    max_model_len=4096,
+    limit_mm_per_prompt={"image": 1},
+    compilation_config={
+        "cudagraph_mode": "NONE",
+        "cudagraph_mm_encoder": True,
+        "encoder_cudagraph_token_budgets": [4096],
+    },
+)
+
+
 def _opt(state: type[DefaultModelState], *, start: str = "estimate", **engine_args):
-    return dict(state=state, start=start, engine_args=engine_args)
+    return dict(state=state, start=start, engine_args={**_OPT, **engine_args})
 
 
 _OPT_SCENARIOS = {
@@ -633,12 +677,24 @@ _OPT_SCENARIOS = {
     "capturing-lora": _opt(
         _CapturingModelState, enable_lora=True, max_loras=1, max_lora_rank=8
     ),
+    # A draft model that speculates for the target, through a registered
+    # speculative method whose speculator records its capture.
+    "capturing-speculator": _opt(
+        _CapturingModelState,
+        speculative_config={
+            "method": "recording_draft_model",
+            "model": "facebook/opt-125m",
+            "num_speculative_tokens": 2,
+        },
+    ),
     "inner-capture-fails": _opt(_InnerCaptureFailsModelState),
     "inner-capture-and-release-fail": _opt(_InnerCaptureAndReleaseFailModelState),
     "capturing-start": _opt(_CapturingModelState, start="engine"),
     "pooling-start": _opt(
         _RecordingModelState, start="engine", runner="pooling", convert="embed"
     ),
+    "encoder-default-predicate": _opt(_RecordingModelState, **_SMOLVLM),
+    "encoder-capturing": _opt(_CapturingModelState, **_SMOLVLM),
 }
 
 
@@ -648,30 +704,32 @@ def _observe_opt(name: str) -> dict:
 
     from vllm import ModelRegistry
     from vllm.engine.arg_utils import EngineArgs
-    from vllm.model_executor.models.opt import OPTForCausalLM
+    from vllm.utils.import_utils import resolve_obj_by_qualname
     from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
     from vllm.v1.core.kv_cache_planning import get_global_kv_cache_groups
     from vllm.v1.engine.core import EngineCore
     from vllm.v1.executor.uniproc_executor import UniProcExecutor
+    from vllm.v1.worker.gpu.spec_decode.speculator_config import (
+        register_speculative_method,
+    )
 
     scenario = _OPT_SCENARIOS[name]
     model_state_cls = scenario["state"]
-
-    class RecordingOPTForCausalLM(OPTForCausalLM):
-        @classmethod
-        def get_model_state_cls(cls) -> type[DefaultModelState]:
-            return model_state_cls
-
-    ModelRegistry.register_model("RecordingOPTForCausalLM", RecordingOPTForCausalLM)
     engine_args = {
         "worker_cls": f"{__name__}.{_RecordingWorker.__qualname__}",
         **scenario["engine_args"],
     }
+
+    class RecordingModel(resolve_obj_by_qualname(engine_args.pop("base"))):  # type: ignore[misc]
+        @classmethod
+        def get_model_state_cls(cls) -> type[DefaultModelState]:
+            return model_state_cls
+
+    ModelRegistry.register_model("RecordingModel", RecordingModel)
+    register_speculative_method("recording_draft_model", _RecordingSpeculatorConfig)
     config = EngineArgs(
-        model="facebook/opt-125m",
-        hf_overrides={"architectures": ["RecordingOPTForCausalLM"]},
+        hf_overrides={"architectures": ["RecordingModel"]},
         load_format="dummy",
-        max_model_len=64,
         max_num_seqs=2,
         enable_extensible_kv_cache=False,
         **engine_args,
@@ -697,6 +755,7 @@ def _observe_opt(name: str) -> dict:
         )
         seen["startup_calls"] = len(_HOOK_CALLS)
         core.shutdown()
+        seen["calls"] = list(_HOOK_CALLS)
     else:
         executor = UniProcExecutor(config)
         try:
@@ -723,6 +782,7 @@ def _observe_opt(name: str) -> dict:
             seen["after_estimate"] = dict(
                 estimate=getattr(worker, "cudagraph_memory_estimate", None),
                 own_capture_runner=isinstance(runner, _OwnCaptureRunner),
+                runner_needs_capture=runner.needs_cudagraph_capture(),
                 runner_has_bindings=runner.state_slots is not None,
                 loras=(
                     None
@@ -730,10 +790,11 @@ def _observe_opt(name: str) -> dict:
                     else sorted(lora_manager.list_adapters())
                 ),
             )
+            # The estimate's calls only: the shutdown below has its own hook.
+            seen["calls"] = list(_HOOK_CALLS)
         finally:
             executor.shutdown()
 
-    seen["calls"] = list(_HOOK_CALLS)
     seen["capture_results"] = list(_CAPTURE_RESULTS)
     seen["logged_raised"] = sorted(
         {
@@ -749,20 +810,23 @@ def _observe_opt(name: str) -> dict:
 
 @pytest.fixture(scope="module")
 def opt_started():
-    """Returns what `_observe_opt` saw of a scenario; each scenario starts
-    once per module, in a new process."""
-    import multiprocessing
-    from concurrent.futures import ProcessPoolExecutor
-
-    observed: dict[str, dict] = {}
+    """Returns what `_observe_opt` saw of a scenario. Each scenario starts
+    once per module, in a new process; a start that failed or timed out is
+    not repeated, and every test of its scenario fails with its error."""
+    observed: dict[str, dict | RuntimeError] = {}
 
     def start(name: str) -> dict:
         if name not in observed:
-            with ProcessPoolExecutor(
-                1, mp_context=multiprocessing.get_context("spawn")
-            ) as pool:
-                observed[name] = pool.submit(_observe_opt, name).result(START_TIMEOUT)
-        return observed[name]
+            try:
+                observed[name] = call_in_spawned_process(
+                    _observe_opt, name, timeout=START_TIMEOUT
+                )
+            except RuntimeError as error:
+                observed[name] = error
+        seen = observed[name]
+        if isinstance(seen, RuntimeError):
+            raise RuntimeError(f"scenario {name!r} did not start: {seen}")
+        return seen
 
     return start
 
@@ -828,13 +892,51 @@ def test_estimate_captures_model_state_graphs_after_the_decoder_graphs(opt_start
 @_NEEDS_DEVICE
 def test_capture_result_includes_what_the_model_state_call_added(opt_started):
     """The call precedes `capture_model`'s last free-memory reading: the
-    graph memory it returns holds the 64 MiB the call kept."""
+    graph memory it returns exceeds what the same capture returns without a
+    model-state call by the 64 MiB the call kept, less an allowance of 8 MiB
+    for allocator rounding between the two starts."""
     seen = opt_started("capturing")
     (capture,) = _infos(seen, "capture_cudagraphs")
     assert capture["device_bytes_taken"] >= 64 * MiB
     ((profile_only, captured),) = seen["capture_results"]
+    ((_, without_call),) = opt_started("default-predicate")["capture_results"]
     assert profile_only is True
-    assert captured >= 64 * MiB
+    assert captured - without_call >= (64 - 8) * MiB
+
+
+@_NEEDS_DEVICE
+def test_capture_call_follows_the_speculator_graphs(opt_started):
+    """With a draft-model speculator, `capture_model` calls
+    `capture_cudagraphs` after the speculator's capture has completed."""
+    hooks = _hooks(opt_started("capturing-speculator"))
+    assert hooks.count("speculator_capture") == 1
+    assert hooks.count("capture_cudagraphs") == 1
+    assert hooks.index("speculator_capture") < hooks.index("capture_cudagraphs")
+
+
+@_NEEDS_DEVICE
+def test_encoder_graphs_alone_make_the_runner_capture(opt_started):
+    """Under `cudagraph_mode` NONE, a model state with encoder graphs and the
+    default predicate makes the runner report graphs to capture: the estimate
+    allocates its temporary KV cache and captures, and calls no graph hook of
+    the model state."""
+    seen = opt_started("encoder-default-predicate")
+    assert seen["cudagraph_mode"] == "NONE"
+    assert seen["after_estimate"]["runner_needs_capture"] is True
+    assert seen["after_estimate"]["estimate"] > 0
+    assert "initialize_kv_cache" in _hooks(seen)
+    assert not _GRAPH_HOOKS & set(_hooks(seen))
+
+
+@_NEEDS_DEVICE
+def test_capture_call_follows_the_encoder_graphs(opt_started):
+    """`capture_model` calls `capture_cudagraphs` once the encoder graphs are
+    captured, also when no decoder graph is captured."""
+    seen = opt_started("encoder-capturing")
+    assert seen["cudagraph_mode"] == "NONE"
+    (capture,) = _infos(seen, "capture_cudagraphs")
+    assert capture["encoder_graphs_captured"] is True
+    assert "capture_inner_cudagraphs" not in _hooks(seen)
 
 
 @_NEEDS_DEVICE
@@ -923,11 +1025,17 @@ def test_non_state_shutdown_calls_the_hook_once(opt_started):
 
 
 @_NEEDS_DEVICE
-def test_pooling_start_calls_post_warmup_and_shutdown_once(opt_started):
+def test_pooling_start_calls_post_warmup_once(opt_started):
     """A pooling model's warmup, which warms no sampler up, still calls
-    `post_warmup` once, and its shutdown calls `shutdown` once."""
+    `post_warmup` once."""
     seen = opt_started("pooling-start")
     hooks = _hooks(seen)
-    assert hooks[: seen["startup_calls"]].count("post_warmup") == 1
-    assert hooks.count("shutdown") == 1
     assert "dummy_sampler_run" not in hooks
+    assert hooks[: seen["startup_calls"]].count("post_warmup") == 1
+
+
+@_NEEDS_DEVICE
+def test_pooling_shutdown_calls_the_hook_once(opt_started):
+    """Shutting a pooling engine down calls `shutdown` once on its model
+    state."""
+    assert _hooks(opt_started("pooling-start")).count("shutdown") == 1
