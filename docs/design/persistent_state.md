@@ -124,13 +124,13 @@ A persistent-state model uses these Model Runner V2 hooks:
   answers from configuration alone and returns the same value for the model
   state's lifetime. `clear_cudagraphs` must tolerate a model state that
   captured nothing.
-- `ModelState.post_warmup()` is called once, after every warmup stage and
-  before the worker serves. Use it to check that nothing a captured graph reads
-  moved during warmup, and to warm up kernels that only a scheduled step would
+- `ModelState.post_warmup()` is called once in each run of the worker's
+  warmup, after the stages that run the model and, at startup, before the
+  worker serves. Use it to check that nothing a captured graph reads moved
+  during warmup, and to warm up kernels that only a scheduled step would
   otherwise compile. After a model-state capture the workspace is already
-  locked, so the hook must not enlarge it. The hook runs after the worker has
-  reset the random seed, so a hook that draws from the global random state
-  changes seeded sampling.
+  locked, so the hook must not enlarge it. The worker resets the random seed
+  after the hook, so the hook may draw from the global random state.
 - `ModelState.shutdown()` is called at the start of `GPUModelRunner.shutdown`,
   before the runner releases the state bindings and the KV cache. Release
   captured graphs and model-owned buffers there. The hook must tolerate a
@@ -152,8 +152,9 @@ state, within these limits:
 - The GPU worker's warmup calls `post_warmup`, and so do workers that inherit
   that warmup, such as XPU. The CPU worker has its own warmup, which captures
   no graphs: it calls neither the graph-capture hooks nor `post_warmup`. When
-  its runner is a `GPUModelRunner`, that runner still calls
-  `prepare_execution_memory` and `shutdown`.
+  its runner is a `GPUModelRunner`, that runner still calls `shutdown`, and
+  calls `prepare_execution_memory` when the worker runs `profile_run`, which
+  it skips when it does not warm the model up.
 
 `StateSlotBindings.bind_rows` authorizes the current step's handles; the
 `StateSlotRows` it returns expose the complete component pools, but a model
@@ -254,7 +255,12 @@ their memory is counted where the runner counts its own graphs:
   `stream` is the stream of a `graph_capture` context that the runner opens
   for the call. The model captures inside
   `vllm.compilation.cudagraph_pool.capture_pool` with that pool and on that
-  stream.
+  stream. The call is made inside the runner's dummy-LoRA scope, as the
+  decoder's inner graphs are, and does not depend on decoder capture. The
+  runner waits for the device when it opens the `graph_capture` context, not
+  when the hook returns, so the hook completes its own device work: before it
+  returns or raises, every capture warm-up and validation replay it started,
+  on `stream` or on a stream of its own, has finished.
 - The profiling call (`profile_only=True`) captures the same graphs as the
   serving call, or graphs whose memory is at least as large: the runner does
   not extrapolate a model state's graphs. The memory it adds is part of the
@@ -287,7 +293,16 @@ their memory is counted where the runner counts its own graphs:
   elastic EP reconfiguration runs the worker's warmup again, so the model
   state gets another serving `capture_cudagraphs` call and another
   `post_warmup`, with no `clear_cudagraphs` call between the two captures.
-  Model-state graphs are not validated with any of these.
+  In that later run JIT monitoring, GC freezing and the GPU sync check are
+  already enabled. Model-state graphs are not validated with any of these.
+- Elastic EP is not among the refused configurations, so a persistent-state
+  model can reach a reconfiguration, which runs a profiling-shaped dummy run
+  and the whole warmup, including a second serving capture over the live
+  pools, while streams hold slots. Persistent state is not validated with
+  elastic EP.
+- The planned GPU tests exercise these hooks under a persistent-state layout
+  with `cudagraph_mode` NONE. A model state without persistent state can
+  override them; for that case only unit tests are planned.
 
 Dummy runs before the serving capture (the compile dummy runs) and after it
 (the final dummy run and the sampler warmup) carry no `bind_rows`
@@ -314,8 +329,8 @@ The skip leaves JIT monitoring as it is: after warmup the worker still
 monitors for unexpected JIT compilation whenever JIT warmup is enabled. A
 persistent-state model therefore warms up what its scheduled step needs in
 `capture_cudagraphs` or `post_warmup`, both of which run before monitoring
-starts. A model that does not will report a JIT compilation on its first
-scheduled step, which is a warning under `jit_monitor_mode` `warn` and an
+starts at startup. A model that does not will report a JIT compilation on its
+first scheduled step, which is a warning under `jit_monitor_mode` `warn` and an
 error under `error`.
 
 The existing `ModelState.capture_inner_cudagraphs` hook is called only while
@@ -437,12 +452,12 @@ conformance.)* are obligations of the model, which a model's own tests check.
   would hold no slot, before memory profiling allocates any state pool. When
   the planned pages fit, the pool has exactly the planned page count; planning
   never reduces it.
-- **Hook defaults.** A model state that overrides none of
-  `prepare_execution_memory`, `needs_cudagraph_capture`, `capture_cudagraphs`,
-  `clear_cudagraphs`, `post_warmup` and `shutdown` starts, serves and shuts
-  down as it does without these hooks: the predicate returns `False`, the
-  other five do nothing, and no graph is captured that was not captured
-  before.
+- **Hook defaults.** On `ModelState`, `needs_cudagraph_capture` returns
+  `False`, and `prepare_execution_memory`, `capture_cudagraphs`,
+  `clear_cudagraphs`, `post_warmup` and `shutdown` return `None` and do
+  nothing. With these defaults `GPUModelRunner.capture_model` opens no
+  `graph_capture` context for the model state, and the graph-memory
+  estimate's teardown makes no `clear_cudagraphs` call.
 - **Execution memory preparation.** `GPUModelRunner.prepare_execution_memory`
   calls the model state's `prepare_execution_memory` the first time it is
   invoked on a runner and does nothing afterwards.
@@ -473,8 +488,9 @@ conformance.)* are obligations of the model, which a model's own tests check.
   state cannot capture CUDA graphs.
 - **Capture need.** `GPUModelRunner.needs_cudagraph_capture()` returns `True`
   when `ModelState.needs_cudagraph_capture()` returns `True` and
-  `enforce_eager` is off, whatever `cudagraph_mode` is; otherwise it returns
-  what it returns without this hook.
+  `enforce_eager` is off, whatever `cudagraph_mode` is. It also returns
+  `True` when the model state has encoder graphs to capture or the runner's
+  graph manager has graphs left to capture, and `False` in every other case.
 - **No predicate call in eager mode.** With `enforce_eager` set, the runner
   does not call `ModelState.needs_cudagraph_capture()`.
 - **Capture call.** When `ModelState.needs_cudagraph_capture()` returns `True`
@@ -484,7 +500,11 @@ conformance.)* are obligations of the model, which a model's own tests check.
 - **Capture order.** `GPUModelRunner.capture_model` invokes
   `capture_cudagraphs` after the encoder, decoder, inner and speculator
   graphs and before its last free-memory reading, so the graph memory it
-  returns includes what the call added.
+  returns includes what the call added. The call is inside the dummy-LoRA
+  scope and outside the branch that captures decoder graphs.
+- **Capture completion.** *(Model conformance.)* When `capture_cudagraphs`
+  returns or raises, all device work that the call started, on `stream` or on
+  any other stream, has completed.
 - **Capture arguments.** `capture_cudagraphs` receives `capture_model`'s
   `profile_only`, the platform's global graph pool as `graph_pool`, and as
   `stream` the stream of a `graph_capture` context that the runner opens for
@@ -532,10 +552,12 @@ conformance.)* are obligations of the model, which a model's own tests check.
   estimate's teardown does not run for this failure, so `clear_cudagraphs` is
   not called.
 - **Profiling release.** When the graph-memory estimate's teardown runs,
-  `ModelState.needs_cudagraph_capture()` returns `True` and `enforce_eager` is
-  off, the teardown calls `clear_cudagraphs` exactly once, before the runner
-  drops the profiling bindings and pools and before the serving KV cache is
-  allocated, also when `capture_cudagraphs` raised or was not reached.
+  the runner's `needs_cudagraph_capture()` and
+  `ModelState.needs_cudagraph_capture()` both return `True` and
+  `enforce_eager` is off, the teardown calls `clear_cudagraphs` exactly once,
+  before the runner drops the profiling bindings and pools and before the
+  serving KV cache is allocated, also when `capture_cudagraphs` raised or was
+  not reached.
 - **Teardown after a failed release.** When `clear_cudagraphs` raises, the
   estimate's teardown still releases the profiling bindings, pools, graph
   manager and graphs, and restores the platform's global graph pool.
@@ -558,7 +580,11 @@ conformance.)* are obligations of the model, which a model's own tests check.
   `prepare_execution_memory`, `post_warmup` and `shutdown`.
 - **Other runners.** A runner that overrides `capture_model` and
   `needs_cudagraph_capture` without calling `GPUModelRunner`'s, as the
-  encoder-only runner does, calls none of the three graph-capture hooks.
+  encoder-only runner does, calls none of the three graph-capture hooks. The
+  graph-memory estimate calls none for it either: under a `cudagraph_mode`
+  other than NONE the estimate allocates its temporary cache and runs its
+  teardown before that runner's predicate returns `False`, and the teardown
+  then makes no `clear_cudagraphs` call.
 - **Profiling bindings.** When the graph-memory estimate runs for a
   persistent-state layout and `GPUModelRunner.needs_cudagraph_capture()`
   returns `True`, `initialize_state_slots` receives bindings over the
@@ -606,10 +632,14 @@ conformance.)* are obligations of the model, which a model's own tests check.
   `post_warmup` on the model state exactly once, whatever the pooling,
   `enforce_eager`, compilation or JIT-warmup setting, and whether or not it
   holds persistent state. Startup runs that warmup once.
-- **Post-warmup order.** `post_warmup` runs after every enabled warmup stage
-  (compile dummy runs, kernel and JIT warmups, graph capture, the final dummy
-  run, the sampler warmup and Inductor's lazy initialization), and before JIT
-  monitoring, GC freezing and the GPU sync check are enabled.
+- **Post-warmup order.** In the startup run of the GPU worker's warmup,
+  `post_warmup` runs after the compile dummy runs, the kernel and JIT
+  warmups, graph capture, the final dummy run and the sampler warmup, and
+  immediately before the worker resets the random seed. Inductor's lazy
+  initialization, JIT monitoring, GC freezing and the GPU sync check follow
+  the seed reset, in that order. In a later run of the warmup the hook has
+  the same place, but monitoring, GC freezing and the sync check are already
+  enabled.
 - **Post-warmup failure.** An exception from `post_warmup` propagates and
   fails startup.
 - **Shutdown hook.** Once the device has synchronized,
