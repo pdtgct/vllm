@@ -1634,6 +1634,27 @@ SCENARIOS = {
     ),
     "post-warmup-fails": _scenario({"fail": ["post_warmup"]}),
     "shutdown-fails": _scenario({"fail": ["shutdown"]}),
+    # The same failures raised as `StubInterrupt`, which is not an
+    # `Exception`.
+    "noted-capture-interrupt": _scenario(
+        {
+            **CAPTURING,
+            **NAMED,
+            "fail": ["capture_serving"],
+            "interrupt": ["capture_serving"],
+        },
+        **FIXED_BUDGET,
+    ),
+    "capture-fails-release-interrupt": _scenario(
+        {
+            **CAPTURING,
+            "fail": ["capture_profile", "clear_cudagraphs"],
+            "interrupt": ["clear_cudagraphs"],
+        }
+    ),
+    "shutdown-interrupt": _scenario({"fail": ["shutdown"], "interrupt": ["shutdown"]}),
+    # A context of one token, in which no prefill request can be sized.
+    "plain-one-token": _scenario(max_model_len=1),
     # State pools larger than the device; see `_oversized_pool`.
     "oversized-temporary-named": _scenario(
         {**CAPTURING, **NAMED}, oversized="temporary"
@@ -1646,6 +1667,15 @@ SCENARIOS = {
     "estimate": _scenario({**CAPTURING, "page_mib": 256}, mode="estimate"),
     "estimate-release-fails": _scenario(
         {**CAPTURING, "page_mib": 256, "fail": ["clear_cudagraphs"]}, mode="estimate"
+    ),
+    "estimate-release-interrupt": _scenario(
+        {
+            **CAPTURING,
+            "page_mib": 256,
+            "fail": ["clear_cudagraphs"],
+            "interrupt": ["clear_cudagraphs"],
+        },
+        mode="estimate",
     ),
     # Encoder graphs, without and with graphs of the model state: the two
     # differ only in the model state's capture predicate.
@@ -1697,7 +1727,8 @@ def _hook_config(path, scenario: dict):
         **scenario["overrides"],
     }
     oversized_gib = _oversized_pool(overrides)
-    args = EngineArgs(**_engine_kwargs(path, **{**RESOLVED_DEFAULTS, **overrides}))
+    kwargs = _engine_kwargs(path, **RESOLVED_DEFAULTS)
+    args = EngineArgs(**{**kwargs, **overrides})
     return args.create_engine_config(), oversized_gib
 
 
@@ -1809,7 +1840,7 @@ def _observe_engine(stub, seen: dict, config, scenario: dict) -> None:
         core = EngineCore(
             vllm_config=config, executor_class=UniProcExecutor, log_stats=False
         )
-    except Exception as error:
+    except (Exception, stub.StubInterrupt) as error:
         seen["error"] = _error(stub, error)
         seen["after_failure"] = _device_state(stub)
         return
@@ -1857,16 +1888,28 @@ def _observe_engine(stub, seen: dict, config, scenario: dict) -> None:
             num_tokens=runner.max_num_tokens,
         )
         steps["after_mixed_warmup"] = len(_scheduled_steps(stub.EVENTS))
+        steps["mixed_fallback_warmup_ran"] = run_mixed_prefill_decode_warmup(
+            runner,
+            worker.execute_model,
+            worker.sample_tokens,
+            num_tokens=runner.max_num_tokens,
+            prefill_only_fallback=True,
+        )
+        steps["after_mixed_fallback_warmup"] = len(_scheduled_steps(stub.EVENTS))
         # A registered warmup that is built on that function.
         mixed_batch_attention_warmup(worker)
         steps["after_attention_warmup"] = len(_scheduled_steps(stub.EVENTS))
     except Exception as error:
         steps["error"] = repr(error)
 
+    seen["shutdown_error"] = None
     if "held_shutdown" in scenario["probes"]:
         seen["held_shutdown"] = _shutdown_behind_held_stream(stub, core)
     else:
-        core.shutdown()
+        try:
+            core.shutdown()
+        except stub.StubInterrupt as error:
+            seen["shutdown_error"] = _error(stub, error)
     seen["after_shutdown"] = dict(
         runner_bindings_dropped=runner.state_slots is None,
         model_state_dropped=not hasattr(runner, "model_state"),
@@ -1902,7 +1945,7 @@ def _observe_estimate(stub, seen: dict, config, records: list) -> None:
         reserved = torch.cuda.memory_reserved()
         try:
             executor.determine_available_memory()
-        except Exception as error:
+        except (Exception, stub.StubInterrupt) as error:
             seen["error"] = _error(stub, error)
         # Nothing of the failure stays referenced here: neither the exception
         # and its frames nor a log record of it.
@@ -2372,16 +2415,19 @@ def test_failed_release_fails_startup(started):
     assert "clear_cudagraphs" in error["message"]
 
 
-@pytest.mark.parametrize("scenario", ["estimate", "estimate-release-fails"])
+@pytest.mark.parametrize(
+    "scenario", ["estimate", "estimate-release-fails", "estimate-release-interrupt"]
+)
 def test_estimate_releases_everything_it_built(started, scenario):
     """When the estimate has ended, with `clear_cudagraphs` returning or
-    raising, and before any shutdown: the runner holds no bindings, pool,
+    raising (an interrupt included), and before any shutdown: the runner
+    holds no bindings, pool,
     KV cache configuration or graph manager, the model state's bindings are
     cleared, the profiling bindings are gone, the platform's global graph
     pool is the serving pool again, and the device has the 768 MiB temporary
     pool and the capture's memory back."""
     seen = started(scenario)
-    failed = scenario == "estimate-release-fails"
+    failed = scenario != "estimate"
     assert (seen["error"] is not None) is failed
     assert not failed or seen["error"]["raised"] == 0
     assert len(_calls(seen, "capture_cudagraphs")) == 1
@@ -2397,6 +2443,32 @@ def test_estimate_releases_everything_it_built(started, scenario):
         bindings_alive=[False],
     )
     assert seen["after_estimate"]["reserved_growth"] < 256 * MiB
+
+
+def test_release_interrupt_alone_propagates_from_the_estimate(started):
+    """With no other exception propagating, a `clear_cudagraphs` failure that
+    is not an `Exception` leaves the estimate as the object the hook raised,
+    and is not logged in its place."""
+    seen = started("estimate-release-interrupt")
+    assert seen["error"]["type"] == "StubInterrupt"
+    assert seen["error"]["raised"] == 0
+    assert seen["logged_raised"] == []
+
+
+def test_earlier_failure_outranks_a_release_interrupt(started):
+    """When the profiling capture raised and `clear_cudagraphs` then raises
+    something that is not an `Exception`, the capture's exception still fails
+    startup, and the later one is logged with its traceback and not raised."""
+    seen = started("capture-fails-release-interrupt")
+    assert [e[0] for e in seen["events"] if e[0].endswith("cudagraphs")] == [
+        "capture_cudagraphs",
+        "clear_cudagraphs",
+    ]
+    assert seen["error"]["type"] == "StubHookError"
+    assert seen["error"]["raised"] == 0
+    assert "capture_profile" in seen["error"]["message"]
+    assert 1 in seen["logged_raised"]
+    assert 0 not in seen["logged_raised"]
 
 
 def test_estimate_alone_runs_the_profiling_capture(started):
@@ -2580,6 +2652,15 @@ def test_capture_failure_notes_the_memory_contributors(started, scenario, error_
     assert error["notes"] == [CONTRIBUTOR_NOTE]
 
 
+def test_capture_interrupt_notes_the_memory_contributors(started):
+    """A `capture_cudagraphs` failure that is not an `Exception` gets the same
+    one note, on the object that fails startup."""
+    error = started("noted-capture-interrupt")["error"]
+    assert error["type"] == "StubInterrupt"
+    assert error["raised"] == 0
+    assert error["notes"] == [CONTRIBUTOR_NOTE]
+
+
 def test_capture_failure_without_contributors_gets_no_note(started):
     """When the spec declares no memory contributors, the runner adds no note
     to the exception from `capture_cudagraphs`."""
@@ -2620,16 +2701,22 @@ def test_warmup_executes_no_scheduled_step(started, scenario):
     assert _scheduled_steps(_startup_events(seen)) == []
 
 
-@pytest.mark.parametrize("scenario", ["capturing", "plain"])
+@pytest.mark.parametrize("scenario", ["capturing", "plain", "plain-one-token"])
 def test_warmup_entry_points_execute_no_step_on_a_started_runner(started, scenario):
     """Called with the started runner and the worker's own callbacks,
     `warmup_kernels` executes no step, and `run_mixed_prefill_decode_warmup`
-    executes none and returns `False`."""
-    again = started(scenario)["warmup_again"]
+    executes none and returns `False`, with and without its prefill-only
+    fallback. That holds for a context of one token too, in which the
+    warmup could size no prefill request."""
+    seen = started(scenario)
+    assert seen["error"] is None
+    again = seen["warmup_again"]
     assert again["error"] is None
     assert again["after_warmup_kernels"] == 0
     assert again["mixed_warmup_ran"] is False
     assert again["after_mixed_warmup"] == 0
+    assert again["mixed_fallback_warmup_ran"] is False
+    assert again["after_mixed_fallback_warmup"] == 0
 
 
 @pytest.mark.parametrize("scenario", ["capturing", "plain"])
@@ -2849,6 +2936,21 @@ def test_shutdown_hook_failure_is_logged_and_cleanup_continues(started):
     assert seen["error"] is None
     assert len(_calls(seen, "shutdown")) == 1
     assert seen["logged_raised"] == [0]
+    assert seen["after_shutdown"] == dict(
+        runner_bindings_dropped=True, model_state_dropped=True
+    )
+
+
+def test_shutdown_hook_interrupt_propagates_after_the_cleanup(started):
+    """A `shutdown` failure that is not an `Exception` leaves the engine's
+    shutdown as the object the hook raised, without a note, once the runner
+    has released the state bindings and the model state."""
+    seen = started("shutdown-interrupt")
+    assert seen["error"] is None
+    assert len(_calls(seen, "shutdown")) == 1
+    assert seen["shutdown_error"]["type"] == "StubInterrupt"
+    assert seen["shutdown_error"]["raised"] == 0
+    assert seen["shutdown_error"]["notes"] == []
     assert seen["after_shutdown"] == dict(
         runner_bindings_dropped=True, model_state_dropped=True
     )

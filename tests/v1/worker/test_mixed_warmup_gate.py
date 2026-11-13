@@ -42,38 +42,6 @@ def test_mixed_warmup_skipped_for_single_seq(max_num_reqs):
     )
 
 
-@pytest.mark.parametrize("max_model_len", [1, 32])
-@pytest.mark.parametrize("prefill_only_fallback", [False, True])
-def test_mixed_warmup_skipped_for_a_persistent_state_layout(
-    max_model_len, prefill_only_fallback
-):
-    """A persistent-state layout gets no synthetic scheduler step: the warmup
-    returns `False` without touching the worker callbacks, also at
-    `max_model_len=1`, where no prefill request could be sized."""
-    from tests.v1.core.utils import state_layer
-    from vllm.v1.kv_cache_interface import KVCacheGroup
-
-    runner = SimpleNamespace(
-        is_pooling_model=False,
-        max_num_reqs=2,
-        max_model_len=max_model_len,
-        kv_cache_config=SimpleNamespace(
-            kv_cache_groups=[KVCacheGroup.from_layers({"state": state_layer()})]
-        ),
-    )
-
-    assert (
-        run_mixed_prefill_decode_warmup(
-            runner,
-            worker_execute_model=_fail,
-            worker_sample_tokens=_fail,
-            num_tokens=128,
-            prefill_only_fallback=prefill_only_fallback,
-        )
-        is False
-    )
-
-
 def test_mixed_warmup_disables_watermarking():
     outputs: list[SchedulerOutput] = []
     runner = SimpleNamespace(

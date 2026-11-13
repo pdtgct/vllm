@@ -27,6 +27,8 @@ the output, which is what the regression, pause and cache-clear tests rely on.
   raises `StubHookError` naming itself, after it has done its work.
 - `stub_fail_oom`: the two capture failures raise `torch.OutOfMemoryError`
   instead.
+- `stub_interrupt`: the hooks among `stub_fail` that raise `StubInterrupt`,
+  which is not an `Exception`, instead.
 
 `EVENTS` records, in order, the hook calls and forward passes of every stub
 built in this process, so an in-process engine test can tell how far startup
@@ -113,6 +115,11 @@ class StubHookError(RuntimeError):
     """What a stub hook raises when `stub_fail` names it."""
 
 
+class StubInterrupt(BaseException):
+    """What a stub hook raises when `stub_interrupt` names it too: like an
+    interrupt, it is not an `Exception`."""
+
+
 def allocator_settings() -> str:
     """The device allocator's settings string, as the worker reads it; empty
     when the allocator has no such settings."""
@@ -195,6 +202,7 @@ class StubPersistentStateModelState(ModelState):
         self._execution_bytes = int(getattr(hf, "stub_execution_mib", 0) * MiB)
         self._fail = frozenset(getattr(hf, "stub_fail", ()))
         self._fail_oom = bool(getattr(hf, "stub_fail_oom", False))
+        self._interrupt = frozenset(getattr(hf, "stub_interrupt", ()))
         self._execution_memory: torch.Tensor | None = None
         # The captured graph, its output and its scratch memory.
         self._graph: tuple[Any, ...] | None = None
@@ -207,6 +215,8 @@ class StubPersistentStateModelState(ModelState):
         error: BaseException = StubHookError(f"stub {hook} failed")
         if self._fail_oom and hook.startswith("capture_"):
             error = torch.OutOfMemoryError(f"stub {hook} failed")
+        if hook in self._interrupt:
+            error = StubInterrupt(f"stub {hook} interrupted")
         RAISED.append(error)
         raise error
 
