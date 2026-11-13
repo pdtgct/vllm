@@ -1558,14 +1558,36 @@ class RecordingWorker(Worker):
         return RecordingRunner(self.vllm_config, self.device)
 
 
-def _scenario(options=None, *, mode="engine", env=None, probes=(), **overrides):
+def _scenario(
+    options=None, *, mode="engine", env=None, probes=(), encoder=False, **overrides
+):
     return dict(
         options=options or {},
         mode=mode,
         env=env or {},
         probes=probes,
+        # Whether the model is the stub with a vision encoder.
+        encoder=encoder,
         overrides=overrides,
     )
+
+
+# The stub with a vision encoder: one encoder CUDA graph, for four tokens,
+# under `cudagraph_mode` NONE. The pool is planned at seven pages, well above
+# the minimal temporary pool of the estimate. The stub's processor processes
+# nothing, so multimodal profiling is skipped.
+ENCODER = dict(
+    encoder=True,
+    num_gpu_blocks_override=7,
+    limit_mm_per_prompt={"image": 1},
+    skip_mm_profiling=True,
+    compilation_config={
+        "cudagraph_mode": "NONE",
+        "cudagraph_mm_encoder": True,
+        "encoder_cudagraph_token_budgets": [4],
+        "encoder_cudagraph_max_vision_items_per_batch": 1,
+    },
+)
 
 
 SCENARIOS = {
@@ -1624,6 +1646,10 @@ SCENARIOS = {
     "estimate-release-fails": _scenario(
         {**CAPTURING, "page_mib": 256, "fail": ["clear_cudagraphs"]}, mode="estimate"
     ),
+    # Encoder graphs, without and with graphs of the model state: the two
+    # differ only in the model state's capture predicate.
+    "encoder": _scenario({"capture_graphs": False, "capture_mib": 64}, **ENCODER),
+    "encoder-capturing": _scenario(CAPTURING, **ENCODER),
 }
 
 
@@ -1918,6 +1944,16 @@ def _observe(path: str, name: str) -> dict:
             and compilation.backend == "inductor"
         ),
         seed=config.model_config.seed,
+        # The estimate's temporary KV cache when the model state captures no
+        # graph of its own: one block per sequence a graph can hold, at least
+        # one.
+        minimal_pool_pages=(
+            min(
+                config.scheduler_config.max_num_seqs,
+                compilation.max_cudagraph_capture_size or 0,
+            )
+            or 1
+        ),
     )
     with _vllm_log_records() as records:
         if scenario["mode"] == "estimate":
@@ -1945,7 +1981,7 @@ def _observed_starts() -> dict:
 
 
 @pytest.fixture
-def started(_observed_starts, dummy_state_model_path):
+def started(_observed_starts, dummy_state_model_path, dummy_encoder_state_model_path):
     """Returns what `_observe` saw of a scenario. Each scenario starts once
     per module, in a new process; a start that failed or timed out is not
     repeated, and every test of its scenario fails with its error."""
@@ -1956,8 +1992,13 @@ def started(_observed_starts, dummy_state_model_path):
             saved = {variable: os.environ.get(variable) for variable in env}
             os.environ.update(env)
             try:
+                path = (
+                    dummy_encoder_state_model_path
+                    if SCENARIOS[name]["encoder"]
+                    else dummy_state_model_path
+                )
                 _observed_starts[name] = call_in_spawned_process(
-                    _observe, dummy_state_model_path, name, timeout=START_TIMEOUT
+                    _observe, path, name, timeout=START_TIMEOUT
                 )
             except RuntimeError as error:
                 _observed_starts[name] = error
@@ -2425,6 +2466,66 @@ def test_without_graphs_the_serving_bindings_are_the_only_ones(started):
     seen = started("plain")
     assert len(seen["bindings"]) == 1
     assert seen["after_startup"]["serving_bindings_live"] is True
+
+
+# Encoder graphs under a persistent-state layout: the runner has graphs to
+# capture whatever the model state's predicate returns, so the estimate
+# allocates a temporary pool either way. Its size follows the predicate.
+
+
+def test_encoder_graphs_alone_keep_the_minimal_temporary_pool(started):
+    """With encoder graphs and a model state that captures none of its own,
+    the estimate's temporary state pool keeps its minimal size, not the
+    planned seven pages; the serving pool has the planned pages."""
+    seen = started("encoder")
+    assert seen["cudagraph_mode"] == "NONE"
+    assert seen["minimal_pool_pages"] < 7
+    temporary, serving = seen["bindings"]
+    assert temporary["pages"] == seen["minimal_pool_pages"]
+    assert serving["pages"] == 7
+
+
+def test_encoder_graphs_with_model_state_graphs_get_the_planned_pool(started):
+    """The same model with a model state that captures: the temporary state
+    pool has the planned seven pages, as the serving pool has."""
+    seen = started("encoder-capturing")
+    assert seen["cudagraph_mode"] == "NONE"
+    assert [binding["pages"] for binding in seen["bindings"]] == [7, 7]
+    profiling = _calls(seen, "capture_cudagraphs")[0]
+    assert profiling["profile_only"] is True
+    assert profiling["pool_pages"] == 7
+
+
+@pytest.mark.parametrize("scenario", ["encoder", "encoder-capturing"])
+def test_encoder_graphs_are_captured_in_the_estimate_and_in_warmup(started, scenario):
+    """The stub's encoder graph is captured once over the temporary pool, in
+    the estimate, and once over the serving pool, in the warmup, whether or
+    not the model state captures graphs of its own."""
+    seen = _startup_events_only(started(scenario))
+    estimate, warmup = _positions(seen, "encoder_capture")
+    temporary, serving = _positions(seen, "initialize_state_slots")
+    assert temporary < estimate < serving < warmup
+    assert started(scenario)["after_startup"]["runner_needs_capture"] is True
+
+
+def test_encoder_graphs_alone_call_no_model_state_capture_hook(started):
+    """With the predicate returning `False`, the estimate and the warmup
+    capture the encoder graph and call neither `capture_cudagraphs` nor
+    `clear_cudagraphs`."""
+    seen = started("encoder")
+    assert len(_positions(seen, "encoder_capture")) == 2
+    assert _calls(seen, "capture_cudagraphs") == []
+    assert _calls(seen, "clear_cudagraphs") == []
+
+
+def test_model_state_capture_follows_the_encoder_graphs(started):
+    """Under a persistent-state layout too, each `capture_model` call
+    captures the encoder graph before it calls `capture_cudagraphs`."""
+    seen = _startup_events_only(started("encoder-capturing"))
+    encoder = _positions(seen, "encoder_capture")
+    model_state = _positions(seen, "capture_cudagraphs")
+    assert len(encoder) == len(model_state) == 2
+    assert encoder[0] < model_state[0] < encoder[1] < model_state[1]
 
 
 # Startup pool access during the capture calls.

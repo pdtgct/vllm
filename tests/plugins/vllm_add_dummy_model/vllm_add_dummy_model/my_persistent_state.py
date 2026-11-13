@@ -34,12 +34,16 @@ got even when it fails. `BINDINGS` records each `initialize_state_slots` call
 and `RAISED` each exception a hook raised. `shutdown` reports whether the
 streams a test put in `WATCHED_STREAMS` were idle when it ran.
 
+`StubEncoderPersistentStateForCausalLM` is the same model with a vision
+encoder that supports encoder CUDA graphs.
+
 Every stub registers one JIT warmup kernel and overrides
 `dummy_sampler_run`; both only record that the worker reached that stage.
 """
 
 import gc
 import weakref
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -49,13 +53,29 @@ import torch.nn as nn
 from vllm.compilation.cudagraph_pool import capture_pool
 from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.model_executor.layers.state import PersistentStateLayerBase
+from vllm.model_executor.models.interfaces import (
+    SupportsEncoderCudaGraph,
+    SupportsMultiModal,
+)
 from vllm.model_executor.warmup.jit_warmup import VllmJitKernel
+from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.processing import (
+    BaseDummyInputsBuilder,
+    BaseMultiModalProcessor,
+    BaseProcessingInfo,
+)
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils import gpu_sync_debug, jit_monitor
 from vllm.v1.kv_cache_interface import (
     PersistentStateDescriptor,
     PersistentStateSpec,
+)
+from vllm.v1.worker.encoder_cudagraph_defs import (
+    EncoderCudaGraphCaptureInputs,
+    EncoderCudaGraphConfig,
+    EncoderCudaGraphReplayBuffers,
+    EncoderItemSpec,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.workspace import current_workspace_manager
@@ -482,3 +502,133 @@ class StubUndeclaredPersistentStateForCausalLM(StubPersistentStateForCausalLM):
     """The same model without the persistent-state declaration."""
 
     supports_persistent_state = False
+
+
+# A persistent-state model with a vision encoder whose CUDA graphs the
+# runner captures. It exists to start: its processor declares one image per
+# prompt and a fixed token count, and processes nothing, so tests start it
+# with `skip_mm_profiling` and feed it no image.
+
+ENCODER_HIDDEN_SIZE = 8
+ENCODER_TOKENS_PER_IMAGE = 4
+
+
+class StubEncoderProcessingInfo(BaseProcessingInfo):
+    def get_supported_mm_limits(self) -> Mapping[str, int | None]:
+        return {"image": 1}
+
+    def get_mm_max_tokens_per_item(
+        self, seq_len: int, mm_counts: Mapping[str, int]
+    ) -> Mapping[str, int]:
+        return {"image": ENCODER_TOKENS_PER_IMAGE}
+
+
+class StubEncoderDummyInputsBuilder(BaseDummyInputsBuilder[StubEncoderProcessingInfo]):
+    def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
+        return ""
+
+    def get_dummy_mm_data(self, seq_len, mm_counts, mm_options):
+        return {}
+
+
+class StubEncoderProcessor(BaseMultiModalProcessor[StubEncoderProcessingInfo]):
+    def _get_mm_fields_config(self, hf_inputs, hf_processor_mm_kwargs):
+        return {}
+
+    def _get_prompt_updates(self, mm_items, hf_processor_mm_kwargs, out_mm_kwargs):
+        return []
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    StubEncoderProcessor,
+    info=StubEncoderProcessingInfo,
+    dummy_inputs=StubEncoderDummyInputsBuilder,
+)
+class StubEncoderPersistentStateForCausalLM(
+    StubPersistentStateForCausalLM, SupportsMultiModal, SupportsEncoderCudaGraph
+):
+    """The stub with a one-layer vision encoder. Each encoder graph capture
+    is recorded in `EVENTS` as ("encoder_capture", info)."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self.vision = nn.Linear(ENCODER_HIDDEN_SIZE, ENCODER_HIDDEN_SIZE)
+
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        return "<image>" if modality == "image" else None
+
+    def get_language_model(self) -> nn.Module:
+        return self
+
+    def embed_multimodal(self, **kwargs: object) -> list[torch.Tensor]:
+        pixel_values = kwargs.get("pixel_values")
+        if not isinstance(pixel_values, torch.Tensor):
+            return []
+        return list(self.vision(pixel_values))
+
+    # The encoder CUDA graph protocol. An image is ENCODER_TOKENS_PER_IMAGE
+    # rows of ENCODER_HIDDEN_SIZE values, in and out.
+
+    def get_encoder_cudagraph_config(self) -> EncoderCudaGraphConfig:
+        return EncoderCudaGraphConfig(
+            modalities=["image"],
+            buffer_keys=["pixel_values"],
+            out_hidden_size=ENCODER_HIDDEN_SIZE,
+        )
+
+    def get_encoder_cudagraph_budget_range(
+        self, vllm_config: VllmConfig
+    ) -> tuple[int, int]:
+        return ENCODER_TOKENS_PER_IMAGE, ENCODER_TOKENS_PER_IMAGE
+
+    def get_encoder_cudagraph_item_specs(
+        self, mm_kwargs: dict[str, Any]
+    ) -> list[EncoderItemSpec]:
+        num_images = mm_kwargs["pixel_values"].shape[0]
+        return [
+            EncoderItemSpec(ENCODER_TOKENS_PER_IMAGE, ENCODER_TOKENS_PER_IMAGE)
+        ] * num_images
+
+    def select_encoder_cudagraph_items(
+        self, mm_kwargs: dict[str, Any], indices: list[int]
+    ) -> dict[str, Any]:
+        return {"pixel_values": mm_kwargs["pixel_values"][indices]}
+
+    def prepare_encoder_cudagraph_capture_inputs(
+        self,
+        token_budget: int,
+        max_batch_size: int,
+        max_frames_per_batch: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        path: str = "default",
+        axis_keys=None,
+    ) -> EncoderCudaGraphCaptureInputs:
+        _record("encoder_capture", token_budget=token_budget)
+        pixel_values = torch.zeros(
+            token_budget, ENCODER_HIDDEN_SIZE, device=device, dtype=dtype
+        )
+        return EncoderCudaGraphCaptureInputs(values={"pixel_values": pixel_values})
+
+    def prepare_encoder_cudagraph_replay_buffers(
+        self,
+        mm_kwargs: dict[str, Any],
+        max_batch_size: int,
+        max_frames_per_batch: int,
+        path: str = "default",
+    ) -> EncoderCudaGraphReplayBuffers:
+        pixel_values = mm_kwargs["pixel_values"]
+        return EncoderCudaGraphReplayBuffers(
+            values={"pixel_values": pixel_values.flatten(0, 1)}
+        )
+
+    def encoder_cudagraph_forward(
+        self, values: dict[str, torch.Tensor], path: str = "default"
+    ) -> torch.Tensor:
+        return self.vision(values["pixel_values"])
+
+    def encoder_eager_forward(
+        self, mm_kwargs: dict[str, Any], path: str = "default"
+    ) -> torch.Tensor:
+        return self.vision(mm_kwargs["pixel_values"].flatten(0, 1))
