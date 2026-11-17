@@ -556,7 +556,15 @@ def run_api_server_worker_proc(
     decorate_logs()
 
     uvloop.run(
-        run_server_worker(listen_address, sock, args, client_config, **uvicorn_kwargs)
+        run_server_worker(
+            listen_address,
+            sock,
+            args,
+            client_config,
+            # The parent signals this worker itself and bounds its shutdown.
+            exit_on_repeated_cleanup_signal=False,
+            **uvicorn_kwargs,
+        )
     )
 
 

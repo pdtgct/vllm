@@ -3,6 +3,7 @@
 
 import asyncio
 import contextlib
+import os
 import signal
 import socket
 from collections.abc import Generator, MutableSequence
@@ -180,11 +181,17 @@ async def serve_http(
     sock: socket.socket | None,
     enable_ssl_refresh: bool = False,
     peer_loads: tuple[MutableSequence[int], int] | None = None,
+    *,
+    exit_on_repeated_cleanup_signal: bool = True,
     **uvicorn_kwargs: Any,
 ):
     """Start a FastAPI app using Uvicorn, with support for custom Uvicorn config
     options.  Supports http header limits via h11_max_incomplete_event_size and
     h11_max_header_count.
+
+    `exit_on_repeated_cleanup_signal` is False for a server whose parent
+    process signals it and bounds its shutdown, so that a signal delivered
+    twice does not skip HTTP cleanup.
     """
     logger.info("Available routes are:")
     # post endpoints
@@ -256,8 +263,24 @@ async def serve_http(
     )
 
     shutdown_event = asyncio.Event()
+    engine_stopped = False
+    received_signals: set[int] = set()
 
-    def signal_handler() -> None:
+    def signal_handler(signum: int) -> None:
+        repeated = signum in received_signals
+        received_signals.add(signum)
+        cleanup_only = engine_stopped or (
+            shutdown_task is not None and shutdown_task.done()
+        )
+        if repeated and cleanup_only and exit_on_repeated_cleanup_signal:
+            # Only HTTP cleanup remains. A repeated signal must not wait for a
+            # handler that never returns. Exit directly: as a container's PID 1,
+            # the process ignores a signal whose action is the default.
+            logger.warning(
+                "[shutdown] API server: received %s during cleanup; exiting",
+                signal.Signals(signum).name,
+            )
+            os._exit(128 + signum)
         if shutdown_event.is_set():
             return
         logger.info_once("[shutdown] API server: shutdown triggered")
@@ -267,6 +290,7 @@ async def serve_http(
         pass
 
     async def handle_shutdown() -> None:
+        nonlocal engine_stopped
         await shutdown_event.wait()
 
         if engine_client is not None:
@@ -284,6 +308,7 @@ async def serve_http(
             )
             logger.info_once("[shutdown] API server: engine client stopped")
 
+        engine_stopped = True
         server.should_exit = True
         logger.info_once("[shutdown] API server: signalling HTTP server shutdown")
         server_task.cancel()
@@ -292,11 +317,14 @@ async def serve_http(
 
     shutdown_task = None
     try:
-        loop.add_signal_handler(signal.SIGINT, signal_handler)
-        loop.add_signal_handler(signal.SIGTERM, signal_handler)
+        loop.add_signal_handler(signal.SIGINT, signal_handler, signal.SIGINT)
+        loop.add_signal_handler(signal.SIGTERM, signal_handler, signal.SIGTERM)
         shutdown_task = loop.create_task(handle_shutdown())
 
         await server_task
+        if not server.started:
+            # Uvicorn < 0.50 returns from a failed startup; later versions exit.
+            raise SystemExit(3)
         return dummy_shutdown()
     except asyncio.CancelledError:
         port = uvicorn_kwargs["port"]
