@@ -18,6 +18,12 @@ It'd be better to store the model in a local disk. Additionally, have a look at 
 !!! note
     To isolate the model downloading and loading issue, you can use the `--load-format dummy` argument to skip loading the model weights. This way, you can check if the model downloading and loading is the bottleneck.
 
+## Hangs shutting down the API server
+
+On `SIGINT` or `SIGTERM`, the API server stops the engine, waiting up to `--shutdown-timeout` seconds for in-flight requests, and then closes its HTTP connections. Closing waits for request handlers to return, so a handler that never returns keeps the server running. Once the log shows `engine client stopped`, send the same signal again: the API server exits immediately with status 128 + the signal number (130 for `SIGINT`, 143 for `SIGTERM`), skipping the remaining HTTP cleanup. A signal received while the engine is still stopping, or a different signal, only requests shutdown. The workers started by `--api-server-count` greater than 1 and the data parallel servers started by `--data-parallel-multi-port-external-lb` never exit this way, because their parent process bounds their shutdown.
+
+If HTTP server startup fails, for example in the application's lifespan startup, the API server exits with status 3.
+
 ## Out of memory
 
 If the model is too large to fit in a single GPU, you will get an out-of-memory (OOM) error. Consider adopting [these options](../configuration/conserving_memory.md) to reduce the memory consumption.

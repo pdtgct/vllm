@@ -28,9 +28,7 @@ from typing import Any
 
 import httpx
 import pytest
-import uvicorn
 from fastapi import APIRouter, FastAPI, Request
-from packaging.version import Version
 from starlette.datastructures import State
 from vllm_add_dummy_endpoint_plugin import DummyAdminEndpointPlugin
 
@@ -954,9 +952,8 @@ _ROLLED_BACK = ["partial_cleanup:B", "stop:A", "native_shutdown"]
 _EXITED = ["engine_context_exit"]
 _STOPPING = ["start:C", "engine_shutdown", "stop:C", "stop:B"]
 _STOPPED = [*_STOPPING, "stop:A", "native_shutdown", *_EXITED]
-# Uvicorn >= 0.50 exits with status 3 when lifespan startup fails; older
-# versions return from `serve`.
-_STARTUP_FAILED = 3 if Version(uvicorn.__version__) >= Version("0.50") else 0
+# serve_http exits with status 3 when lifespan startup fails.
+_STARTUP_FAILED = 3
 
 
 def _held_stop(trigger: str, *stop_signals: str) -> dict:
