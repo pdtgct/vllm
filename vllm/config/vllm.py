@@ -537,8 +537,8 @@ class VllmConfig:
     up to this amount of time to allow already-running requests to complete. Any
     remaining requests are aborted once the timeout is reached. Endpoint plugin
     drains still running at half of this time are cancelled; the engine gets
-    the time that remains. A drain that ignores cancellation can delay engine
-    shutdown until the process is killed.
+    the time that remains. A drain that ignores cancellation delays engine
+    shutdown until a repeated signal after the drain deadline abandons it.
     """
 
     def compile_factors(self, include_version: bool = True) -> CompileFactors:

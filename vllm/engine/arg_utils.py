@@ -1993,7 +1993,8 @@ class EngineArgs:
             help="Shutdown timeout in seconds. 0 = abort, >0 = wait. "
             "Endpoint plugin drains are cancelled at half of this time; the "
             "engine gets the time that remains. A drain that ignores "
-            "cancellation can delay engine shutdown until the process is killed.",
+            "cancellation delays engine shutdown until a repeated signal after "
+            "the drain deadline abandons it.",
         )
 
         parser.add_argument(
