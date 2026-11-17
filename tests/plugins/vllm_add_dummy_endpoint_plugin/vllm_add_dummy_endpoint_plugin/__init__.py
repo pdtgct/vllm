@@ -15,9 +15,17 @@ than reaching for a client that doesn't exist.
 It also implements the optional lifecycle capabilities. Its session routes
 hold one work owner until explicitly released, exercising admission and final
 engine work during drain. `events` records lifecycle and owner ordering.
+
+For shutdown tests, `POST /plugins/dummy/hang_drain` makes `drain` ignore its
+deadline cancellation and, once the deadline has passed, send its own process
+a repeated SIGTERM.
 """
 
 import asyncio
+import contextlib
+import os
+import signal
+import time
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
@@ -32,8 +40,14 @@ class DummyAdminEndpointPlugin:
         self.owner: asyncio.Task | None = None
         self.finish = asyncio.Event()
         self.drain_entered = asyncio.Event()
+        self.hang_drain = False
 
     def attach_router(self, app: FastAPI) -> None:
+        @app.post("/plugins/dummy/hang_drain")
+        async def hang_drain():
+            self.hang_drain = True
+            return {"hang_drain": True}
+
         @app.get("/v1/admin/scheduler_config")
         async def scheduler_config(raw_request: Request):
             engine_client = raw_request.app.state.dummy_engine_client
@@ -127,6 +141,16 @@ class DummyAdminEndpointPlugin:
         return True
 
     async def drain(self, state, timeout: float) -> None:
+        if self.hang_drain:
+            deadline = time.monotonic() + timeout
+            self.events.append("drain_hangs")
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.Event().wait()
+            self.events.append("drain_cancel_ignored")
+            while (remaining := deadline - time.monotonic()) > 0:
+                await asyncio.sleep(remaining)
+            os.kill(os.getpid(), signal.SIGTERM)
+            await asyncio.Event().wait()
         if self.owner is not None:
             self.events.append("draining")
             self.drain_entered.set()
