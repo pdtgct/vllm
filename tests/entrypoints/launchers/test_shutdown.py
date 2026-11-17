@@ -785,9 +785,9 @@ class _ServeHttpChild:
         self.conn.sendall(b"GET /hang HTTP/1.1\r\nHost: localhost\r\n\r\n")
         self.wait_for("HANG")
 
-    def wait_exit(self) -> int:
+    def wait_exit(self, timeout: float = _CHILD_EVENT_TIMEOUT) -> int:
         try:
-            return self.proc.wait(timeout=_CHILD_EVENT_TIMEOUT)
+            return self.proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             pass
         self.close()
@@ -878,4 +878,5 @@ def test_repeated_signal_while_engine_stops_does_not_exit(serve_http_child):
 def test_failed_startup_exits_with_status_3(serve_http_child):
     """Uvicorn < 0.50 returns from a failed lifespan startup instead of exiting."""
     child = serve_http_child(fail_startup=True)
-    assert child.wait_exit() == 3
+    # The child never reports READY, so this wait also covers its startup.
+    assert child.wait_exit(_CHILD_STARTUP_TIMEOUT) == 3
