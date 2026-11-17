@@ -1991,8 +1991,9 @@ class EngineArgs:
             type=int,
             default=0,
             help="Shutdown timeout in seconds. 0 = abort, >0 = wait. "
-            "Endpoint plugin drains are cancelled at half of this time; the "
-            "engine gets the time that remains. A drain that ignores "
+            "Endpoint plugin drains are cancelled after "
+            "--endpoint-plugin-drain-timeout seconds (default half of this "
+            "time); the engine gets the time that remains. A drain that ignores "
             "cancellation delays engine shutdown until a repeated signal after "
             "the drain deadline abandons it.",
         )
