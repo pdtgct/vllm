@@ -14,8 +14,10 @@ import asyncio
 import contextlib
 import os
 import signal
+import socket
 import subprocess
 import sys
+import time
 from argparse import Namespace
 from contextlib import asynccontextmanager
 from typing import Any
@@ -26,7 +28,7 @@ from fastapi import APIRouter, FastAPI, Request
 from starlette.datastructures import State
 from vllm_add_dummy_endpoint_plugin import DummyAdminEndpointPlugin
 
-from tests.utils import VLLM_PATH
+from tests.utils import VLLM_PATH, RemoteLaunchRenderServer
 from vllm.config import VllmConfig
 from vllm.entrypoints.common.cli_args import (
     make_arg_parser,
@@ -780,13 +782,14 @@ class _PrintedEvents(list):
         print(f"EVENT={event}", flush=True)
 
 
-_STOP_CASES = ("held_stop", "hung_stop", "stop_bad_signature")
+_STOP_CASES = ("held_stop", "hung_stop", "stop_ignores_cancel", "stop_bad_signature")
 
 
 async def _serve_in_child(
     case: str,
     trigger: str = "SIGTERM",
     stop_signals: tuple[str, ...] = (),
+    **serve_kwargs: Any,
 ) -> None:
     """Run real `serve_http` under uvloop and shut it down as `case` says.
 
@@ -794,14 +797,20 @@ async def _serve_in_child(
     `start_raises`. In `_STOP_CASES` its `start` returns, `trigger` requests
     shutdown once the server is serving, and its `stop` is held: `held_stop`
     sends itself `stop_signals`, returning once each is handled; `hung_stop`
-    waits until cancelled. In `stop_bad_signature` its `stop` does not accept
-    `state`, so calling it raises.
+    waits until cancelled; `stop_ignores_cancel` never returns and repeats
+    SIGTERM once everything else has been cleaned up. In `stop_bad_signature`
+    its `stop` does not accept `state`, so calling it raises.
     """
     # As the launchers do, so that the parent can read this process's warnings.
     configure_logging_from_args(_build_args())
     events = _PrintedEvents()
     engine = _ServingEngineClient(events)
     blocked = asyncio.Event()
+
+    async def ignore_cancellation_until(done) -> None:
+        while not done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.sleep(0.01)
 
     class _Blocking(DummyAdminEndpointPlugin):
         name = "B"
@@ -824,13 +833,21 @@ async def _serve_in_child(
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
-                events.append("partial_cleanup:B")
-                raise
+                if case != "start_ignores_cancel":
+                    events.append("partial_cleanup:B")
+                    raise
+            events.append("cancel_ignored:B")
+            os.kill(os.getpid(), signal.SIGTERM)
+            await asyncio.Event().wait()
 
         async def stop(self, state: State) -> None:
             await super().stop(state)
             if case == "hung_stop":
                 await asyncio.Event().wait()
+            if case == "stop_ignores_cancel":
+                await ignore_cancellation_until(lambda: _EXITED[0] in events)
+                os.kill(os.getpid(), signal.SIGTERM)
+                await ignore_cancellation_until(lambda: False)
             # A signal has been handled once the SIGUSR1 sent after it has.
             handled = asyncio.Event()
             asyncio.get_running_loop().add_signal_handler(signal.SIGUSR1, handled.set)
@@ -859,7 +876,7 @@ async def _serve_in_child(
         monkeypatch = stack.enter_context(pytest.MonkeyPatch.context())
         plugins = [_dummy("A", events), blocking(events), _dummy("C", events)]
         # Only a `stop` meant to outlive the limit gets a short one.
-        stop_timeout = 1 if case == "hung_stop" else 6 * _TIMEOUT_S
+        stop_timeout = 1 if case in _EXPIRING_STOP_CASES else 6 * _TIMEOUT_S
         app = await _build_plugin_app(
             monkeypatch, plugins, engine, _NativeServing(events), stop_timeout
         )
@@ -873,6 +890,7 @@ async def _serve_in_child(
                 host="127.0.0.1",
                 port=port,
                 log_level="warning",
+                **serve_kwargs,
             )
         )
 
@@ -910,10 +928,14 @@ _STOPPING = ["start:C", "engine_shutdown", "stop:C", "stop:B"]
 _STOPPED = [*_STOPPING, "stop:A", "native_shutdown", *_EXITED]
 # serve_http exits with status 3 when lifespan startup fails.
 _STARTUP_FAILED = 3
+_SIGTERM_EXIT = 128 + signal.SIGTERM
+_SIGINT_EXIT = 128 + signal.SIGINT
+_EXPIRING_STOP_CASES = ("hung_stop", "stop_ignores_cancel")
+_ABANDONED = [*_STOPPING, "native_shutdown", *_EXITED]
 
 
-def _held_stop(trigger: str, *stop_signals: str) -> dict:
-    return {"trigger": trigger, "stop_signals": stop_signals}
+def _held_stop(trigger: str, *stop_signals: str, **serve_kwargs: Any) -> dict:
+    return {"trigger": trigger, "stop_signals": stop_signals, **serve_kwargs}
 
 
 @pytest.mark.parametrize(
@@ -938,9 +960,32 @@ def _held_stop(trigger: str, *stop_signals: str) -> dict:
             _STARTUP_FAILED,
             ["stop:A", "native_shutdown", *_EXITED],
         ),
+        (
+            "start_ignores_cancel",
+            {},
+            _SIGTERM_EXIT,
+            ["engine_shutdown", "cancel_ignored:B"],
+        ),
+        ("held_stop", _held_stop("SIGTERM", "SIGTERM"), _SIGTERM_EXIT, _STOPPING),
+        ("held_stop", _held_stop("SIGINT", "SIGINT"), _SIGINT_EXIT, _STOPPING),
         ("held_stop", _held_stop("SIGINT", "SIGTERM"), 0, _STOPPED),
         ("held_stop", _held_stop("request_shutdown", "SIGTERM"), 0, _STOPPED),
-        ("hung_stop", {}, 0, [*_STOPPING, "native_shutdown", *_EXITED]),
+        (
+            "held_stop",
+            _held_stop("request_shutdown", "SIGTERM", "SIGTERM"),
+            _SIGTERM_EXIT,
+            _STOPPING,
+        ),
+        (
+            "held_stop",
+            _held_stop(
+                "SIGTERM", "SIGTERM", "SIGTERM", exit_on_repeated_cleanup_signal=False
+            ),
+            0,
+            _STOPPED,
+        ),
+        ("hung_stop", {}, 0, _ABANDONED),
+        ("stop_ignores_cancel", {}, _SIGTERM_EXIT, _ABANDONED),
         (
             "stop_bad_signature",
             {},
@@ -955,9 +1000,13 @@ def test_shutdown_during_plugin_lifecycle(
     """Shutdown during a blocked `start` cancels it and rolls back the
     started plugins before the listener closes, and the process exits as
     Uvicorn does after a failed startup. Signals that arrive while `stop`
-    hooks run do not skip the rest of cleanup. A `stop` that outlives its
-    time limit is cancelled and does not hold up the rest of shutdown, and
-    one that cannot be called does not hold up the other `stop` hooks."""
+    hooks run do not skip the rest of cleanup, except that when a hook ignores
+    cancellation or never returns, a repeated SIGTERM or SIGINT after engine
+    shutdown exits the process instead of hanging. Only a signal number the
+    process has already received counts as repeated, and never for a server
+    that a parent supervises. A `stop` that outlives its time limit is
+    cancelled and does not hold up the rest of shutdown, and one that cannot
+    be called does not hold up the other `stop` hooks."""
     code = (
         "import runpy, uvloop; "
         f"scope = runpy.run_path({__file__!r}); "
@@ -985,4 +1034,35 @@ def test_shutdown_during_plugin_lifecycle(
     assert result.returncode == returncode, output
     assert events == ["start:A", "start:B", *expected], output
     abandoned = "abandoned: B; skipped: A" in output
-    assert abandoned == (case == "hung_stop"), output
+    assert abandoned == (case in _EXPIRING_STOP_CASES), output
+
+
+def test_repeated_sigterm_exits_render_server_with_hung_plugin_stop():
+    """Through the real `vllm launch render` CLI: once shutdown has stopped
+    HTTP and a plugin `stop` never returns, a repeated SIGTERM exits the
+    process with `128 + SIGTERM` instead of leaving it running."""
+    with RemoteLaunchRenderServer(
+        "vllm-project/tiny-random-LlamaForCausalLM",
+        # Keep the hung `stop` inside its time limit until the second signal.
+        ["--shutdown-timeout", "10", "--endpoint-plugin-stop-timeout", "60"],
+        env_dict={"VLLM_PLUGINS": "dummy_admin_endpoint_plugin"},
+    ) as server:
+        response = httpx.post(server.url_for("plugins/dummy/hang_stop"))
+        assert response.status_code == 200
+        port = server.port
+
+        server.proc.send_signal(signal.SIGTERM)
+        # The listener closes only after shutdown has begun, so a refused
+        # connection means the plugin's `stop` is the only thing left running.
+        deadline = time.monotonic() + _TIMEOUT_S
+        while True:
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=1).close()
+            except OSError:
+                break
+            assert time.monotonic() < deadline, "HTTP listener never closed"
+            time.sleep(0.05)
+        assert server.proc.poll() is None, "server exited without the hung stop"
+
+        server.proc.send_signal(signal.SIGTERM)
+        assert server.proc.wait(timeout=_TIMEOUT_S) == 128 + signal.SIGTERM
