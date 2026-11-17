@@ -90,6 +90,28 @@ def load_general_plugins():
         func()
 
 
+def _validate_authenticated_path_prefixes(name: str, plugin: object) -> None:
+    from vllm.plugins.endpoint_plugins.interface import SupportsAuthenticatedPaths
+
+    if not isinstance(plugin, SupportsAuthenticatedPaths):
+        return
+    prefixes = plugin.authenticated_path_prefixes
+    if not isinstance(prefixes, tuple) or not all(
+        isinstance(prefix, str) for prefix in prefixes
+    ):
+        raise ValueError(
+            f"Endpoint plugin {name}: authenticated path prefixes {prefixes!r} "
+            "are not supported; they must be a tuple of str"
+        )
+    for prefix in prefixes:
+        if not prefix.startswith("/") or prefix == "/":
+            raise ValueError(
+                f"Endpoint plugin {name}: authenticated path prefix {prefix!r} "
+                "is not supported; a prefix must start with '/' and must not "
+                "be '/'"
+            )
+
+
 def load_endpoint_plugins(
     supported_tasks: "tuple[SupportedTask, ...] | None" = None,
 ) -> "list[EndpointPlugin]":
@@ -115,6 +137,10 @@ def load_endpoint_plugins(
 
     Returns:
         Instantiated plugins that passed gating in discovery order.
+
+    Raises:
+        ValueError: If a loaded plugin declares invalid
+            `authenticated_path_prefixes` (see `SupportsAuthenticatedPaths`).
 
     """
     from importlib.metadata import entry_points
@@ -153,6 +179,7 @@ def load_endpoint_plugins(
             )
             continue
 
+        _validate_authenticated_path_prefixes(name, plugin)
         logger.info("Loaded endpoint plugin %s", name)
         endpoint_plugins.append(plugin)
 

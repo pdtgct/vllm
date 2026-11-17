@@ -12,6 +12,9 @@ steps:
   source_file_dependencies:
   - vllm/plugins/
   - tests/plugins/
+  - vllm/entrypoints/serve/middleware/authenticate.py
+  - vllm/entrypoints/serve/middleware/register.py
+  - tests/plugins_tests/test_endpoint_plugins.py
   commands:
   # These plugins act only when a test names them (io_processor and endpoint)
   # or add new model names (dummy_model), so they can all be installed at once.
@@ -38,6 +41,9 @@ steps:
       source_file_dependencies:
       - vllm/plugins/
       - tests/plugins/
+      - vllm/entrypoints/serve/middleware/authenticate.py
+      - vllm/entrypoints/serve/middleware/register.py
+      - tests/plugins_tests/test_endpoint_plugins.py
       - vllm/platforms/rocm.py
 
 # The platform and stat logger plugins act on every vLLM process while

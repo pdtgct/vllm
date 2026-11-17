@@ -31,9 +31,20 @@ def init_entrypoints_middleware(
 
     # Ensure --api-key option from CLI takes precedence over VLLM_API_KEY
     if tokens := [key for key in (args.api_key or [envs.VLLM_API_KEY]) if key]:
-        from .authenticate import AuthenticationMiddleware
+        from vllm.plugins.endpoint_plugins.interface import SupportsAuthenticatedPaths
 
-        app.add_middleware(AuthenticationMiddleware, tokens=tokens)
+        from .authenticate import GUARDED_PREFIX, AuthenticationMiddleware
+
+        plugin_prefixes = [
+            prefix
+            for plugin in getattr(app.state, "endpoint_plugins", [])
+            if isinstance(plugin, SupportsAuthenticatedPaths)
+            for prefix in plugin.authenticated_path_prefixes
+        ]
+        guarded_prefixes = tuple(dict.fromkeys((*GUARDED_PREFIX, *plugin_prefixes)))
+        app.add_middleware(
+            AuthenticationMiddleware, tokens=tokens, guarded_prefixes=guarded_prefixes
+        )
 
     if args.enable_request_id_headers:
         from .x_request_id import XRequestIdMiddleware

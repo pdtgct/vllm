@@ -94,6 +94,20 @@ class EndpointPlugin(Protocol):
         ...
 
 
+@runtime_checkable
+class SupportsAuthenticatedPaths(Protocol):
+    """Optional endpoint plugin capability: paths that `--api-key` guards."""
+
+    authenticated_path_prefixes: tuple[str, ...]
+    """Path prefixes that require the API key when one is configured.
+
+    Matched like core's guarded prefixes: a literal `str.startswith` on the
+    request path with `root_path` removed, for HTTP and WebSocket requests.
+    Has no effect when no API key is configured. Keep routes that must stay
+    unauthenticated, such as probes, outside these prefixes.
+    """
+
+
 def attach_endpoint_plugins(
     app: FastAPI, supported_tasks: tuple["SupportedTask", ...]
 ) -> None:

@@ -339,8 +339,9 @@ class FrontendArgs(BaseFrontendArgs):
     the header.
 
     Warning: this only authenticates endpoints under the `/v1`, `/v2`,
-    `/inference`, and `/cohere` path prefixes. Other endpoints on the same
-    server, including `/invocations` (which exposes the same inference
+    `/inference`, and `/cohere` path prefixes, plus any prefixes that loaded
+    endpoint plugins declare in `authenticated_path_prefixes`. Other endpoints
+    on the same server, including `/invocations` (which exposes the same inference
     capabilities as `/v1`), remain unauthenticated. Do not rely on `--api-key`
     alone to secure vLLM; see
     https://docs.vllm.ai/en/latest/usage/security.html#api-key-authentication-limitations

@@ -107,6 +107,7 @@ Endpoint plugins are discovered and gated by [`load_endpoint_plugins`][vllm.plug
 - **Nothing loads unless `VLLM_PLUGINS` is set and names the plugin.** Other plugin groups load everything unless `VLLM_PLUGINS` narrows the set. Endpoint plugins invert that default because they add network exposed surface. See [Security](../usage/security.md#endpoint-plugins).
 - **`required_tasks` must intersect the server's supported tasks** unless it is `None`. Use this to keep a plugin from attaching routes on a server that can't service them (e.g. a pooling only deployment).
 - A factory that raises an issue during instantiation is logged and skipped. It does not abort server startup.
+- A loaded plugin with invalid `authenticated_path_prefixes` aborts server startup (see [Requiring the API key for plugin routes](#requiring-the-api-key-for-plugin-routes)).
 
 Only the front end API server process loads endpoint plugins. There is no need to guard for worker or engine core processes.
 
@@ -132,6 +133,22 @@ There is currently no rejection of route conflicts (tracked as a follow-up to RF
 
 - Namespace your routes under a distinct prefix, e.g. `/plugins/<plugin-name>/...`, rather than reusing `/v1/...` or other core prefixes
 - Only register routes under a core prefix (like the worked example's `/v1/admin/scheduler_config`) if you specifically intend to override or extend existing behavior and document that clearly for operators allowlisting your plugin
+
+## Requiring the API key for plugin routes
+
+`--api-key` (or `VLLM_API_KEY`) guards only core's path prefixes, so routes under `/plugins/<plugin-name>/...` are unauthenticated by default. A plugin opts its routes into the same check by declaring `authenticated_path_prefixes` (the optional [`SupportsAuthenticatedPaths`][vllm.plugins.endpoint_plugins.interface.SupportsAuthenticatedPaths] protocol):
+
+```python
+class MyAdminEndpointPlugin:
+    name = "my_admin_endpoint_plugin"
+    required_tasks: tuple[str, ...] | None = None
+    authenticated_path_prefixes = ("/plugins/my_admin_endpoint_plugin/",)
+```
+
+- A request requires the API key when its path, with `root_path` removed, starts with one of the prefixes (a literal `str.startswith`, as for core's prefixes). This applies to HTTP and WebSocket requests; `OPTIONS` requests are exempt.
+- The prefixes have no effect when no API key is configured.
+- Each prefix must be a `str` starting with `/` and must not be `/`, and the attribute must be a tuple. A plugin declaring anything else aborts server startup with a `ValueError`.
+- Keep routes that must stay unauthenticated, such as health or readiness probes, outside the declared prefixes.
 
 ## Compatibility
 
