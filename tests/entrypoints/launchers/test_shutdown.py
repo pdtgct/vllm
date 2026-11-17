@@ -3,9 +3,12 @@
 """Integration tests for shutdown behavior, timeout, and signal handling."""
 
 import asyncio
+import queue
 import signal
+import socket
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,6 +32,105 @@ _CHILD_CLEANUP_TIMEOUT = 10
 _INFLIGHT_REQUEST_START_TIMEOUT = 5
 _INFLIGHT_REQUEST_POLL_INTERVAL = 0.1
 _ABORT_CLIENT_TIMEOUT = 3
+_CHILD_STARTUP_TIMEOUT = 60
+_CHILD_EVENT_TIMEOUT = 10
+
+# Releases the held `GET /hang` request and a blocked engine shutdown. Linux and
+# macOS deliver pending signals lowest number first, and this number is above
+# SIGINT's and SIGTERM's on both, so it is handled after any signal sent before it.
+_RELEASE_SIGNAL = signal.SIGWINCH
+
+# Runs `serve_http` under uvloop with a fake engine client and reports events on
+# stdout. Arguments: exit_on_repeated_cleanup_signal, block engine shutdown, fail
+# lifespan startup (each 0 or 1), and the release signal number.
+_SERVE_HTTP_CHILD = """
+import asyncio
+import signal
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
+
+import uvloop
+from fastapi import FastAPI
+
+from vllm.entrypoints.launchers.launcher import create_server_socket, serve_http
+
+exit_on_repeat, block_engine, fail_startup = (arg == "1" for arg in sys.argv[1:4])
+release_signal = int(sys.argv[4])
+engine_released = threading.Event()
+
+
+class Config:
+    shutdown_timeout = 0
+
+
+class EngineClient:
+    vllm_config = Config()
+    errored = False
+    is_running = True
+    should_keep_api_server_alive = False
+
+    def shutdown(self, timeout):
+        print("ENGINE_SHUTDOWN", flush=True)
+        if block_engine:
+            engine_released.wait()
+
+
+@asynccontextmanager
+async def lifespan(app):
+    if fail_startup:
+        raise RuntimeError("startup failed")
+    yield
+
+
+async def report(app, port):
+    while not (hasattr(app.state, "server") and app.state.server.started):
+        await asyncio.sleep(0.01)
+    print("READY", port, flush=True)
+    while not app.state.server.should_exit:
+        await asyncio.sleep(0.01)
+    print("HTTP_SHUTDOWN", flush=True)
+
+
+async def main():
+    loop = asyncio.get_running_loop()
+    # Signals then reach only the main thread, which handles them in order.
+    handled = {signal.SIGINT, signal.SIGTERM, release_signal}
+    loop.set_default_executor(
+        ThreadPoolExecutor(
+            initializer=signal.pthread_sigmask, initargs=(signal.SIG_BLOCK, handled)
+        )
+    )
+    released = asyncio.Event()
+
+    def release():
+        released.set()
+        engine_released.set()
+
+    loop.add_signal_handler(release_signal, release)
+
+    app = FastAPI(lifespan=lifespan)
+    app.state.engine_client = EngineClient()
+
+    @app.get("/hang")
+    async def hang():
+        print("HANG", flush=True)
+        await released.wait()
+
+    sock = create_server_socket(("127.0.0.1", 0), reuse_port=False)
+    port = sock.getsockname()[1]
+    kwargs = {} if exit_on_repeat else {"exit_on_repeated_cleanup_signal": False}
+    reporter = asyncio.create_task(report(app, port))
+    shutdown = await serve_http(
+        app, sock, host="127.0.0.1", port=port, log_level="warning", **kwargs
+    )
+    await shutdown
+    reporter.cancel()
+
+
+uvloop.run(main())
+"""
 
 
 def _get_child_pids(parent_pid: int) -> list[int]:
@@ -67,7 +169,16 @@ async def _assert_children_cleaned_up(
     )
 
 
-@dataclass
+def _wait_for_server_exit(proc: subprocess.Popen, timeout: float) -> None:
+    """Children such as multiprocessing's resource_tracker only exit after the
+    server process does, so wait for it before checking them."""
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        pytest.fail(f"Server did not exit within {timeout}s")
+
+
+@dataclass(slots=True)
 class ShutdownState:
     got_503: bool = False
     got_500: bool = False
@@ -249,6 +360,7 @@ async def test_shutdown_on_engine_failure(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_wait_timeout_completes_requests():
     """Verify wait timeout: new requests rejected, in-flight requests complete."""
+    shutdown_timeout = 30
     server_args = [
         "--dtype",
         "bfloat16",
@@ -260,7 +372,7 @@ async def test_wait_timeout_completes_requests():
         "--max-num-seqs",
         "4",
         "--shutdown-timeout",
-        "30",
+        str(shutdown_timeout),
     ]
 
     with RemoteOpenAIServer(MODEL_NAME, server_args) as remote_server:
@@ -306,6 +418,7 @@ async def test_wait_timeout_completes_requests():
             f"completed: {state.requests_after_sigterm}, errors: {state.errors}"
         )
 
+        _wait_for_server_exit(proc, shutdown_timeout)
         await _assert_children_cleaned_up(child_pids)
 
 
@@ -502,6 +615,7 @@ async def test_abort_timeout_fails_inflight_requests():
 @pytest.mark.asyncio
 async def test_request_rejection_during_shutdown():
     """Verify new requests are rejected with error during shutdown."""
+    shutdown_timeout = 30
     server_args = [
         "--dtype",
         "bfloat16",
@@ -513,7 +627,7 @@ async def test_request_rejection_during_shutdown():
         "--max-num-seqs",
         "4",
         "--shutdown-timeout",
-        "30",
+        str(shutdown_timeout),
     ]
 
     with RemoteOpenAIServer(MODEL_NAME, server_args) as remote_server:
@@ -545,6 +659,7 @@ async def test_request_rejection_during_shutdown():
             f"but {rejected_count} were rejected out of 10"
         )
 
+        _wait_for_server_exit(proc, shutdown_timeout)
         await _assert_children_cleaned_up(child_pids)
 
 
@@ -611,3 +726,156 @@ async def test_multi_api_server_shutdown():
             pytest.fail("Process did not exit after SIGTERM")
 
         await _assert_children_cleaned_up(child_pids)
+
+
+class _ServeHttpChild:
+    """A child process running `serve_http` with a fake engine client."""
+
+    def __init__(
+        self,
+        *,
+        exit_on_repeated_cleanup_signal: bool,
+        block_engine_shutdown: bool,
+        fail_startup: bool,
+    ):
+        flags = (exit_on_repeated_cleanup_signal, block_engine_shutdown, fail_startup)
+        self.proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                _SERVE_HTTP_CHILD,
+                *("1" if flag else "0" for flag in flags),
+                str(int(_RELEASE_SIGNAL)),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        self.output: list[str] = []
+        self.conn: socket.socket | None = None
+        self._lines: queue.Queue[str | None] = queue.Queue()
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self) -> None:
+        assert self.proc.stdout is not None
+        for line in self.proc.stdout:
+            self._lines.put(line)
+        self._lines.put(None)
+
+    def wait_for(self, event: str, timeout: float = _CHILD_EVENT_TIMEOUT) -> str:
+        """Wait for the next stdout line starting with `event`."""
+        deadline = time.monotonic() + timeout
+        while (remaining := deadline - time.monotonic()) > 0:
+            try:
+                line = self._lines.get(timeout=remaining)
+            except queue.Empty:
+                break
+            if line is None:
+                break
+            self.output.append(line)
+            if line.startswith(event):
+                return line
+        raise AssertionError(
+            f"No {event} from the server child:\n{''.join(self.output)}"
+        )
+
+    def hold_request(self, port: int) -> None:
+        self.conn = socket.create_connection(("127.0.0.1", port))
+        self.conn.sendall(b"GET /hang HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        self.wait_for("HANG")
+
+    def wait_exit(self) -> int:
+        try:
+            return self.proc.wait(timeout=_CHILD_EVENT_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            pass
+        self.close()
+        while (line := self._lines.get()) is not None:
+            self.output.append(line)
+        raise AssertionError(f"The server child did not exit:\n{''.join(self.output)}")
+
+    def close(self) -> None:
+        if self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait()
+        if self.conn is not None:
+            self.conn.close()
+
+
+@pytest.fixture
+def serve_http_child():
+    """Start a `serve_http` child, waiting for it to listen unless startup fails;
+    holding a request keeps HTTP cleanup from finishing."""
+    children: list[_ServeHttpChild] = []
+
+    def start(
+        *,
+        exit_on_repeated_cleanup_signal: bool = True,
+        block_engine_shutdown: bool = False,
+        fail_startup: bool = False,
+        hold_request: bool = True,
+    ) -> _ServeHttpChild:
+        child = _ServeHttpChild(
+            exit_on_repeated_cleanup_signal=exit_on_repeated_cleanup_signal,
+            block_engine_shutdown=block_engine_shutdown,
+            fail_startup=fail_startup,
+        )
+        children.append(child)
+        if not fail_startup:
+            port = int(child.wait_for("READY", _CHILD_STARTUP_TIMEOUT).split()[1])
+            if hold_request:
+                child.hold_request(port)
+        return child
+
+    yield start
+    for child in children:
+        child.close()
+
+
+@pytest.mark.parametrize(
+    "signum", [signal.SIGTERM, signal.SIGINT], ids=lambda signum: signum.name
+)
+def test_repeated_signal_after_engine_stops_exits(serve_http_child, signum):
+    """A repeated signal exits a server whose HTTP cleanup waits for a request
+    that never finishes."""
+    child = serve_http_child()
+    child.proc.send_signal(signum)
+    child.wait_for("ENGINE_SHUTDOWN")
+    child.wait_for("HTTP_SHUTDOWN")
+    child.proc.send_signal(signum)
+    assert child.wait_exit() == 128 + signum
+
+
+def test_different_signal_after_engine_stops_does_not_exit(serve_http_child):
+    child = serve_http_child()
+    child.proc.send_signal(signal.SIGINT)
+    child.wait_for("HTTP_SHUTDOWN")
+    child.proc.send_signal(signal.SIGTERM)
+    child.proc.send_signal(_RELEASE_SIGNAL)
+    assert child.wait_exit() == 0
+
+
+def test_supervised_server_does_not_exit_on_repeated_signal(serve_http_child):
+    """Its parent bounds its shutdown, so HTTP cleanup is never skipped."""
+    child = serve_http_child(exit_on_repeated_cleanup_signal=False)
+    child.proc.send_signal(signal.SIGTERM)
+    child.wait_for("HTTP_SHUTDOWN")
+    child.proc.send_signal(signal.SIGTERM)
+    child.proc.send_signal(_RELEASE_SIGNAL)
+    assert child.wait_exit() == 0
+
+
+def test_repeated_signal_while_engine_stops_does_not_exit(serve_http_child):
+    child = serve_http_child(block_engine_shutdown=True, hold_request=False)
+    child.proc.send_signal(signal.SIGTERM)
+    child.wait_for("ENGINE_SHUTDOWN")
+    child.proc.send_signal(signal.SIGTERM)
+    child.proc.send_signal(_RELEASE_SIGNAL)
+    assert child.wait_exit() == 0
+
+
+def test_failed_startup_exits_with_status_3(serve_http_child):
+    """Uvicorn < 0.50 returns from a failed lifespan startup instead of exiting."""
+    child = serve_http_child(fail_startup=True)
+    assert child.wait_exit() == 3
