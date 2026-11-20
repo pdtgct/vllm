@@ -903,7 +903,6 @@ def test_extensible_extend_keeps_layers_sharing_host_resident_kv_bound(
                 SimpleNamespace(host_resident=True, layers=["host"]),
                 SimpleNamespace(host_resident=False, layers=["device"]),
             ],
-            state_groups=[],
         ),
         cache_config=SimpleNamespace(get_resolved_kv_cache_layout=lambda: None),
         vllm_config=SimpleNamespace(

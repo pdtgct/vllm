@@ -65,14 +65,17 @@ class SingleTypeKVCacheManager(ABC):
     retains_longer_hit: bool = False
 
     @classmethod
-    def config(cls, **params: Any) -> ManagerConfig:
+    def config(cls, *, recomputable: bool = True, **params: Any) -> ManagerConfig:
         """This manager's policy with `Params(**params)`."""
-        return ManagerConfig(cls, cls.Params(**params))
+        return ManagerConfig(cls, cls.Params(**params), recomputable)
 
     @classmethod
-    def layer_config(cls, spec: KVCacheSpec, **params: Any) -> KVCacheLayerConfig:
+    def layer_config(
+        cls, spec: KVCacheSpec, *, recomputable: bool = True, **params: Any
+    ) -> KVCacheLayerConfig:
         """A layer whose KV cache this manager allocates with `Params(**params)`."""
-        return KVCacheLayerConfig(cls.config(**params), spec)
+        config = cls.config(recomputable=recomputable, **params)
+        return KVCacheLayerConfig(config, spec)
 
     @classmethod
     def prefix_cacheable(cls, config: ManagerConfig) -> bool:

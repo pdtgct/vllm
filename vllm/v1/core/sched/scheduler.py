@@ -143,6 +143,24 @@ class Scheduler(SchedulerInterface):
             if self.scheduler_config.max_num_active_seqs is not None
             else self.max_num_running_reqs
         )
+        # State that can't be recomputed rules out preemption, so the pool must
+        # hold every active request at its largest.
+        self.has_unrecomputable_state = any(
+            not group.manager_config.recomputable
+            for group in kv_cache_config.kv_cache_groups
+        )
+        if self.has_unrecomputable_state:
+            blocks_per_request = sum(
+                group.max_allocated_blocks_per_request(vllm_config)
+                for group in kv_cache_config.kv_cache_groups
+            )
+            max_requests = (kv_cache_config.num_blocks - 1) // blocks_per_request
+            if self.max_num_active_reqs > max_requests:
+                raise ValueError(
+                    f"The KV cache holds {max_requests} requests of state that "
+                    f"can't be recomputed, fewer than the {self.max_num_active_reqs} "
+                    "that can be active. Lower max_num_seqs or enlarge the cache."
+                )
         self.max_num_scheduled_tokens = (
             self.scheduler_config.max_num_scheduled_tokens
             if self.scheduler_config.max_num_scheduled_tokens is not None
@@ -1899,6 +1917,10 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        if self.has_unrecomputable_state:
+            raise RuntimeError(
+                f"Request {request.request_id} holds state that can't be recomputed"
+            )
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
         self._free_request_blocks(request)
@@ -2360,16 +2382,6 @@ class Scheduler(SchedulerInterface):
         )
         return GrammarOutput(structured_output_request_ids, bitmask)
 
-    def _add_queued_outputs(self, outputs: dict[int, list[EngineCoreOutput]]) -> None:
-        """Add outputs queued outside model execution ahead of this step's."""
-        return
-
-    def _get_stale_output_req_ids(
-        self, scheduler_output: SchedulerOutput
-    ) -> set[str] | None:
-        """Requests whose output in this step must be dropped unread."""
-        return None
-
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -2404,7 +2416,6 @@ class Scheduler(SchedulerInterface):
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         # Updates dropped on arrival precede outputs of any later update.
         self._emit_dropped_streaming_updates(outputs)
-        self._add_queued_outputs(outputs)
         spec_decoding_stats: SpecDecodingStats | None = None
 
         failed_kv_load_req_ids: set[str] = set()
@@ -2434,14 +2445,11 @@ class Scheduler(SchedulerInterface):
         stopped_preempted_reqs: set[Request] = set()
         # Stopped resumable requests to re-enqueue, in output order.
         continuing_reqs: list[Request] = []
-        stale_req_ids = self._get_stale_output_req_ids(scheduler_output)
         # The worker's output order follows its batch, not num_scheduled_tokens.
         req_indices = {
             req_id: i for i, req_id in enumerate(model_runner_output.req_ids)
         }
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
-            if stale_req_ids and req_id in stale_req_ids:
-                continue
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
             output_is_stale = False
@@ -2853,7 +2861,8 @@ class Scheduler(SchedulerInterface):
             RequestStatus.WAITING_FOR_STREAMING_REQ,
         )
 
-    def _holds_kv_blocks(self, request: Request) -> bool:
+    @staticmethod
+    def _holds_kv_blocks(request: Request) -> bool:
         # Whether a request currently has kv blocks allocated.
         # While always the case when status is WAITING_FOR_REMOTE_KVS
         # or WAITING_FOR_STREAMING_REQ, there are such cases where it's
@@ -3424,6 +3433,8 @@ class Scheduler(SchedulerInterface):
         Otherwise, this method will only reset the KV prefix cache when there
         is no running requests taking KV cache.
         """
+        if self.has_unrecomputable_state:
+            reset_running_requests = False
         if reset_running_requests:
             # For logging.
             timestamp = time.monotonic()

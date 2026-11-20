@@ -266,8 +266,7 @@ class CacheConfig:
     """Sliding window size for the KV cache. This is primarily set in
     `ModelConfig` and that value should be manually duplicated here."""
     enable_prefix_caching: bool = True
-    """Whether to enable prefix caching. A model with persistent state does
-    not support it."""
+    """Whether to enable prefix caching."""
     prefix_caching_hash_algo: PrefixCachingHashAlgo = "sha256"
     """Set the hash algorithm for prefix caching:
 
@@ -408,9 +407,7 @@ class CacheConfig:
     there. When a KV connector registers the KV cache for RDMA or exports it to
     another process, each segment is backed by a single physical allocation;
     connectors declare this by overriding
-    `KVConnectorBase_V1.kv_cache_access`. Disabled by default for a model with
-    persistent state, whose pool is sized by configuration and allocated in
-    full at startup."""
+    `KVConnectorBase_V1.kv_cache_access`."""
 
     kv_offloading_size: float | None = None
     """Size of the KV cache offloading buffer in GiB. When TP > 1, this is
