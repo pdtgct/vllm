@@ -49,6 +49,7 @@ from vllm.distributed.aux_output_connector.worker import (
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
+    graph_capture,
     single_pp_stage,
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -207,6 +208,8 @@ logger = init_logger(__name__)
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
+    _execution_memory_prepared: bool = False
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -1091,7 +1094,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.pooling_runner.dummy_pooler_run(hidden_states)
 
     @torch.inference_mode()
+    def prepare_execution_memory(self) -> None:
+        """Let the model state allocate its long-lived working memory, once,
+        before the profiling forward pass and before any KV cache exists."""
+        if self._execution_memory_prepared:
+            return
+        self._execution_memory_prepared = True
+        self.model_state.prepare_execution_memory()
+
+    @torch.inference_mode()
     def profile_run(self, randomize_inputs: bool = False) -> None:
+        self.prepare_execution_memory()
         if self.vllm_config.aux_output_config.enabled:
             self.aux_output_connector = get_aux_output_connector(
                 self.model, self.vllm_config
@@ -1155,12 +1168,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def needs_cudagraph_capture(self) -> bool:
         """Whether capture_model() has any CUDA graphs left to capture."""
         return (
-            self.model_state.supports_mm_inputs
-            and self.model_state.encoder_runner.has_cudagraph()
-        ) or (
-            self.cudagraph_manager is not None
-            and self.cudagraph_manager.needs_capture()
+            (
+                self.model_state.supports_mm_inputs
+                and self.model_state.encoder_runner.has_cudagraph()
+            )
+            or (
+                self.cudagraph_manager is not None
+                and self.cudagraph_manager.needs_capture()
+            )
+            or self.model_state_needs_cudagraph_capture()
         )
+
+    def model_state_needs_cudagraph_capture(self) -> bool:
+        """Whether capture_model() captures the model state's own CUDA graphs,
+        whatever `cudagraph_mode` is. The model state is not asked in eager
+        mode."""
+        return (
+            not self.model_config.enforce_eager
+            and self.model_state.needs_cudagraph_capture()
+        )
+
+    def _capture_model_state_cudagraphs(self, profile_only: bool) -> None:
+        with graph_capture(self.device) as context:
+            self.model_state.capture_cudagraphs(
+                graph_pool=current_platform.get_global_graph_pool(),
+                stream=context.stream,
+                profile_only=profile_only,
+            )
 
     @torch.inference_mode()
     def capture_model(self, *, profile_only: bool = False) -> int:
@@ -1170,7 +1204,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and self.model_state.encoder_runner.has_cudagraph()
         )
         capture_decoder = self.cudagraph_manager.needs_capture()
-        if not capture_encoder and not capture_decoder:
+        capture_model_state = self.model_state_needs_cudagraph_capture()
+        if not capture_encoder and not capture_decoder and not capture_model_state:
             logger.warning(
                 "Skipping encoder and decoder CUDA graph capture. To enable "
                 "encoder capture, ensure `cudagraph_mm_encoder` is enabled; "
@@ -1223,6 +1258,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         # allocator cache is counted as graph memory below.
                         torch.accelerator.empty_cache()
                     self.kv_connector.reset_capture_state()
+
+                if capture_model_state:
+                    self._capture_model_state_cudagraphs(profile_only)
 
             # Warmup activations stay cached on the capture streams, which
             # nothing allocates from after capture; release them.
@@ -2544,6 +2582,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
         torch.accelerator.synchronize()
+        try:
+            if hasattr(self, "model_state"):
+                self.model_state.shutdown()
+        except Exception:
+            logger.exception("The model state's shutdown hook failed")
+        finally:
+            # Also when the hook is interrupted.
+            self._release_gpu_tensors()
+
+    def _release_gpu_tensors(self) -> None:
         if current_platform.is_rocm():
             # RCCL's ncclCommAbort waits for live graphs that captured the comm:
             # https://github.com/ROCm/rocm-systems/issues/13018
