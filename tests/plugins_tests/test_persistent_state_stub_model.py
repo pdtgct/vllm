@@ -142,3 +142,36 @@ async def test_stop_token_is_not_fed_back(async_scheduling):
         assert observed == (extra if async_scheduling else clean)
     finally:
         llm.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_scheduling", [False, True])
+async def test_streaming_history_stays_bounded(async_scheduling):
+    """200 two-token inputs at max_model_len 256: without trimming the session
+    would pass max_model_len near input 64 and get an empty `length` turn.
+    With every group's state unrecomputable, each input drops the consumed
+    tokens, and every turn still follows the state's running sum."""
+    llm = AsyncLLM.from_engine_args(
+        AsyncEngineArgs(**ENGINE_KWARGS, async_scheduling=async_scheduling)
+    )
+    try:
+        inputs = [[1 + i % 50, 2 + i % 7] for i in range(200)]
+        expected = expected_turns(inputs, MAX_TOKENS, llm.model_config.get_vocab_size())
+
+        async def stream():
+            for prompt in inputs:
+                yield StreamingInput(prompt=TokensPrompt(prompt_token_ids=list(prompt)))
+
+        params = SamplingParams(
+            temperature=0, max_tokens=MAX_TOKENS, output_kind=RequestOutputKind.DELTA
+        )
+        turns: list[list[int]] = [[]]
+        async for output in llm.generate(stream(), params, "long-stream"):
+            completion = output.outputs[0]
+            turns[-1].extend(completion.token_ids)
+            if completion.finish_reason is not None and not output.finished:
+                turns.append([])
+        # A dropped update leaves an empty turn in place, so it fails here.
+        assert turns[: len(inputs)] == expected
+    finally:
+        llm.shutdown()

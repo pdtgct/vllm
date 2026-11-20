@@ -149,6 +149,12 @@ class Scheduler(SchedulerInterface):
             not group.manager_config.recomputable
             for group in kv_cache_config.kv_cache_groups
         )
+        # When every group holds such state, a streaming session never reads
+        # its consumed tokens again, so each new input can drop them.
+        self.trims_streaming_history = bool(kv_cache_config.kv_cache_groups) and all(
+            not group.manager_config.recomputable
+            for group in kv_cache_config.kv_cache_groups
+        )
         if self.has_unrecomputable_state:
             blocks_per_request = sum(
                 group.max_allocated_blocks_per_request(vllm_config)
@@ -1987,6 +1993,23 @@ class Scheduler(SchedulerInterface):
         self.finished_req_ids = set()
         self.reset_preempted_req_ids = set()
 
+    def _can_trim_streaming_history(self, session: Request) -> bool:
+        """Whether a streaming session's consumed tokens can be dropped at its
+        next input: every group holds state that can't be recomputed, so no
+        position-indexed cache reads them, no connector tracks them, and every
+        multimodal input has been consumed."""
+        return (
+            self.trims_streaming_history
+            and self.connector is None
+            and self.ec_connector is None
+            and session.num_computed_tokens > 1
+            and all(
+                feature.mm_position.offset + feature.mm_position.length
+                <= session.num_computed_tokens
+                for feature in session.mm_features
+            )
+        )
+
     def _update_request_as_session(
         self, session: Request, update: StreamingUpdate
     ) -> bool:
@@ -1995,7 +2018,16 @@ class Scheduler(SchedulerInterface):
         Discards the last sampled output token from the prior input chunk.
         Returns False if the update was dropped for exceeding max_model_len.
         """
-        new_num_tokens = session.num_tokens - 1 + len(update.prompt_token_ids or ())
+        # Consumed tokens dropped from the session; it keeps one computed token,
+        # so it still reads as a continuing request with prior state.
+        drop = (
+            session.num_computed_tokens - 1
+            if self._can_trim_streaming_history(session)
+            else 0
+        )
+        new_num_tokens = (
+            session.num_tokens - 1 - drop + len(update.prompt_token_ids or ())
+        )
         if new_num_tokens + self.num_sampled_tokens_per_step > self.max_model_len:
             logger.warning(
                 "Dropping streaming update for request %s: session would "
@@ -2020,6 +2052,14 @@ class Scheduler(SchedulerInterface):
             session.num_prompt_tokens,
             keep_end,
         )
+        if drop:
+            self.encoder_cache_manager.free(session)
+            self._pending_encoder_input_ids.pop(session.request_id, None)
+            session.mm_features.clear()
+            del session._all_token_ids[:drop]
+            del session.prompt_token_ids[:drop]
+            session.block_hashes.clear()
+            session.num_computed_tokens -= drop
 
         if update.mm_features:
             base = session.num_tokens
