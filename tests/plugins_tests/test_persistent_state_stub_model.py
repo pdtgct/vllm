@@ -80,3 +80,65 @@ async def test_async_llm_streams_keep_their_state_across_inputs():
         assert results == [expected] * 3
     finally:
         llm.shutdown()
+
+
+def _stop_token_case(vocab_size: int) -> tuple[list[int], list[int], int, int, int]:
+    """A first input whose turn stops on its second token, before
+    `max_tokens`, and whose stop token changes the second turn's first token
+    if it is fed back: the stub emits `total` modulo `vocab_size - 3`, so a stop
+    token congruent to 0 would hide the extra write."""
+    from vllm_add_dummy_model.my_persistent_state import emit
+
+    second = [7]
+    for first_token in range(1, 10_000):
+        first = [first_token]
+        t0 = emit(sum(first), vocab_size)
+        stop = emit(sum(first) + t0, vocab_size)
+        clean = emit(sum(first) + t0 + sum(second), vocab_size)
+        extra = emit(sum(first) + t0 + stop + sum(second), vocab_size)
+        if stop != t0 and stop % (vocab_size - 3) and clean != extra:
+            return first, second, stop, clean, extra
+    raise AssertionError("no observable stop token")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_scheduling", [False, True])
+async def test_stop_token_is_not_fed_back(async_scheduling):
+    """A turn that stops on a sampled stop token must not feed that token
+    into the state. Under async scheduling the step after the stop is already
+    scheduled with the stop token as its input; this test records which of
+    the two predictions the second turn matches."""
+    llm = AsyncLLM.from_engine_args(
+        AsyncEngineArgs(**ENGINE_KWARGS, async_scheduling=async_scheduling)
+    )
+    try:
+        vocab_size = llm.model_config.get_vocab_size()
+        first, second, stop, clean, extra = _stop_token_case(vocab_size)
+
+        async def inputs():
+            for prompt in (first, second):
+                yield StreamingInput(prompt=TokensPrompt(prompt_token_ids=list(prompt)))
+
+        params = SamplingParams(
+            temperature=0,
+            max_tokens=4,
+            stop_token_ids=[stop],
+            output_kind=RequestOutputKind.DELTA,
+        )
+        turns: list[list[int]] = [[]]
+        async for output in llm.generate(inputs(), params, "stop-stream"):
+            completion = output.outputs[0]
+            turns[-1].extend(completion.token_ids)
+            if completion.finish_reason is not None and not output.finished:
+                turns.append([])
+        turns = [turn for turn in turns if turn]
+        assert turns[0][-1] == stop and len(turns[0]) == 2, turns
+        observed = turns[1][0]
+        assert observed in (clean, extra), (turns, clean, extra)
+        print(
+            f"async_scheduling={async_scheduling} second turn starts {observed}: "
+            f"{'clean' if observed == clean else 'stop token fed back'}"
+        )
+        assert observed == (extra if async_scheduling else clean)
+    finally:
+        llm.shutdown()
