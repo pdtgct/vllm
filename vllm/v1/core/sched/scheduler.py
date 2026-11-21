@@ -1988,7 +1988,7 @@ class Scheduler(SchedulerInterface):
         session.max_tokens = update.max_tokens
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
             self.num_waiting_for_streaming_input -= 1
-            # Preemption reset a session that parked afterwards; it has no slot.
+            # A session preempted before it parked has no slot.
             if session.num_computed_tokens > 0:
                 self.resumed_streaming_sessions.add(session)
         session.status = RequestStatus.WAITING

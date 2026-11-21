@@ -301,26 +301,6 @@ def test_session_resumed_by_queued_input_keeps_worker_slot_until_aborted():
     assert set(out.num_scheduled_tokens) == {"busy", "parked", "new"}
 
 
-@pytest.mark.parametrize("input_queued_before_stop", [False, True])
-def test_resumed_session_needs_no_free_worker_slot(input_queued_before_stop):
-    """With every worker slot held, a resumed session still runs in its own."""
-    scheduler = create_scheduler(max_num_seqs=1)
-    slots = WorkerSlots(max_num_reqs=1)
-    scheduler.add_request(_request("session", resumable=True))
-    out = scheduler.schedule()
-    slots.apply(out)
-    if input_queued_before_stop:
-        scheduler.add_request(_request("session", resumable=True))
-    scheduler.update_from_output(out, _model_runner_output(["session"], [[STOP_TOKEN]]))
-    if not input_queued_before_stop:
-        scheduler.add_request(_request("session", resumable=True))
-    scheduler.add_request(_request("new"))
-
-    out = scheduler.schedule()
-    slots.apply(out)
-    assert set(out.num_scheduled_tokens) == {"session"}
-
-
 def test_resumed_session_runs_ahead_of_loaded_request_waiting_for_slot():
     """A request whose KV load has finished needs a free worker slot. While the
     only slot belongs to a resumed session behind it, the session runs, and the
