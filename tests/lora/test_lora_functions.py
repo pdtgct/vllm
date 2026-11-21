@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Script to test add_lora, remove_lora, pin_lora, list_loras functions."""
 
+import asyncio
 import json
+from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import cast
 
@@ -11,11 +13,13 @@ import torch
 
 from vllm import LLM, RequestOutput, SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
+from vllm.engine.protocol import StreamingInput
 from vllm.entrypoints.launchers.api_server.entry import (
     build_async_engine_client_from_engine_args,
 )
 from vllm.exceptions import VLLMValidationError
 from vllm.lora.request import LoRARequest, _TensorLoRARequest
+from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.llm_engine import LLMEngine
 from vllm.v1.worker.worker_base import WorkerBase
@@ -344,3 +348,65 @@ def test_memory_lora_loading_and_reload(
         reference = generate(LoRARequest("woof", 3, qwen3_woofing_lora_files))
         assert "Woof Woof Woof" in updated.text
         assert updated.token_ids == reference.token_ids
+@pytest.mark.asyncio
+async def test_streaming_session_held_back_by_max_loras_keeps_its_slot(
+    qwen3_lora_files,
+):
+    """A streaming session given its next input keeps its model runner slot
+    while max_loras holds it back, so a new request must wait for that slot.
+    Admitting the new request made the model runner fail with "No free indices"
+    and killed the engine."""
+    engine_args = AsyncEngineArgs(
+        model=MODEL_PATH,
+        enable_lora=True,
+        max_loras=1,
+        max_lora_rank=LORA_RANK,
+        max_model_len=256,
+        max_num_seqs=2,
+        gpu_memory_utilization=0.8,
+        enforce_eager=True,
+    )
+    turn_params = SamplingParams(
+        temperature=0, max_tokens=4, output_kind=RequestOutputKind.DELTA
+    )
+    # Long enough that the busy request still runs when the others arrive.
+    busy_params = SamplingParams(temperature=0, max_tokens=200, ignore_eos=True)
+    next_input = asyncio.Event()
+
+    async def session_inputs() -> AsyncGenerator[StreamingInput, None]:
+        yield StreamingInput(prompt="Hello, my name is")
+        await next_input.wait()
+        yield StreamingInput(prompt=" and I like")
+
+    async def drain(
+        outputs: AsyncGenerator[RequestOutput, None],
+    ) -> list[RequestOutput]:
+        return [output async for output in outputs]
+
+    async with build_async_engine_client_from_engine_args(engine_args) as llm:
+        session = llm.generate(
+            session_inputs(),
+            turn_params,
+            "session",
+            lora_request=LoRARequest("2", 2, qwen3_lora_files),
+        )
+        # After its first turn the session waits for input, holding its slot.
+        output = await asyncio.wait_for(anext(session), timeout=60)
+        while not (output.outputs and output.outputs[0].finish_reason):
+            output = await asyncio.wait_for(anext(session), timeout=60)
+
+        # The busy request's adapter fills max_loras, holding back the session.
+        busy = llm.generate(
+            "Count to two hundred:",
+            busy_params,
+            "busy",
+            lora_request=LoRARequest("1", 1, qwen3_lora_files),
+        )
+        await asyncio.wait_for(anext(busy), timeout=60)
+        next_input.set()
+        new = llm.generate("Hello", turn_params, "new")
+        outputs = await asyncio.wait_for(
+            asyncio.gather(drain(session), drain(busy), drain(new)), timeout=120
+        )
+
+    assert all(request_outputs[-1].finished for request_outputs in outputs)
