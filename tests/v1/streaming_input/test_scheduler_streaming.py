@@ -789,6 +789,24 @@ def test_session_resumes_after_stop_while_preempted(chunk_queued_before_stop):
     assert output.num_scheduled_tokens["session"] == len(expected)
 
 
+def test_session_parked_after_preemption_reserves_no_slot():
+    """A session preempted with a step in flight, then parked by that step's
+    stop, has no model-runner slot. Its next input must not reserve one, or a
+    request queued ahead of it waits for a slot that no request holds."""
+    scheduler = create_async_scheduler(async_scheduling=True, max_num_seqs=1)
+    session = DummyRequest("session", prompt_token_ids=list(range(10)))
+    scheduler.add_request(session)
+    scheduler.update_from_output(scheduler.schedule(), _model_output("session", [10]))
+    in_flight = scheduler.schedule()
+    scheduler.running.remove(session)
+    scheduler._preempt_request(session, timestamp=0.0)
+    scheduler.add_request(DummyRequest("other", resumable=False, prompt_token_ids=[1]))
+    scheduler.update_from_output(in_flight, _model_output("session", [STOP_TOKEN]))
+    scheduler.add_request(DummyRequest("session", prompt_token_ids=[20, 21]))
+
+    assert set(scheduler.schedule().num_scheduled_tokens) == {"other"}
+
+
 def test_non_resumable_request_stays_dequeued_after_stop_while_preempted():
     """Only resumable requests continue after a stop; a request that finishes
     while preempted must not be put back in a queue."""

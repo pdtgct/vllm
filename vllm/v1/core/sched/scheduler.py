@@ -265,6 +265,9 @@ class Scheduler(SchedulerInterface):
         # Counter for requests waiting for streaming input. Used to calculate
         # number of unfinished requests
         self.num_waiting_for_streaming_input: int = 0
+        # Sessions given their next input that keep their model-runner request
+        # slot, but not their place in `running`, until scheduled again.
+        self.resumed_streaming_sessions: set[Request] = set()
         # Sessions whose streaming update was dropped for exceeding max_model_len.
         self.dropped_streaming_updates: list[Request] = []
 
@@ -1308,13 +1311,29 @@ class Scheduler(SchedulerInterface):
                 # has arrived (_update_waiting_for_remote_kv).
                 num_replay_tokens = 0
 
+                # A resumed streaming session keeps its model-runner request
+                # slot; any other request entering `running` needs a free one.
+                waits_for_slot = (
+                    not load_kv_async
+                    and request not in self.resumed_streaming_sessions
+                    and num_running + len(self.resumed_streaming_sessions)
+                    >= self.max_num_active_reqs
+                )
+                if waits_for_slot and request_queue is self.kv_holding_waiting:
+                    # Resumed sessions behind it need no free slot.
+                    skip_request(request_queue)
+                    continue
                 if (
-                    load_kv_async
-                    and (
-                        num_async_kv_loads >= max_async_kv_loads
-                        or not self._admits_inflight_kv_load()
+                    (
+                        load_kv_async
+                        and (
+                            num_async_kv_loads >= max_async_kv_loads
+                            or not self._admits_inflight_kv_load()
+                        )
                     )
-                ) or (loads_only and not load_kv_async):
+                    or (loads_only and not load_kv_async)
+                    or waits_for_slot
+                ):
                     # Past an async KV load limit, or needs a running slot while none
                     # is free. It waits at the head of its queue; others may admit.
                     if request_queue is not self.async_kv_waiting:
@@ -1595,6 +1614,7 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.pop_request()
                 self.deferred_waiting.discard(request)
+                self.resumed_streaming_sessions.discard(request)
                 self.running.append(request)
                 if num_external_computed_tokens > 0:
                     # load_kv_async is False here
@@ -1968,6 +1988,9 @@ class Scheduler(SchedulerInterface):
         session.max_tokens = update.max_tokens
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
             self.num_waiting_for_streaming_input -= 1
+            # Preemption reset a session that parked afterwards; it has no slot.
+            if session.num_computed_tokens > 0:
+                self.resumed_streaming_sessions.add(session)
         session.status = RequestStatus.WAITING
 
         if self.log_stats:
@@ -2601,6 +2624,9 @@ class Scheduler(SchedulerInterface):
 
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
+                    if request.status == RequestStatus.WAITING:
+                        # Resumed with a queued input; it keeps its slot.
+                        self.resumed_streaming_sessions.add(request)
                 else:
                     stopped_preempted_reqs.add(request)
 
@@ -3225,6 +3251,7 @@ class Scheduler(SchedulerInterface):
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
         self._inflight_prefills.discard(request)
+        self.resumed_streaming_sessions.discard(request)
         self._unreserve_parked(request)
         self._set_kv_fetch_stage(request, None)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)

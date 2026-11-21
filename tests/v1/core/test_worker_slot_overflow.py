@@ -20,8 +20,16 @@ faithful model of the worker's slot accounting.
 
 import pytest
 
+from tests.v1.kv_connector.unit.utils import (
+    create_model_runner_output,
+    create_vllm_config,
+)
+from tests.v1.kv_connector.unit.utils import create_request as create_kv_request
+from tests.v1.kv_connector.unit.utils import create_scheduler as create_kv_scheduler
+from vllm.config import LoRAConfig
+from vllm.lora.request import LoRARequest
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.request import RequestStatus
+from vllm.v1.request import Request, RequestStatus
 
 from .test_scheduler import create_scheduler_with_priority
 from .utils import create_requests, create_scheduler
@@ -207,3 +215,142 @@ def test_reset_prefix_cache_same_step_resume_purges_then_re_adds():
     # it. No overflow, A still occupies its single slot afterward.
     slots.apply(out)
     assert slots.occupied == {"A"}
+
+
+STOP_TOKEN = 7
+
+
+def _request(
+    req_id: str, resumable: bool = False, lora_id: int | None = None
+) -> Request:
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=4,
+        req_ids=[req_id],
+        stop_token_ids=[STOP_TOKEN],
+        max_tokens=16,
+    )
+    request.resumable = resumable
+    if lora_id is not None:
+        request.lora_request = LoRARequest(f"lora-{lora_id}", lora_id, "/lora")
+    return request
+
+
+def test_skipped_resumed_session_does_not_over_admit_worker_slot():
+    """A session given its next input keeps its worker slot until it is
+    scheduled again. When a step skips it, here for max_loras, a new request
+    must not take that slot."""
+    scheduler = create_scheduler(max_num_seqs=2, lora_config=LoRAConfig(max_loras=1))
+    slots = WorkerSlots(max_num_reqs=2)
+    scheduler.add_request(_request("session", resumable=True, lora_id=2))
+    out = scheduler.schedule()
+    slots.apply(out)
+    scheduler.update_from_output(out, _model_runner_output(["session"], [[STOP_TOKEN]]))
+
+    scheduler.add_request(_request("busy", lora_id=1))
+    out = scheduler.schedule()
+    slots.apply(out)
+    scheduler.update_from_output(out, _model_runner_output(["busy"], [[42]]))
+
+    scheduler.add_request(_request("session", resumable=True))
+    scheduler.add_request(_request("new"))
+    out = scheduler.schedule()
+    slots.apply(out)
+    assert set(out.num_scheduled_tokens) == {"busy"}
+
+    scheduler.update_from_output(out, _model_runner_output(["busy"], [[STOP_TOKEN]]))
+    out = scheduler.schedule()
+    slots.apply(out)
+    assert set(out.num_scheduled_tokens) == {"session", "new"}
+
+
+def test_session_resumed_by_queued_input_keeps_worker_slot_until_aborted():
+    """A session that stops with its next input queued resumes at once and keeps
+    its worker slot through a step that skips it. An abort frees the slot."""
+    scheduler = create_scheduler(max_num_seqs=3, lora_config=LoRAConfig(max_loras=2))
+    slots = WorkerSlots(max_num_reqs=3)
+    scheduler.add_request(_request("parked", resumable=True, lora_id=3))
+    out = scheduler.schedule()
+    slots.apply(out)
+    scheduler.update_from_output(out, _model_runner_output(["parked"], [[STOP_TOKEN]]))
+
+    scheduler.add_request(_request("session", resumable=True, lora_id=2))
+    scheduler.add_request(_request("busy", lora_id=1))
+    out = scheduler.schedule()
+    slots.apply(out)
+    # parked's input arrives first, so parked resumes ahead of session.
+    scheduler.add_request(_request("parked", resumable=True))
+    scheduler.add_request(_request("session", resumable=True))
+    scheduler.update_from_output(
+        out, _model_runner_output(["session", "busy"], [[STOP_TOKEN], [42]])
+    )
+    assert scheduler.requests["session"].status == RequestStatus.WAITING
+
+    # busy's and parked's adapters fill max_loras, so this step skips session.
+    scheduler.add_request(_request("new"))
+    out = scheduler.schedule()
+    slots.apply(out)
+    assert set(out.num_scheduled_tokens) == {"busy", "parked"}
+
+    scheduler.update_from_output(
+        out, _model_runner_output(["busy", "parked"], [[42], [42]])
+    )
+    scheduler.finish_requests("session", RequestStatus.FINISHED_ABORTED)
+    out = scheduler.schedule()
+    slots.apply(out)
+    assert set(out.num_scheduled_tokens) == {"busy", "parked", "new"}
+
+
+@pytest.mark.parametrize("input_queued_before_stop", [False, True])
+def test_resumed_session_needs_no_free_worker_slot(input_queued_before_stop):
+    """With every worker slot held, a resumed session still runs in its own."""
+    scheduler = create_scheduler(max_num_seqs=1)
+    slots = WorkerSlots(max_num_reqs=1)
+    scheduler.add_request(_request("session", resumable=True))
+    out = scheduler.schedule()
+    slots.apply(out)
+    if input_queued_before_stop:
+        scheduler.add_request(_request("session", resumable=True))
+    scheduler.update_from_output(out, _model_runner_output(["session"], [[STOP_TOKEN]]))
+    if not input_queued_before_stop:
+        scheduler.add_request(_request("session", resumable=True))
+    scheduler.add_request(_request("new"))
+
+    out = scheduler.schedule()
+    slots.apply(out)
+    assert set(out.num_scheduled_tokens) == {"session"}
+
+
+def test_resumed_session_runs_ahead_of_loaded_request_waiting_for_slot():
+    """A request whose KV load has finished needs a free worker slot. While the
+    only slot belongs to a resumed session behind it, the session runs, and the
+    request keeps its place until the slot is freed."""
+    scheduler = create_kv_scheduler(create_vllm_config(max_num_seqs=1))
+    slots = WorkerSlots(max_num_reqs=1)
+    loaded = create_kv_request(request_id=1, do_remote_prefill=True)
+    session = create_kv_request(request_id=2)
+    session.resumable = True
+    scheduler.add_request(loaded)
+    scheduler.add_request(session)
+    out = scheduler.schedule()
+    slots.apply(out)
+    assert set(out.num_scheduled_tokens) == {session.request_id}
+    scheduler.update_from_output(
+        out,
+        create_model_runner_output(
+            [session], use_eos=True, finished_recving={loaded.request_id}
+        ),
+    )
+
+    next_input = create_kv_request(request_id=2)
+    next_input.resumable = True
+    scheduler.add_request(next_input)
+    out = scheduler.schedule()
+    slots.apply(out)
+    assert set(out.num_scheduled_tokens) == {session.request_id}
+
+    scheduler.update_from_output(out, create_model_runner_output([session]))
+    scheduler.finish_requests(session.request_id, RequestStatus.FINISHED_ABORTED)
+    out = scheduler.schedule()
+    slots.apply(out)
+    assert set(out.num_scheduled_tokens) == {loaded.request_id}
