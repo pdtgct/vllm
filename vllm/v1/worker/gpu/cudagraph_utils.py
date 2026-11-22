@@ -1008,8 +1008,8 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
 
     FULL graphs bake in KV cache pointers, so only the largest few are
     captured (into a throwaway pool) and their total cost is extrapolated.
-    PIECEWISE, encoder and speculator graphs are measured in full. All
-    profiling captures are discarded afterwards: replaying graphs recorded
+    PIECEWISE, encoder, speculator and model-state graphs are measured in
+    full. All profiling captures are discarded afterwards: replaying graphs recorded
     against the throwaway profiling state is unsafe (e.g. inductor graph
     partition reclaims the storages of earlier cudagraph recordings once the
     real capture records new ones, leading to use-after-free crashes).
@@ -1078,14 +1078,22 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
             with capture_outside_cumem_pool():
                 measured = int(runner.capture_model(profile_only=True))
 
-            # The measured delta covers PIECEWISE, encoder and speculator graphs
-            # plus the sampled FULL graphs; swap the sampled FULL cost for the
-            # extrapolated total. FULL and PIECEWISE share one pool here just as
-            # they share the global pool at runtime, so the overlap is not
-            # double-counted.
+            # The measured delta covers PIECEWISE, encoder, speculator and
+            # model-state graphs plus the sampled FULL graphs; swap the sampled
+            # FULL cost for the extrapolated total. FULL and PIECEWISE share one
+            # pool here just as they share the global pool at runtime, so the
+            # overlap is not double-counted.
             num_full_graphs = len(manager._capture_descs.get(CUDAGraphMode.FULL, []))
             full_estimate = _extrapolate_full_graph_memory(mem_samples, num_full_graphs)
-            return max(measured - sum(mem_samples) + full_estimate, 0)
+            estimate = max(measured - sum(mem_samples) + full_estimate, 0)
+        except BaseException:
+            # This failure propagates; one from the release is only logged.
+            _clear_model_state_cudagraphs(runner, after_failure=True)
+            raise
+        else:
+            # A failure here propagates once the teardown below has run.
+            _clear_model_state_cudagraphs(runner)
+            return estimate
         finally:
             compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
             compilation_counter.num_gpu_runner_capture_triggers = saved_capture_triggers
@@ -1105,6 +1113,34 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
             _teardown_profiling_state(runner)
     finally:
         platform_cls._global_graph_pool = saved_global_pool
+
+
+def _model_state_captures(runner: "GPUModelRunner") -> bool:
+    """Whether the runner's capture_model() calls the model state's
+    `capture_cudagraphs`. A runner with its own capture is asked first, so one
+    that captures nothing never reaches the model state."""
+    return (
+        runner.needs_cudagraph_capture()
+        and runner.model_state_needs_cudagraph_capture()
+    )
+
+
+def _clear_model_state_cudagraphs(
+    runner: "GPUModelRunner", *, after_failure: bool = False
+) -> None:
+    """Have the model state release what it captured against the profiling
+    state, while the profiling KV cache still exists. With `after_failure`, a
+    failure is logged instead of replacing the one already propagating."""
+    try:
+        if _model_state_captures(runner):
+            runner.model_state.clear_cudagraphs()
+    except BaseException:
+        if not after_failure:
+            raise
+        logger.exception(
+            "The model state failed to release its profiling CUDA graphs "
+            "after an earlier failure"
+        )
 
 
 def _extrapolate_full_graph_memory(mem_samples: list[int], total_graphs: int) -> int:
