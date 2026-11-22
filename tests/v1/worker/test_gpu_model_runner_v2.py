@@ -225,6 +225,7 @@ def test_profile_run_creates_aux_output_connector_before_forward(
     runner.vllm_config = vllm_config
     runner.model = model
     runner.aux_output_connector = None
+    runner.model_state = SimpleNamespace(prepare_execution_memory=lambda: None)
     runner.supports_mm_inputs = False
     runner.is_last_pp_rank = False
     runner.max_num_tokens = 8
@@ -499,8 +500,11 @@ def _make_capture_runner(
     cudagraph_manager's needs_capture decision."""
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.model_state = SimpleNamespace(
-        supports_mm_inputs=False, capture_inner_cudagraphs=Mock()
+        supports_mm_inputs=False,
+        capture_inner_cudagraphs=Mock(),
+        needs_cudagraph_capture=lambda: False,
     )
+    runner.model_config = SimpleNamespace(enforce_eager=False)
     runner.cudagraph_manager = SimpleNamespace(
         needs_capture=lambda: captured,
         capture=lambda *args, **kwargs: None,
@@ -787,3 +791,51 @@ def test_speculator_request_hooks(gpu_model_runner_for_requests):
     runner.finish_requests(scheduler_output)
 
     assert events == [("add", "a"), ("add", "b"), ("finished", "a")]
+
+
+# The model-state hooks every `ModelState` has. A state that defines none of
+# them captures nothing and needs no call.
+
+
+@pytest.mark.parametrize(
+    ("hook", "kwargs", "expected"),
+    [
+        ("needs_cudagraph_capture", {}, False),
+        ("prepare_execution_memory", {}, None),
+        (
+            "capture_cudagraphs",
+            {"graph_pool": None, "stream": None, "profile_only": True},
+            None,
+        ),
+        (
+            "capture_cudagraphs",
+            {"graph_pool": None, "stream": None, "profile_only": False},
+            None,
+        ),
+        ("clear_cudagraphs", {}, None),
+        ("post_warmup", {}, None),
+        ("shutdown", {}, None),
+    ],
+)
+def test_model_state_hook_defaults(hook, kwargs, expected):
+    """On a model state that defines none of them, `needs_cudagraph_capture`
+    returns `False` and the other hooks return `None` and leave the state as
+    it was."""
+    model_config = ModelConfig(model="facebook/opt-125m", dtype="float32")
+    vllm_config = VllmConfig(
+        model_config=model_config,
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=4,
+            max_num_batched_tokens=16,
+            max_model_len=64,
+            is_encoder_decoder=False,
+        ),
+    )
+    model = _EmbeddingModel(32, model_config.get_inputs_embeds_size())
+    state = DefaultModelState(vllm_config, model, None, torch.device("cpu"))
+    before = dict(vars(state))
+
+    assert getattr(state, hook)(**kwargs) is expected
+    after = vars(state)
+    assert after.keys() == before.keys()
+    assert all(after[name] is value for name, value in before.items())
