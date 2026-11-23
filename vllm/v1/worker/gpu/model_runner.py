@@ -322,6 +322,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             device=self.device,
             num_prefill_lookahead=num_prefill_lookahead,
             use_dense_all_token_ids=use_dense_all_token_ids,
+            tracks_position_offset=self.applies_position_offset,
         )
 
         # Speculative decoding.
@@ -1460,11 +1461,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if scheduler_output.new_block_ids_to_zero:
             assert self.kv_block_zeroer is not None
             self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
-            # @spec PSTATE-PAGE-001, PSTATE-PAGE-002
-            if self.state_page_initializer is not None:
-                self.state_page_initializer.initialize(
-                    scheduler_output.new_block_ids_to_zero
-                )
+        # @spec PSTATE-PAGE-001
+        if scheduler_output.new_state_block_ids:
+            assert self.state_page_initializer is not None
+            self.state_page_initializer.initialize(scheduler_output.new_state_block_ids)
 
         # Apply copy-on-write block copies for partial prefix-cache hits, after
         # zeroing new blocks and before the forward pass reads them.

@@ -239,10 +239,10 @@ class ModelState(ABC):
     ) -> None:
         return None
 
-    def take_failed_requests(self) -> set[str]:
+    def take_failed_requests(self) -> set[str] | None:
         """Ids of the requests whose state this step could not advance,
         reported once; the runner asks after `postprocess_state`."""
-        return set()
+        return None
 
     @abstractmethod
     def prepare_inputs_embeds(

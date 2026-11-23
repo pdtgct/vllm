@@ -6,13 +6,17 @@ A state request's history is replaced, not appended, on each update; its pending
 inputs and undelivered turns are bounded; and a terminal finish ends the stream.
 """
 
+from collections import deque
+
 import numpy as np
 import pytest
 
-from vllm.exceptions import GenerationError
+from vllm.exceptions import GenerationError, RetryableRequestError
+from vllm.outputs import STREAM_FINISHED, RequestError
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tokenizers import get_tokenizer
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
+from vllm.v1.engine.exceptions import StreamError
 from vllm.v1.engine.output_processor import (
     OutputProcessor,
     StreamingInputOutputCollector,
@@ -33,6 +37,7 @@ def _input(
     prompt_token_ids: list[int],
     *,
     resumable: bool = True,
+    stream_admission: bool = False,
     **sampling_kwargs,
 ) -> EngineCoreRequest:
     sampling_kwargs.setdefault("detokenize", False)
@@ -50,6 +55,7 @@ def _input(
         cache_salt=None,
         data_parallel_rank=None,
         resumable=resumable,
+        stream_admission=stream_admission,
     )
 
 
@@ -99,6 +105,57 @@ def test_terminal_finish_ends_the_stream_instead_of_starting_the_next_turn():
     assert processor.get_num_unfinished_requests() == 0
     output = queue.get_nowait()
     assert output is not None and output.finished is True
+
+
+# @spec PSTATE-ADMIT-002 PSTATE-TURN-003
+def test_admission_closed_before_any_input_finishes_the_stream():
+    """An admission opens no input of its own, so a close that follows it at
+    once ends generation instead of waiting for a turn that never comes."""
+    processor = _processor()
+    queue = StreamingInputOutputCollector(RequestOutputKind.DELTA, "s")
+    processor.add_request(_input("s", [], stream_admission=True), None, queue=queue)
+
+    processor.add_request(_input("s", [0], resumable=False), None)
+
+    assert not processor.has_request("s")
+    assert queue.get_nowait() is STREAM_FINISHED
+
+
+# @spec PSTATE-ADMIT-010
+def test_admitted_streams_first_input_becomes_its_first_turn():
+    processor = _processor()
+    queue = StreamingInputOutputCollector(RequestOutputKind.DELTA, "s")
+    processor.add_request(_input("s", [], stream_admission=True), None, queue=queue)
+
+    processor.add_request(_input("s", [7, 8]), "ab")
+
+    state = processor.request_states["s"]
+    assert (state.prompt, state.prompt_token_ids, state.prompt_len) == ("ab", [7, 8], 2)
+    assert state.streaming_input and state.input_chunk_queue == deque()
+
+
+# @spec PSTATE-TURN-006 PSTATE-TURN-016
+def test_engine_error_codes_reach_the_client():
+    processor = _processor()
+    queue = _open(processor)
+
+    processor.process_outputs(
+        [
+            EngineCoreOutput(
+                request_id="s",
+                new_token_ids=[],
+                finish_reason=FinishReason.ERROR,
+                error=RequestError(code="input_after_close", message="late"),
+                terminal=True,
+            )
+        ]
+    )
+
+    assert not processor.has_request("s")
+    with pytest.raises(StreamError) as excinfo:
+        queue.get_nowait()
+    assert excinfo.value.code == "input_after_close"
+    assert not isinstance(excinfo.value, RetryableRequestError)
 
 
 # @spec PSTATE-HIST-005
@@ -270,8 +327,9 @@ def test_unread_turns_beyond_the_bound_finish_the_stream_with_a_named_error():
     with pytest.raises(GenerationError) as excinfo:
         queue.get_nowait()
     # Not retryable: a client that stopped reading has lost turns.
-    assert type(excinfo.value) is GenerationError
-    assert "output_backlog_limit" in str(excinfo.value)
+    assert not isinstance(excinfo.value, RetryableRequestError)
+    assert isinstance(excinfo.value, StreamError)
+    assert excinfo.value.code == "output_backlog_limit"
 
 
 # @spec PSTATE-HIST-011

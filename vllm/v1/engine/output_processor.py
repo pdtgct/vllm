@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Any, cast
 import numpy as np
 import torch
 
-from vllm.exceptions import GenerationError, VLLMValidationError
 from vllm.lora.request import LoRARequest
 from vllm.outputs import (
     STREAM_FINISHED,
@@ -34,7 +33,7 @@ from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.gc_utils import gc_untrack
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
-from vllm.v1.engine.exceptions import StreamAdmissionError
+from vllm.v1.engine.exceptions import StreamError
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import (
@@ -215,7 +214,6 @@ class RequestState:
         stream_input: bool = False,
         remote_prefill_cached_tokens: int | None = None,
         persistent_state: bool = False,
-        stream_admission: bool = False,
     ):
         self.request_id = request_id
         self.external_req_id = external_req_id
@@ -266,8 +264,6 @@ class RequestState:
         )
         # A persistent-state request's history is replaced on each update.
         self.persistent_state = persistent_state
-        # Opened by a stream admission; True until its first input arrives.
-        self.stream_admission = stream_admission
 
     def apply_streaming_update(self, update: StreamingUpdate) -> None:
         # Apply the update to the request state.
@@ -380,10 +376,11 @@ class RequestState:
             queue=queue,
             log_stats=log_stats,
             stream_interval=stream_interval,
-            stream_input=request.resumable,
+            # An admission opens no input of its own: it parks, as a request
+            # whose last input completed, until the stream's first input.
+            stream_input=request.resumable and not request.stream_admission,
             remote_prefill_cached_tokens=remote_prefill_cached_tokens,
             persistent_state=persistent_state,
-            stream_admission=request.stream_admission,
         )
         if state.stats is not None and sampling_params is not None:
             state.stats.is_watermarked = bool(sampling_params.watermarking)
@@ -764,12 +761,7 @@ class OutputProcessor:
             arrival_time=request.arrival_time,
         )
 
-        if req_state.stream_admission:
-            # The admission opened the state without an input: this is the
-            # first turn's input, not a queued update.
-            req_state.stream_admission = False
-            req_state.apply_streaming_update(update)
-        elif req_state.input_chunk_queue is None:
+        if req_state.input_chunk_queue is None:
             # Apply request updates now if the last input already completed.
             req_state.apply_streaming_update(update)
             req_state.input_chunk_queue = deque()
@@ -790,9 +782,10 @@ class OutputProcessor:
         self.lora_states.request_finished(req_state.request_id, req_state.lora_name)
         if req_state.queue is not None:
             req_state.queue.put(
-                GenerationError(
+                StreamError(
+                    code,
                     f"Stream {req_state.external_req_id} ended: {code} "
-                    f"({self.max_pending_stream_inputs} allowed)"
+                    f"({self.max_pending_stream_inputs} allowed)",
                 )
             )
 
@@ -835,12 +828,14 @@ class OutputProcessor:
             error = engine_core_output.error
             if error is not None and req_state.queue is not None:
                 # Rejected on arrival, e.g. by a paused engine; nothing was run.
-                exception = error.to_exception()
-                if req_state.stream_admission and not isinstance(
-                    exception, VLLMValidationError
+                exception: Exception = error.to_exception()
+                if (
+                    req_state.persistent_state
+                    and not error.retryable
+                    and error.code != "validation_error"
                 ):
-                    # @spec PSTATE-ADMIT-001: a refused admission names its reason.
-                    exception = StreamAdmissionError(error.code)
+                    # The stream ended with a code the client can act on.
+                    exception = StreamError(error.code, error.message)
                 req_state.queue.put(exception)
                 self._finish_request(req_state)
                 if req_state.streaming_input:
@@ -918,7 +913,7 @@ class OutputProcessor:
                 # if required.
                 req_state.logprobs_processor.update_from_output(engine_core_output)
 
-            # @spec PSTATE-TURN-003: a terminal finish ends the stream.
+            # @spec PSTATE-TURN-003 PSTATE-HIST-010
             streaming_chunk_boundary = (
                 req_state.streaming_input
                 and finish_reason not in (FinishReason.ABORT, FinishReason.ERROR)
@@ -931,7 +926,7 @@ class OutputProcessor:
                 and req_state.queue.num_pending_turns()
                 >= self.max_pending_stream_inputs
             ):
-                # @spec PSTATE-HIST-010: the client stopped reading turns.
+                # The client stopped reading turns.
                 self._end_stream(req_state, "output_backlog_limit")
                 reqs_to_abort.append(req_id)
                 self._update_stats_from_finished(

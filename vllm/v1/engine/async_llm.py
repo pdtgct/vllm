@@ -5,9 +5,9 @@ import itertools
 import os
 import socket
 import time
-from collections.abc import AsyncGenerator, Iterable, Iterator, Mapping
+from collections.abc import AsyncGenerator, Iterable, Mapping
 from copy import copy
-from functools import cached_property
+from functools import partial
 from typing import Any
 
 import msgspec
@@ -58,6 +58,7 @@ from vllm.transformers_utils.config import maybe_register_config_serialize_by_va
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.async_utils import cancel_task_threadsafe
 from vllm.utils.collection_utils import as_list
+from vllm.v1.core.sched.utils import unsupported_stream_sampling_parameter
 from vllm.v1.engine import CheckpointState, EngineCoreRequest, PauseMode
 from vllm.v1.engine.admission_control import SharedAdmissionStats
 from vllm.v1.engine.core_client import EngineCoreClient
@@ -96,6 +97,20 @@ def _unbind_retired_streams(
         external_req_id = internal_req_id.rsplit("-", 2)[0]
         if state_stream_ids.get(external_req_id) == internal_req_id:
             del state_stream_ids[external_req_id]
+
+
+def _is_empty_update(prompt: PromptType | EngineInput) -> bool:
+    """Whether a streaming update carries no tokens, text or features."""
+    if isinstance(prompt, str):
+        return not prompt
+    if isinstance(prompt, dict):
+        return not (
+            prompt.get("prompt")
+            or prompt.get("prompt_token_ids")
+            or prompt.get("multi_modal_data")
+            or prompt.get("prompt_embeds") is not None
+        )
+    return False
 
 
 class InputStreamError(Exception):
@@ -223,6 +238,16 @@ class AsyncLLM(EngineClient):
             client_index=client_index,
             renderer=renderer,
         )
+
+        # Persistent-state streams: this client's id counter, and the binding
+        # of each external id to the internal id of its current stream, which
+        # the engine core's retirements release.
+        self._state_stream_numbers = itertools.count(1)
+        self._state_stream_ids: dict[str, str] = {}
+        if self.model_config.has_persistent_state:
+            self.engine_core.stream_retired_callback = partial(
+                _unbind_retired_streams, self._state_stream_ids
+            )
 
         # Loggers.
         self.logger_manager: StatLoggerManager | None = None
@@ -639,30 +664,30 @@ class AsyncLLM(EngineClient):
             await self.engine_core.abort_requests_async([request.request_id])
             return
 
-        if request.stream_admission:
-            # @spec PSTATE-ADMIT-001: the engine admits the stream before any
-            # of its input is read, or names its reason.
-            try:
-                reason = await self.engine_core.admit_stream_async(request)
-            except BaseException:
-                self.output_processor.abort_requests(
-                    [request.request_id], internal=True
-                )
-                raise
-            if reason is not None:
-                self.output_processor.abort_requests(
-                    [request.request_id], internal=True
-                )
-                raise StreamAdmissionError(reason)
-            if self.log_requests:
-                logger.info("Admitted stream %s.", request.request_id)
-            return
-
         # Add the EngineCoreRequest to EngineCore (separate process).
         await self.engine_core.add_request_async(request)
 
         if self.log_requests:
             logger.info("Added request %s.", request.request_id)
+
+    async def _admit_stream(
+        self, admission: EngineCoreRequest, queue: RequestOutputCollector
+    ) -> None:
+        """Have the engine admit a persistent-state stream before any of its
+        input is read, or raise `StreamAdmissionError` with the reason."""
+        # @spec PSTATE-ADMIT-001
+        self.check_admission(request_id=admission.request_id)
+        self.output_processor.add_request(admission, None, None, 0, queue)
+        try:
+            reason = await self.engine_core.admit_stream_async(admission)
+        except BaseException:
+            self.output_processor.abort_requests([admission.request_id], internal=True)
+            raise
+        if reason is not None:
+            self.output_processor.abort_requests([admission.request_id], internal=True)
+            raise StreamAdmissionError(reason)
+        if self.log_requests:
+            logger.info("Admitted stream %s.", admission.request_id)
 
     async def _add_streaming_input_request(
         self,
@@ -682,11 +707,11 @@ class AsyncLLM(EngineClient):
         self._validate_resumable_request()
         state_stream = self.model_config.has_persistent_state
         if stream_admission and not state_stream:
-            # @spec PSTATE-ADMIT-011
+            # @spec PSTATE-ADMIT-011 PSTATE-ADMIT-006
             raise VLLMValidationError(
                 "stream_admission is not supported for this model"
             )
-        if state_stream:
+        if state_stream and isinstance(sampling_params, SamplingParams):
             self._validate_state_sampling_params(sampling_params, stream=True)
         self._validate_streaming_input_sampling_params(sampling_params)
 
@@ -715,7 +740,7 @@ class AsyncLLM(EngineClient):
             **inputs,  # type: ignore[arg-type]
         )
         if state_stream:
-            # @spec PSTATE-ADMIT-006: an id the engine never sees twice.
+            # An id the engine never sees twice.
             final_req.external_req_id = request_id
             final_req.request_id = (
                 f"{request_id}-{self.engine_core.client_index}-"
@@ -734,8 +759,6 @@ class AsyncLLM(EngineClient):
         # Ensure output handler is running.
         self._run_output_handler()
 
-        if state_stream:
-            self._state_stream_ids[request_id] = internal_req_id
         if stream_admission:
             # The admission carries the stream's parameters and no prompt; its
             # output state opens empty, so the first input is the first turn.
@@ -746,7 +769,11 @@ class AsyncLLM(EngineClient):
                 continuation=False,
                 stream_admission=True,
             )
-            await self._add_request(admission, None, None, 0, queue)
+            await self._admit_stream(admission, queue)
+        if state_stream:
+            # Bound once admitted. A live binding is never overwritten: the
+            # engine refuses the newcomer's id as in use.
+            self._state_stream_ids.setdefault(request_id, internal_req_id)
 
         async def handle_inputs():
             cancelled = False
@@ -761,9 +788,14 @@ class AsyncLLM(EngineClient):
                         internal_req_id
                     ):
                         break
+                    if state_stream and _is_empty_update(input_chunk.prompt):
+                        # @spec PSTATE-TURN-005 PSTATE-TURN-007: no turn.
+                        continue
                     sp = input_chunk.sampling_params
                     if sp:
-                        if state_stream:
+                        if state_stream and not any_added:
+                            # An update of a held stream is the scheduler's to
+                            # refuse, with the stream (PSTATE-DECL-014).
                             self._validate_state_sampling_params(sp, stream=True)
                         self._validate_streaming_input_sampling_params(sp)
                     else:
@@ -782,10 +814,6 @@ class AsyncLLM(EngineClient):
                             "prompt_embeds not supported for streaming inputs"
                         )
                     if state_stream:
-                        # @spec PSTATE-TURN-007: nothing to feed, so no turn.
-                        if not req.mm_features and not req.prompt_token_ids:
-                            continue
-                        # @spec PSTATE-TURN-005
                         req.continuation = any_added
                     prompt_text, _, _ = extract_prompt_components(
                         self.model_config, input_chunk.prompt
@@ -814,17 +842,6 @@ class AsyncLLM(EngineClient):
         queue._input_stream_task = asyncio.create_task(handle_inputs())
         return queue
 
-    @cached_property
-    def _state_stream_numbers(self) -> Iterator[int]:
-        """This client's counter for persistent-state stream ids."""
-        return itertools.count(1)
-
-    @cached_property
-    def _state_stream_ids(self) -> dict[str, str]:
-        """External id -> internal id of this client's current persistent-state
-        stream under it, until the engine retires the stream."""
-        return {}
-
     async def wait_stream_retired(self, request_id: str) -> None:
         """Return once the engine has retired the persistent-state stream
         opened under the external `request_id`, with any page it held back in
@@ -848,29 +865,12 @@ class AsyncLLM(EngineClient):
     def _validate_state_sampling_params(
         params: SamplingParams | PoolingParams, *, stream: bool
     ) -> None:
-        """Refuse sampling parameters a model with persistent state cannot
-        honour: its history lives in the state, not in the token sequence."""
-        # @spec PSTATE-DECL-007
+        """Refuse the sampling parameters a model with persistent state cannot
+        honour (PSTATE-DECL-007) before any input is consumed."""
         assert isinstance(params, SamplingParams)
-        refused = (
-            ("presence_penalty", params.presence_penalty != 0),
-            ("frequency_penalty", params.frequency_penalty != 0),
-            ("repetition_penalty", params.repetition_penalty != 1),
-            ("bad_words", bool(params.bad_words)),
-            ("structured_outputs", params.structured_outputs is not None),
-            ("prompt_logprobs", params.prompt_logprobs is not None),
-            ("thinking_token_budget", params.thinking_token_budget is not None),
-            ("n", params.n > 1),
-            (
-                f"output_kind {params.output_kind.name}",
-                stream and params.output_kind != RequestOutputKind.DELTA,
-            ),
-        )
-        for parameter, is_refused in refused:
-            if is_refused:
-                raise VLLMValidationError(
-                    f"{parameter} is not supported for this model"
-                )
+        parameter = unsupported_stream_sampling_parameter(params, stream=stream)
+        if parameter is not None:
+            raise VLLMValidationError(f"{parameter} is not supported for this model")
 
     @staticmethod
     def _validate_streaming_input_sampling_params(
@@ -1049,7 +1049,6 @@ class AsyncLLM(EngineClient):
         # P0 multi-modal sender ("shadow") cache; None for text-only models.
         mm_processor_cache = renderer.mm_processor_cache
         chunk_size = envs.VLLM_V1_OUTPUT_PROC_CHUNK_SIZE
-        state_stream_ids = self._state_stream_ids
 
         async def output_handler():
             try:
@@ -1057,11 +1056,6 @@ class AsyncLLM(EngineClient):
                     # 1) Pull EngineCoreOutputs from the EngineCore.
                     outputs = await engine_core.get_output_async()
                     num_outputs = len(outputs.outputs)
-                    if state_stream_ids and outputs.finished_requests:
-                        # Retired streams release their external ids.
-                        _unbind_retired_streams(
-                            state_stream_ids, outputs.finished_requests
-                        )
 
                     iteration_stats = (
                         IterationStats() if (log_stats and num_outputs) else None

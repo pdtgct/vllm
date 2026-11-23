@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
@@ -336,7 +337,11 @@ class SchedulerOutput:
     # Requests whose persistent-state page was allocated, and so initialized,
     # in this step; the model state reads page freshness from this set alone.
     # Empty for a model without persistent state.
-    new_state_page_req_ids: set[str] = field(default_factory=set)
+    new_state_page_req_ids: AbstractSet[str] = frozenset()
+    # The pages to initialize, by KV cache group id, for the state groups
+    # that allocated them in this step. None for a model without persistent
+    # state, and for a step that allocated no state page.
+    new_state_block_ids: dict[int, list[int]] | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

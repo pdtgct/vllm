@@ -17,6 +17,7 @@ class RequestState:
         device: torch.device,
         num_prefill_lookahead: int = 1,
         use_dense_all_token_ids: bool = False,
+        tracks_position_offset: bool = False,
     ):
         self.max_num_reqs = max_num_reqs
         self.max_model_len = max_model_len
@@ -64,7 +65,9 @@ class RequestState:
         # Optimistic CPU mirror of num_computed_tokens (upper bound on GPU value).
         self.num_computed_tokens_np = np.zeros(self.max_num_reqs, dtype=np.int32)
         # Tokens the scheduler dropped from a compacted streaming request;
-        # added to its positions, never to its lengths.
+        # added to its positions, never to its lengths. Staged only for a
+        # model that reads positions through it.
+        self.tracks_position_offset = tracks_position_offset
         self.position_offset = StagedWriteTensor(
             self.max_num_reqs, dtype=torch.int32, device=device
         )
@@ -119,7 +122,8 @@ class RequestState:
         self.num_computed_prefill_tokens[req_idx] = num_computed_tokens
         self.num_computed_tokens_np[req_idx] = num_computed_tokens
         self.num_computed_tokens.stage_write_elem(req_idx, num_computed_tokens)
-        self.position_offset.stage_write_elem(req_idx, position_offset)
+        if self.tracks_position_offset:
+            self.position_offset.stage_write_elem(req_idx, position_offset)
 
         if self.num_speculative_steps > 0:
             self.draft_tokens[req_idx].zero_()
@@ -130,7 +134,8 @@ class RequestState:
         self.total_len.apply_write()
         self.all_token_ids.apply_write()
         self.num_computed_tokens.apply_write()
-        self.position_offset.apply_write()
+        if self.tracks_position_offset:
+            self.position_offset.apply_write()
 
     def remove_request(self, req_id: str) -> int | None:
         """Return the freed slot index, or None if the request was not found."""

@@ -386,8 +386,16 @@ def _initialize_state_pages(
     """Have the step initialize the state pages its requests were given, as
     the scheduler does for pages it allocates."""
     # @spec PSTATE-PREP-005
-    if model_runner.state_page_initializer is not None and block_ids:
-        output.new_block_ids_to_zero = list(block_ids)
+    initializer = model_runner.state_page_initializer
+    if initializer is not None and block_ids:
+        output.new_state_block_ids = {
+            group_id: [
+                block_id
+                for req in output.scheduled_new_reqs
+                for block_id in req.block_ids[group_id]
+            ]
+            for group_id in initializer.group_ids
+        }
 
 
 def run_context_prefill_warmup(

@@ -107,15 +107,10 @@ def check_stop(
 ) -> bool:
     """Set the request's finished status if its last output token stops it.
 
-    Args:
-        request: The request whose last output token is checked.
-        max_model_len: The position limit.
-        position_offset: Positions the request's tokens dropped by
-            compaction occupy; counted against `max_model_len`.
-        length_before_eos: Check the position limit before EOS, so an EOS
-            sampled at the limit ends a persistent-state stream instead of
-            parking it. The per-turn `max_tokens` check stays after EOS.
-
+    `position_offset` counts the positions compaction dropped against
+    `max_model_len`. `length_before_eos` checks that limit before EOS, so an
+    EOS sampled at the limit ends a persistent-state stream instead of
+    parking it; the per-turn `max_tokens` check stays after EOS.
     """
     assert not request.pooling_params
 

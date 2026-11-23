@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import math
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import InitVar
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self, cast
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal, Self, cast
 
 from pydantic import Field, field_validator
 
@@ -299,7 +298,9 @@ class SchedulerConfig:
     output backlog may hold. An input or turn beyond the bound ends the
     stream. A model without persistent state makes no use of this option."""
 
-    stream_admission_timeouts: dict[str, float] = Field(
+    stream_admission_timeouts: dict[
+        str, Annotated[float, Field(gt=0, allow_inf_nan=False)]
+    ] = Field(
         default_factory=lambda: dict(SchedulerConfig.DEFAULT_STREAM_ADMISSION_TIMEOUTS)
     )
     """Seconds a stream of a model with persistent state may stay in a state
@@ -310,10 +311,8 @@ class SchedulerConfig:
     - `parked_idle_timeout` (60.0): parked, waiting for its next input.
     - `draining_timeout` (40.0): unfinished after its input closed.
 
-    Each value must be a finite, positive number. A model without persistent
-    state makes no use of this option.
-
-    On the command line this is a JSON object, e.g.
+    A model without persistent state makes no use of this option. On the
+    command line this is a JSON object, e.g.
     `--stream-admission-timeouts '{"never_fed_timeout": 30}'`."""
 
     @staticmethod
@@ -400,33 +399,18 @@ class SchedulerConfig:
         """Skip validation if the value is `None` when initialisation is delayed."""
         return None if value is None else handler(value)
 
-    @field_validator("stream_admission_timeouts", mode="before")
+    @field_validator("stream_admission_timeouts")
     @classmethod
-    def _validate_stream_admission_timeouts(cls, value: Any) -> dict[str, float]:
-        if not isinstance(value, Mapping):
+    def _complete_stream_admission_timeouts(
+        cls, value: dict[str, float]
+    ) -> dict[str, float]:
+        defaults = cls.DEFAULT_STREAM_ADMISSION_TIMEOUTS
+        if unknown := value.keys() - defaults.keys():
             raise ValueError(
-                "stream_admission_timeouts must be a mapping of timeout names "
-                f"to seconds, got {value!r}"
+                f"Unknown stream admission timeouts {sorted(unknown)}; expected "
+                f"keys among {sorted(defaults)}"
             )
-        timeouts = dict(cls.DEFAULT_STREAM_ADMISSION_TIMEOUTS)
-        for key, seconds in value.items():
-            if key not in timeouts:
-                raise ValueError(
-                    f"Unknown stream admission timeout {key!r}; expected one of "
-                    f"{sorted(timeouts)}"
-                )
-            if (
-                isinstance(seconds, bool)
-                or not isinstance(seconds, (int, float))
-                or not math.isfinite(seconds)
-                or seconds <= 0
-            ):
-                raise ValueError(
-                    f"Stream admission timeout {key!r} must be a finite, "
-                    f"positive number of seconds, got {seconds!r}"
-                )
-            timeouts[key] = float(seconds)
-        return timeouts
+        return {**defaults, **value}
 
     def __post_init__(self, max_model_len: int, is_encoder_decoder: bool) -> None:
         if is_encoder_decoder:

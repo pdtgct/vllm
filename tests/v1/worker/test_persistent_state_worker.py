@@ -45,8 +45,10 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request
 from vllm.v1.worker import gpu_worker
 from vllm.v1.worker.extensible_kv_cache import ExtensibleKVCache
+from vllm.v1.worker.gpu import warmup
 from vllm.v1.worker.gpu.input_batch import prepare_pos_seq_lens
 from vllm.v1.worker.gpu.model_runner import ExecuteModelState, GPUModelRunner
+from vllm.v1.worker.utils import StatePageInitializer
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA"
@@ -124,6 +126,72 @@ def test_state_metadata_marks_a_single_token_prefill_as_holding_initial_state():
     assert metadata.num_prefills == 1
     assert metadata.has_initial_states_p is not None
     assert metadata.has_initial_states_p.tolist() == [True]
+
+
+def _two_state_groups():
+    """Two state groups of one layer each, whose pages are separate CPU
+    tensors; the second declares initial values, the first takes zeros."""
+    first = MambaManager.layer_config(_state_spec(), recomputable=False)
+    second = MambaManager.layer_config(
+        _state_spec(initial_values=(5, 7)), recomputable=False
+    )
+    kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[
+            new_kv_cache_group(["a"], first),
+            new_kv_cache_group(["b"], second),
+        ]
+    )
+    context = {
+        name: SimpleNamespace(
+            kv_cache=[torch.full((4, 1), -1, dtype=torch.int64) for _ in range(2)]
+        )
+        for name in ("a", "b")
+    }
+    return kv_cache_config, context
+
+
+# @spec PSTATE-PAGE-001
+def test_initializer_writes_each_groups_values_into_its_own_pages_only():
+    kv_cache_config, context = _two_state_groups()
+    initializer = StatePageInitializer.from_kv_cache_config(
+        torch.device("cpu"), kv_cache_config, context
+    )
+    assert initializer is not None and initializer.group_ids == [0, 1]
+
+    initializer.initialize({0: [1], 1: [2, 3]})
+
+    a_total, a_count = (t[:, 0].tolist() for t in context["a"].kv_cache)
+    b_total, b_count = (t[:, 0].tolist() for t in context["b"].kv_cache)
+    assert (a_total, a_count) == ([-1, 0, -1, -1], [-1, 0, -1, -1])
+    assert (b_total, b_count) == ([-1, -1, 5, 5], [-1, -1, 7, 7])
+
+
+# @spec PSTATE-PAGE-001
+def test_initializer_is_none_without_a_state_group():
+    kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[new_kv_cache_group(["m"], _state_spec())]
+    )
+    initializer = StatePageInitializer.from_kv_cache_config(
+        torch.device("cpu"), kv_cache_config, {}
+    )
+    assert initializer is None
+
+
+# @spec PSTATE-PREP-005
+def test_warmup_initializes_each_groups_pages_from_its_requests_blocks():
+    output = SchedulerOutput.make_empty()
+    output.scheduled_new_reqs = [
+        SimpleNamespace(block_ids=([1], [2, 3])),
+        SimpleNamespace(block_ids=([4], [5])),
+    ]
+    model_runner = SimpleNamespace(
+        state_page_initializer=SimpleNamespace(group_ids=[1])
+    )
+
+    warmup._initialize_state_pages(model_runner, output, range(1, 6))
+
+    assert output.new_state_block_ids == {1: [2, 3, 5]}
+    assert output.new_block_ids_to_zero is None
 
 
 # @spec PSTATE-PAGE-006
@@ -567,13 +635,20 @@ def test_serving_capture_does_not_clear_the_model_state_graphs(monkeypatch):
     assert events == [("capture", False)]
 
 
-def _waking_core(*, fully_awake: bool):
+def _waking_core(*, fully_awake: bool, was_sleeping: bool = True):
+    """A core whose executor is asleep at level 1 or above when `was_sleeping`
+    and, after a wake, asleep still unless `fully_awake`."""
     calls: list[str] = []
     core = _pausable_engine_core_proc()
     core.scheduler.has_unrecomputable_state = True
     core.scheduler.held_state_streams.return_value = []
-    core.model_executor.is_sleeping = not fully_awake
-    core.model_executor.wake_up.side_effect = lambda tags: calls.append("wake_up")
+    core.model_executor.is_sleeping = was_sleeping
+
+    def wake_up(tags):
+        calls.append("wake_up")
+        core.model_executor.is_sleeping = not fully_awake
+
+    core.model_executor.wake_up.side_effect = wake_up
     core.model_executor.collective_rpc.side_effect = lambda method, *args, **kwargs: (
         calls.append(method)
     )
@@ -603,11 +678,22 @@ def test_partial_wake_does_not_recapture():
 
 # @spec PSTATE-PREP-009
 def test_light_wake_keeps_captured_graphs():
-    core, calls = _waking_core(fully_awake=True)
+    core, calls = _waking_core(fully_awake=True, was_sleeping=False)
 
     EngineCore.wake_up(core, ["scheduling"])
 
     assert calls == ["resume"]
+
+
+# @spec PSTATE-PREP-009
+@pytest.mark.parametrize("tags", [None, ["weights", "kv_cache"]])
+def test_wake_of_an_awake_executor_does_not_recapture(tags):
+    """After a level-0 sleep, or a repeated wake, nothing was remapped."""
+    core, calls = _waking_core(fully_awake=True, was_sleeping=False)
+
+    EngineCore.wake_up(core, tags)
+
+    assert calls == ["wake_up", "resume"]
 
 
 # @spec PSTATE-PREP-006
@@ -622,6 +708,11 @@ def test_checkpoint_restore_recaptures_after_the_kv_cache_wakes():
     core.scheduler.get_kv_connector.return_value = None
     core.checkpoint_prepare("wait")
     core.model_executor.reset_mock()
+    # Preparing released the KV cache; the restore's wake maps it again.
+    core.model_executor.is_sleeping = True
+    core.model_executor.wake_up.side_effect = lambda tags: setattr(
+        core.model_executor, "is_sleeping", False
+    )
 
     core.checkpoint_restore()
 
@@ -635,11 +726,17 @@ def test_checkpoint_restore_recaptures_after_the_kv_cache_wakes():
 # Bounded history
 
 
+SHARED_OBJECT_MODULES = ("vllm.config", "vllm.tokenizers", "transformers", "tokenizers")
+"""Objects every request shares, which a walk stops at: they are not a
+request's retained history, and they reach the rest of the engine."""
+
+
 def retained_bytes(*roots, exclude=()) -> int:
     """Host bytes reachable from `roots`, not through `exclude`: `sys.getsizeof`
     of every object, plus the whole backing storage of each tensor and NumPy
     array once, deduplicated by address, so a small view that keeps a large
-    buffer alive counts the buffer."""
+    buffer alive counts the buffer. The walk stops at classes, modules,
+    functions and the shared config and tokenizer objects."""
     seen: set[int] = {id(obj) for obj in exclude}
     storages: dict[int, int] = {}
     total = 0
@@ -653,7 +750,11 @@ def retained_bytes(*roots, exclude=()) -> int:
     )
     while stack:
         obj = stack.pop()
-        if id(obj) in seen or isinstance(obj, skipped):
+        if (
+            id(obj) in seen
+            or isinstance(obj, skipped)
+            or type(obj).__module__.startswith(SHARED_OBJECT_MODULES)
+        ):
             continue
         seen.add(id(obj))
         total += sys.getsizeof(obj)
@@ -670,8 +771,14 @@ def retained_bytes(*roots, exclude=()) -> int:
     return total + sum(storages.values())
 
 
-NUM_TURNS = 10_000
-CALIBRATION_TURNS = 64
+NUM_TURNS = 1024
+"""Turns each stream runs; enough that history growth of even a few bytes a
+turn would show, while the test runs in seconds."""
+MEASURE_EVERY = 8
+"""Turns between two walks of the retained structures."""
+CALIBRATION_SAMPLES = 16
+"""Walks that set each structure's bound; they cover every input and output
+length, whose cycles are shorter than the turns they span."""
 MAX_INPUT = 24
 MAX_OUTPUT = 8
 READ_EVERY = 4
@@ -687,15 +794,18 @@ def _output_len(turn: int) -> int:
 
 
 def _check_bounded(sizes: dict[str, list[int]]) -> None:
-    """Each structure stays within twice its size over the first turns, which
-    cover every input and output length."""
+    """Each structure stays within twice its size over the first walks."""
     for name, structure_sizes in sizes.items():
-        bound = 2 * max(structure_sizes[:CALIBRATION_TURNS]) + 4096
+        bound = 2 * max(structure_sizes[:CALIBRATION_SAMPLES]) + 4096
         assert max(structure_sizes) <= bound, (
-            f"{name} retained {max(structure_sizes)} bytes after "
-            f"{len(structure_sizes)} turns; {bound} after the first "
-            f"{CALIBRATION_TURNS}"
+            f"{name} retained {max(structure_sizes)} bytes by the last of "
+            f"{len(structure_sizes)} walks; {bound} after the first "
+            f"{CALIBRATION_SAMPLES}"
         )
+
+
+def _measured(turn: int) -> bool:
+    return turn % MEASURE_EVERY == MEASURE_EVERY - 1
 
 
 # @spec PSTATE-HIST-008
@@ -720,7 +830,7 @@ def test_retained_bytes_detects_a_planted_growing_buffer(backing):
     dtype = torch.uint8 if backing == "tensor" else np.uint8
     kept: list = []
     sizes = []
-    for turn in range(CALIBRATION_TURNS * 8):
+    for turn in range(CALIBRATION_SAMPLES * 16):
         kept[:] = [zeros(64 * (turn + 1), dtype=dtype)[:1]]
         sizes.append(retained_bytes(kept))
 
@@ -768,12 +878,13 @@ def test_output_processor_history_stays_bounded_over_many_turns():
                 )
             ]
         )
-        state = processor.request_states["stream"]
-        sizes["request state"].append(
-            retained_bytes(state, exclude=(state.queue, state.input_chunk_queue))
-        )
-        sizes["input queue"].append(retained_bytes(state.input_chunk_queue))
-        sizes["output backlog"].append(retained_bytes(queue))
+        if _measured(turn):
+            state = processor.request_states["stream"]
+            sizes["request state"].append(
+                retained_bytes(state, exclude=(state.queue, state.input_chunk_queue))
+            )
+            sizes["input queue"].append(retained_bytes(state.input_chunk_queue))
+            sizes["output backlog"].append(retained_bytes(queue))
         if turn % READ_EVERY == READ_EVERY - 1:
             while queue.get_nowait() is not None:
                 pass
@@ -822,10 +933,11 @@ def test_scheduler_request_history_stays_bounded_over_many_turns(monkeypatch):
     }
     for turn in range(NUM_TURNS):
         scheduler.add_request(_stream_input(turn))
+        measured = _measured(turn)
         resent = 0
         for step in range(_output_len(turn)):
             output = scheduler.schedule()
-            if step == 0:
+            if step == 0 and measured:
                 resent = retained_bytes(
                     output.scheduled_new_reqs, output.scheduled_cached_reqs
                 )
@@ -834,6 +946,8 @@ def test_scheduler_request_history_stays_bounded_over_many_turns(monkeypatch):
                 output,
                 ModelRunnerOutput(req_ids=["stream"], sampled_token_ids=[[token]]),
             )
+        if not measured:
+            continue
         request = scheduler.requests["stream"]
         sizes["request"].append(
             retained_bytes(request, exclude=(request.streaming_queue,))

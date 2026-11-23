@@ -8,7 +8,10 @@ shared, uninitialized or doubly written state changes the tokens.
 """
 
 import asyncio
+import gc
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -40,9 +43,28 @@ def _engine_kwargs(arch: str = STUB_ARCH, **hf_overrides) -> dict:
         load_format="dummy",
         max_model_len=256,
         max_num_seqs=2,
-        # The null block plus one 16-byte state page per running request.
+        # The null block plus one 16-byte state page per running request. The
+        # cap is load-bearing: sized from device memory, a 16-byte page gives
+        # a block count in the billions, and the scheduler's block pool holds
+        # one host object per block.
         num_gpu_blocks_override=3,
     )
+
+
+def _shutdown(llm: LLM) -> None:
+    """End the engine core this `LLM` started, then drop the object."""
+    llm.llm_engine.engine_core.shutdown()
+    del llm
+    gc.collect()
+
+
+@contextmanager
+def _llm(**kwargs) -> Iterator[LLM]:
+    llm = LLM(**kwargs)
+    try:
+        yield llm
+    finally:
+        _shutdown(llm)
 
 
 def _register_no_warmup_arch() -> None:
@@ -53,18 +75,20 @@ def _register_no_warmup_arch() -> None:
         )
 
 
-def _in_process_llm(arch: str = STUB_ARCH, **kwargs) -> LLM:
-    """An engine in this process, so a test can read the stub's `EVENTS`."""
+@contextmanager
+def _in_process_llm(arch: str = STUB_ARCH, **kwargs) -> Iterator[LLM]:
+    """An engine in this process, so a test can read the stub's `EVENTS`.
+
+    The block-count override stays under an extensible KV cache: the sizing
+    steps still run, and the override bounds the measured block count.
+    """
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     _register_no_warmup_arch()
     stub.EVENTS.clear()
     stub.PREFILL_STARTS.clear()
     engine_kwargs = _engine_kwargs(arch, stub_initial_total=INITIAL_TOTAL)
-    if kwargs.get("enable_extensible_kv_cache"):
-        # An extensible cache is sized from measured memory, which a block
-        # count override would replace.
-        del engine_kwargs["num_gpu_blocks_override"]
-    return LLM(**engine_kwargs, **kwargs)
+    with _llm(**engine_kwargs, **kwargs) as llm:
+        yield llm
 
 
 def _requires_extensible_kv_cache() -> None:
@@ -129,14 +153,14 @@ def test_llm_reuses_slots_from_a_fresh_state(enforce_eager, initial_total):
     """Six prompts through two slots: each produces the tokens of a page that
     holds its initial values, so a reused slot never carries its previous
     owner's sum."""
-    llm = LLM(
+    with _llm(
         **_engine_kwargs(stub_initial_total=initial_total),
         enforce_eager=enforce_eager,
-    )
-    vocab_size = llm.llm_engine.model_config.get_vocab_size()
-    prompts = [[11 * i + 1, 11 * i + 2, 11 * i + 3] for i in range(6)]
-    params = SamplingParams(temperature=0, max_tokens=MAX_TOKENS)
-    outputs = llm.generate([{"prompt_token_ids": p} for p in prompts], params)
+    ) as llm:
+        vocab_size = llm.llm_engine.model_config.get_vocab_size()
+        prompts = [[11 * i + 1, 11 * i + 2, 11 * i + 3] for i in range(6)]
+        params = SamplingParams(temperature=0, max_tokens=MAX_TOKENS)
+        outputs = llm.generate([{"prompt_token_ids": p} for p in prompts], params)
     assert [without_eos(output.outputs[0].token_ids) for output in outputs] == [
         expected_turns([prompt], vocab_size, initial_total=initial_total)[0]
         for prompt in prompts
@@ -238,14 +262,14 @@ async def test_positions_stay_absolute_across_compacted_turns():
 # @spec PSTATE-FAIL-001
 @create_new_process_for_each_test("spawn")
 def test_model_reported_failure_ends_only_its_request():
-    llm = LLM(**_engine_kwargs())
-    vocab_size = llm.llm_engine.model_config.get_vocab_size()
-    params = SamplingParams(temperature=0, max_tokens=MAX_TOKENS)
-    healthy = [1, 2, 3]
-    failing = [4, stub.FAIL_TOKEN, 6]
-    outputs = llm.generate(
-        [{"prompt_token_ids": healthy}, {"prompt_token_ids": failing}], params
-    )
+    with _llm(**_engine_kwargs()) as llm:
+        vocab_size = llm.llm_engine.model_config.get_vocab_size()
+        params = SamplingParams(temperature=0, max_tokens=MAX_TOKENS)
+        healthy = [1, 2, 3]
+        failing = [4, stub.FAIL_TOKEN, 6]
+        outputs = llm.generate(
+            [{"prompt_token_ids": healthy}, {"prompt_token_ids": failing}], params
+        )
     assert outputs[0].outputs[0].finish_reason == "stop"
     assert (
         without_eos(outputs[0].outputs[0].token_ids)
@@ -258,8 +282,8 @@ def test_model_reported_failure_ends_only_its_request():
 @create_new_process_for_each_test("spawn")
 def test_startup_runs_no_request_through_a_model_that_declines_warmup():
     _requires_extensible_kv_cache()
-    _in_process_llm(NO_WARMUP_ARCH, enable_extensible_kv_cache=True)
-    assert [event for event in stub.EVENTS if event[0] == "add"] == []
+    with _in_process_llm(NO_WARMUP_ARCH, enable_extensible_kv_cache=True):
+        assert [event for event in stub.EVENTS if event[0] == "add"] == []
 
 
 # @spec PSTATE-PREP-001
@@ -268,49 +292,54 @@ def test_startup_warms_up_a_model_that_accepts_it():
     """The control of the test above: the same startup does run warmup
     requests through a model that accepts them."""
     _requires_extensible_kv_cache()
-    _in_process_llm(enable_extensible_kv_cache=True)
-    assert [event for event in stub.EVENTS if event[0] == "add"] != []
+    with _in_process_llm(enable_extensible_kv_cache=True):
+        assert [event for event in stub.EVENTS if event[0] == "add"] != []
 
 
 # @spec PSTATE-PREP-005
 @create_new_process_for_each_test("spawn")
 def test_warmup_requests_read_initialized_pages():
     _requires_extensible_kv_cache()
-    llm = _in_process_llm(enable_extensible_kv_cache=True)
-    assert stub.PREFILL_STARTS
-    assert set(stub.PREFILL_STARTS) == {INITIAL_TOTAL}
-    del llm
+    with _in_process_llm(enable_extensible_kv_cache=True):
+        assert stub.PREFILL_STARTS
+        assert set(stub.PREFILL_STARTS) == {INITIAL_TOTAL}
 
 
 # @spec PSTATE-PREP-004 PSTATE-PREP-008
 @create_new_process_for_each_test("spawn")
 def test_engine_is_ready_after_the_model_state_is_prepared_and_captured():
-    llm = _in_process_llm()
-    assert stub.EVENTS.count(("prepare_execution_memory",)) == 1
-    assert ("capture", False) in stub.EVENTS
-    adds = [i for i, event in enumerate(stub.EVENTS) if event[0] == "add"]
-    assert all(i > stub.EVENTS.index(("prepare_execution_memory",)) for i in adds)
-    assert llm.llm_engine.engine_core.engine_core.is_inference_ready()
+    with _in_process_llm() as llm:
+        assert stub.EVENTS.count(("prepare_execution_memory",)) == 1
+        assert ("capture", False) in stub.EVENTS
+        adds = [i for i, event in enumerate(stub.EVENTS) if event[0] == "add"]
+        prepared = stub.EVENTS.index(("prepare_execution_memory",))
+        assert all(i > prepared for i in adds)
+        assert llm.llm_engine.engine_core.engine_core.is_inference_ready()
 
 
 # @spec PSTATE-PREP-006
 @create_new_process_for_each_test("spawn")
 def test_full_wake_after_deep_sleep_recaptures_model_state_graphs_once():
-    llm = _in_process_llm(enable_sleep_mode=True)
-    ready = len(stub.EVENTS)
-    llm.sleep(level=1)
-    llm.wake_up(tags=["weights"])
-    assert stub.EVENTS[ready:] == []
-    llm.wake_up(tags=["kv_cache"])
-    assert stub.EVENTS[ready:] == [("clear",), ("capture", False)]
+    with _in_process_llm(enable_sleep_mode=True) as llm:
+        ready = len(stub.EVENTS)
+        llm.sleep(level=1)
+        llm.wake_up(tags=["weights"])
+        assert stub.EVENTS[ready:] == []
+        llm.wake_up(tags=["kv_cache"])
+        assert stub.EVENTS[ready:] == [("clear",), ("capture", False)]
+        # A wake of an awake engine remaps nothing.
+        llm.wake_up()
+        assert stub.EVENTS[ready:] == [("clear",), ("capture", False)]
 
 
 # @spec PSTATE-PREP-009
 @create_new_process_for_each_test("spawn")
 def test_light_sleep_and_cache_reset_keep_model_state_graphs():
-    llm = _in_process_llm(enable_sleep_mode=True)
-    ready = len(stub.EVENTS)
-    llm.sleep(level=0)
-    llm.wake_up(tags=["scheduling"])
-    assert llm.reset_prefix_cache()
-    assert stub.EVENTS[ready:] == []
+    with _in_process_llm(enable_sleep_mode=True) as llm:
+        ready = len(stub.EVENTS)
+        llm.sleep(level=0)
+        llm.wake_up(tags=["scheduling"])
+        assert llm.reset_prefix_cache()
+        llm.sleep(level=0)
+        llm.wake_up()
+        assert stub.EVENTS[ready:] == []

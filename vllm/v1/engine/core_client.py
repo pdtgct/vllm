@@ -1239,8 +1239,10 @@ class AsyncMPClient(MPClient):
         self.client_count = client_count
         self.client_index = client_index
         self.outputs_queue = asyncio.Queue[EngineCoreOutputs | Exception]()
-        # Waits for a persistent-state stream's retirement, by request id.
+        # Waits for a persistent-state stream's retirement, by request id, and
+        # the frontend's callback for every retired request id.
         self._retirement_waiters: dict[str, asyncio.Future[None]] = {}
+        self.stream_retired_callback: Callable[[Iterable[str]], None] | None = None
 
         # locally-cached engine status
         self._engine_status: dict[int, dict] = {}
@@ -1326,10 +1328,16 @@ class AsyncMPClient(MPClient):
                             return
                         await output_handler(_self, outputs)
 
-                    if retirement_waiters and outputs.finished_requests:
-                        _resolve_retirement_waiters(
-                            retirement_waiters, outputs.finished_requests
-                        )
+                    if outputs.finished_requests:
+                        if retirement_waiters:
+                            _resolve_retirement_waiters(
+                                retirement_waiters, outputs.finished_requests
+                            )
+                        # Here, not in the frontend's output handler: a batch
+                        # that carries only finished ids is dropped below.
+                        _self = _self_ref()
+                        if _self is not None and _self.stream_retired_callback:
+                            _self.stream_retired_callback(outputs.finished_requests)
                     if outputs.outputs or outputs.scheduler_stats:
                         outputs_queue.put_nowait(outputs)
             except Exception as e:

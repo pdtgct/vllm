@@ -8,16 +8,25 @@ Scheduler-side rules run on a real scheduler whose only KV cache group is one
 """
 
 import asyncio
+import itertools
 import queue
 import re
+import time
 from collections import deque
+from functools import partial
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
 
 from tests.v1.core.test_persistent_state_scheduler import declare_state_facts
-from tests.v1.core.utils import EOS_TOKEN_ID, create_requests, create_scheduler
+from tests.v1.core.utils import (
+    EOS_TOKEN_ID,
+    create_requests,
+    create_scheduler,
+    new_kv_cache_group,
+)
 from vllm import ModelRegistry
 from vllm.config import (
     ECTransferConfig,
@@ -38,6 +47,7 @@ from vllm.sampling_params import (
     StructuredOutputsParams,
 )
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.core.kv_cache_utils import verify_persistent_state_groups
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.engine import EngineCoreRequest, EngineCoreRequestType, FinishReason
@@ -49,7 +59,7 @@ from vllm.v1.engine.core import (
     EngineShutdownState,
 )
 from vllm.v1.engine.exceptions import StreamAdmissionError
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, MambaSpec
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 
@@ -199,18 +209,54 @@ def test_state_model_accepts_async_scheduling_and_cuda_graphs():
     assert config.scheduler_config.async_scheduling is True
 
 
+def _state_group(spec: MambaSpec | None = None):
+    layer = MambaManager.layer_config(spec or _state_spec(), recomputable=False)
+    return new_kv_cache_group(["state"], layer)
+
+
+def _attention_group():
+    return new_kv_cache_group(
+        ["attn"],
+        AttentionSpec(block_size=64, num_kv_heads=1, head_size=1, dtype=torch.float32),
+    )
+
+
+def _verify_groups(*groups, declared: bool = True) -> None:
+    """The engine's startup check over `groups`, for a model that declares
+    `SupportsPersistentState` when `declared`."""
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(has_persistent_state=declared)
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=4, kv_cache_tensors=[], kv_cache_groups=list(groups)
+    )
+    verify_persistent_state_groups(vllm_config, kv_cache_config)
+
+
 # @spec PSTATE-DECL-003
 def test_state_group_refuses_other_mamba_types():
     spec = _state_spec(mamba_type=MambaAttentionBackendEnum.SHORT_CONV)
     with pytest.raises(ValueError, match="PERSISTENT_STATE"):
-        MambaManager.layer_config(spec, recomputable=False)
+        _verify_groups(_state_group(spec))
 
 
 # @spec PSTATE-DECL-009
 def test_state_group_refuses_initial_values_of_the_wrong_length():
-    spec = _state_spec(initial_values=(0, 1))
     with pytest.raises(ValueError, match="initial_values"):
-        MambaManager.layer_config(spec, recomputable=False)
+        _verify_groups(_state_group(_state_spec(initial_values=(0, 1))))
+
+
+# @spec PSTATE-DECL-004 PSTATE-DECL-013
+def test_state_declaration_and_state_groups_must_agree():
+    """A model has a state group if and only if it declares persistent state,
+    so every PSTATE check keys on one fact."""
+    _verify_groups(_state_group(), declared=True)
+    _verify_groups(_attention_group(), _state_group(), declared=True)
+    _verify_groups(_attention_group(), declared=False)
+    with pytest.raises(ValueError, match="SupportsPersistentState"):
+        _verify_groups(_attention_group(), declared=True)
+    with pytest.raises(ValueError, match="SupportsPersistentState"):
+        _verify_groups(_state_group(), declared=False)
 
 
 # @spec PSTATE-HIST-006 PSTATE-HIST-007
@@ -260,10 +306,17 @@ def _state_llm(monkeypatch: pytest.MonkeyPatch, mm_features=None) -> AsyncLLM:
         lambda model_config, prompt: ("", None, None),
     )
     llm.output_handler = None
+    llm.log_requests = False
     llm.observability_config = MagicMock(otlp_traces_endpoint=None)
     llm.vllm_config = MagicMock(is_mm_encoder_only=False)
     llm.vllm_config.cache_config.kv_sharing_fast_prefill = False
+    llm.vllm_config.parallel_config.enable_fault_tolerance = False
+    llm.scheduler_config = MagicMock(
+        max_num_queued_reqs=None, max_num_queued_tokens=None
+    )
     llm.model_config = MagicMock(is_diffusion=False, has_persistent_state=True)
+    llm._state_stream_numbers = itertools.count(1)
+    llm._state_stream_ids = {}
     llm.engine_core = MagicMock(client_index=3)
     llm.engine_core.resources.engine_dead = False
     llm.engine_core.admit_stream_async = AsyncMock(return_value=None)
@@ -508,6 +561,28 @@ async def test_wait_stream_retired_resolves_only_when_core_retires_the_stream(
     llm.engine_core.wait_stream_retired_async.assert_awaited_once_with(queue.request_id)
 
 
+# @spec PSTATE-ADMIT-005 PSTATE-ADMIT-012
+@pytest.mark.asyncio
+async def test_refused_admission_keeps_the_live_streams_binding(monkeypatch):
+    """Opening a second stream under a held external id is refused by the
+    engine; the first stream keeps the binding `wait_stream_retired` uses."""
+    llm = _state_llm(monkeypatch)
+    live = await _open_stream(llm, "ext", _chunks([1]))
+    llm.engine_core.admit_stream_async.return_value = "request_id_in_use"
+
+    with pytest.raises(StreamAdmissionError):
+        await llm._add_streaming_input_request(
+            "ext",
+            _chunks([1]),
+            SamplingParams(max_tokens=4, output_kind=DELTA),
+            stream_admission=True,
+        )
+
+    assert llm._state_stream_ids["ext"] == live.request_id
+    await llm.wait_stream_retired("ext")
+    llm.engine_core.wait_stream_retired_async.assert_awaited_once_with(live.request_id)
+
+
 # @spec PSTATE-ADMIT-005
 @pytest.mark.asyncio
 async def test_wait_stream_retired_resolves_at_once_for_an_unknown_id(monkeypatch):
@@ -558,8 +633,41 @@ async def test_empty_update_never_reaches_the_output_processor_or_engine(
 async def test_update_with_only_features_is_forwarded(monkeypatch):
     feature = MagicMock(spec=MultiModalFeatureSpec)
     llm = _state_llm(monkeypatch, mm_features=[feature])
-    await _open_stream(llm, "ext", _chunks([1], []))
+
+    async def chunks():
+        yield StreamingInput(prompt=TokensPrompt(prompt_token_ids=[1]))
+        yield StreamingInput(
+            prompt=TokensPrompt(
+                prompt_token_ids=[], multi_modal_data={"audio": object()}
+            )
+        )
+
+    await _open_stream(llm, "ext", chunks())
     assert len(_sent(llm)) == 3
+
+
+# @spec PSTATE-DECL-014
+@pytest.mark.asyncio
+async def test_unsupported_update_of_a_held_stream_is_left_to_the_scheduler(
+    monkeypatch,
+):
+    """Only the opening parameters are validated here; an update's are the
+    scheduler's to refuse, ending the stream with a named code."""
+    llm = _state_llm(monkeypatch)
+
+    async def chunks():
+        yield StreamingInput(prompt=TokensPrompt(prompt_token_ids=[1]))
+        yield StreamingInput(
+            prompt=TokensPrompt(prompt_token_ids=[2]),
+            sampling_params=SamplingParams(
+                presence_penalty=0.5, max_tokens=4, output_kind=DELTA
+            ),
+        )
+
+    queue = await _open_stream(llm, "ext", chunks())
+
+    assert [request.prompt_token_ids for request in _sent(llm)] == [[1], [2], [0]]
+    assert queue.get_nowait() is None
 
 
 # Scheduler-side stream rules
@@ -712,20 +820,22 @@ class _Clock:
 
 
 def _clocked_scheduler(monkeypatch: pytest.MonkeyPatch, **kwargs):
+    """A state scheduler and the monotonic clock its deadlines run on."""
     scheduler = _state_scheduler(monkeypatch, **kwargs)
-    scheduler.clock = _Clock()
-    return scheduler
+    clock = _Clock()
+    monkeypatch.setattr(time, "monotonic", clock)
+    return scheduler, clock
 
 
 # @spec PSTATE-ADMIT-007
 def test_never_fed_stream_is_aborted_after_its_deadline(monkeypatch):
-    scheduler = _clocked_scheduler(monkeypatch)
+    scheduler, clock = _clocked_scheduler(monkeypatch)
     request = _stream_request("s", 0)
     scheduler.admit_stream(request)
 
-    scheduler.clock.now += 14.9
+    clock.now += 14.9
     assert scheduler.sweep_stream_deadlines() == []
-    scheduler.clock.now += 0.2
+    clock.now += 0.2
     assert scheduler.sweep_stream_deadlines() == [request]
     assert request.status == RequestStatus.FINISHED_ABORTED
     assert request.stop_reason == "never_fed_timeout"
@@ -733,12 +843,12 @@ def test_never_fed_stream_is_aborted_after_its_deadline(monkeypatch):
 
 # @spec PSTATE-ADMIT-007
 def test_parked_stream_is_aborted_after_its_idle_deadline(monkeypatch):
-    scheduler = _clocked_scheduler(monkeypatch)
+    scheduler, clock = _clocked_scheduler(monkeypatch)
     request = _park(scheduler, "s")
 
-    scheduler.clock.now += 59.9
+    clock.now += 59.9
     assert scheduler.sweep_stream_deadlines() == []
-    scheduler.clock.now += 0.2
+    clock.now += 0.2
     assert scheduler.sweep_stream_deadlines() == [request]
     assert request.status == RequestStatus.FINISHED_ABORTED
     assert request.stop_reason == "parked_idle_timeout"
@@ -748,15 +858,15 @@ def test_parked_stream_is_aborted_after_its_idle_deadline(monkeypatch):
 def test_stream_unfinished_after_close_is_aborted_after_its_draining_deadline(
     monkeypatch,
 ):
-    scheduler = _clocked_scheduler(monkeypatch)
+    scheduler, clock = _clocked_scheduler(monkeypatch)
     request = _stream_request("s")
     scheduler.add_request(request)
     scheduler.schedule()
     scheduler.add_request(_stream_request("s", 1, resumable=False, continuation=True))
 
-    scheduler.clock.now += 39.9
+    clock.now += 39.9
     assert scheduler.sweep_stream_deadlines() == []
-    scheduler.clock.now += 0.2
+    clock.now += 0.2
     assert scheduler.sweep_stream_deadlines() == [request]
     assert request.stop_reason == "draining_timeout"
 
@@ -764,17 +874,17 @@ def test_stream_unfinished_after_close_is_aborted_after_its_draining_deadline(
 # @spec PSTATE-ADMIT-009
 @pytest.mark.parametrize("pause_state", [PauseState.PAUSED_NEW, PauseState.PAUSED_ALL])
 def test_deadlines_do_not_advance_while_paused(monkeypatch, pause_state):
-    scheduler = _clocked_scheduler(monkeypatch)
+    scheduler, clock = _clocked_scheduler(monkeypatch)
     request = _stream_request("s", 0)
     scheduler.admit_stream(request)
 
-    scheduler.clock.now += 10
+    clock.now += 10
     scheduler.set_pause_state(pause_state)
-    scheduler.clock.now += 500
+    clock.now += 500
     scheduler.set_pause_state(PauseState.UNPAUSED)
 
     assert scheduler.sweep_stream_deadlines() == []
-    scheduler.clock.now += 5.1
+    clock.now += 5.1
     assert scheduler.sweep_stream_deadlines() == [request]
 
 
@@ -812,6 +922,8 @@ def _state_core(held: list[str] | None = None) -> EngineCoreProc:
     scheduler.has_unrecomputable_state = True
     scheduler.has_requests.return_value = False
     scheduler.has_request.return_value = False
+    scheduler.stream_id_in_use.return_value = False
+    scheduler.stream_finish_outputs = []
     scheduler.held_state_streams.side_effect = lambda: list(held)
     scheduler.pause_state = PauseState.UNPAUSED
 
@@ -840,6 +952,7 @@ def _state_core(held: list[str] | None = None) -> EngineCoreProc:
     core.reject_new_requests = False
     core.shutdown_state = EngineShutdownState.RUNNING
     core._idle_state_callbacks = []
+    core.output_queue = queue.Queue()
     core._send_finish_outputs_to_client = MagicMock()
     core._send_abort_outputs_to_client = MagicMock()
     core.held = held
@@ -919,6 +1032,69 @@ def test_opener_whose_external_id_a_held_stream_has_is_refused(monkeypatch):
     req_ids, client_index, reason, error = _refusal(core)
     assert (req_ids, client_index, reason) == (["ext-1-2"], 1, FinishReason.ERROR)
     assert error.code == "request_id_in_use"
+
+
+# @spec PSTATE-ADMIT-012
+def test_opener_whose_internal_id_a_held_stream_has_is_refused(monkeypatch):
+    core = _state_core()
+    core.scheduler = _state_scheduler(monkeypatch)
+    held = _stream_request("s")
+    core.scheduler.add_request(held)
+    opener = _stream_request("s")
+    opener.client_index = 1
+
+    core._handle_client_request(EngineCoreRequestType.ADD, (opener, 0))
+
+    assert core.scheduler.requests["s"] is held
+    req_ids, client_index, reason, error = _refusal(core)
+    assert (req_ids, client_index, reason) == (["s"], 1, FinishReason.ERROR)
+    assert error.code == "request_id_in_use"
+
+
+# @spec PSTATE-TURN-006 PSTATE-TURN-013
+def test_paused_engine_still_refuses_unknown_continuations_by_name():
+    """A paused engine's retryable refusal does not replace `stream_not_found`,
+    and an unknown close signal still draws no output."""
+    core = _state_core()
+    core.reject_new_requests = True
+
+    _add(core, continuation=True)
+    *_, error = _refusal(core)
+    assert error.code == "stream_not_found"
+
+    core._send_finish_outputs_to_client.reset_mock()
+    _add(core, continuation=True, resumable=False)
+    core._send_finish_outputs_to_client.assert_not_called()
+    core._send_abort_outputs_to_client.assert_not_called()
+
+
+# @spec PSTATE-ADMIT-014
+def test_stream_ended_by_an_input_is_reported_before_a_later_refusal(monkeypatch):
+    """An input that ends its stream between steps reports that at once, so
+    a later input's refusal in the same drain cannot overtake it."""
+    core = _state_core()
+    core.scheduler = _state_scheduler(monkeypatch)
+    core._send_finish_outputs_to_client = partial(
+        EngineCoreProc._send_finish_outputs_to_client, core
+    )
+
+    def add(request):
+        request.client_index = 1
+        core._handle_client_request(EngineCoreRequestType.ADD, (request, 0))
+
+    add(_stream_request("s"))
+    core.scheduler.schedule()
+    add(_stream_request("s", 1, resumable=False, continuation=True))
+    add(_stream_request("s", 1, continuation=True))
+    add(_stream_request("t", 1, continuation=True))
+
+    sent = [core.output_queue.get_nowait() for _ in range(2)]
+    assert core.output_queue.empty()
+    assert [
+        (client_index, outputs.finished_requests, outputs.outputs[0].error.code)
+        for client_index, outputs in sent
+    ] == [(1, ["s"], "input_after_close"), (1, ["t"], "stream_not_found")]
+    assert all(outputs.outputs[0].terminal for _, outputs in sent[:1])
 
 
 # @spec PSTATE-ADMIT-001
@@ -1020,6 +1196,9 @@ def test_draining_clearing_pause_refuses_admissions_then_rechecks_when_idle():
     with pytest.raises(RuntimeError, match="stream-1"):
         future.result(timeout=0)
     core.scheduler.reset_prefix_cache.assert_not_called()
+    # The refusal leaves the engine as it was before the pause.
+    assert core.scheduler.pause_state == PauseState.UNPAUSED
+    assert core.reject_new_requests is False
 
 
 def _pause_abort(core):
@@ -1060,7 +1239,9 @@ def test_sleep_level_zero_is_allowed_while_a_stream_is_held(mode):
 
 
 # @spec PSTATE-ADMIT-008
-def test_deadlines_are_swept_after_the_input_drain_and_before_the_work_check():
+def test_deadlines_are_swept_after_the_input_drain_and_before_the_step():
+    """The sweep is the last thing before the loop hands over to the step,
+    after every queued input has been handled."""
     core = _state_core()
     events = []
     core._deferred_inputs = deque()
@@ -1069,11 +1250,11 @@ def test_deadlines_are_swept_after_the_input_drain_and_before_the_work_check():
     core.process_input_queue_block = True
     core._handle_client_request = lambda *args: events.append("input")
     core._sweep_stream_deadlines = lambda: events.append("sweep")
-    core.has_work = lambda: events.append("work") or True
+    core.has_work = lambda: True
 
     core._process_input_queue()
 
-    assert events.index("input") < events.index("sweep") < events.index("work")
+    assert events == ["input", "sweep"]
 
 
 def _idle_core(core: EngineCoreProc) -> EngineCoreProc:
@@ -1114,6 +1295,24 @@ def test_ordinary_engine_iterations_traverse_no_deadlines():
     assert call.kwargs.get("timeout") is None
     core.scheduler.sweep_stream_deadlines.assert_not_called()
     core.scheduler.next_stream_deadline.assert_not_called()
+
+
+# @spec PSTATE-ADMIT-007
+def test_abort_outputs_name_the_deadline_that_expired():
+    core = _state_core()
+    expired = MagicMock(
+        request_id="s", client_index=1, stop_reason="parked_idle_timeout"
+    )
+
+    core._send_abort_outputs([expired])
+
+    client_index, outputs = core.output_queue.get_nowait()
+    assert (client_index, outputs.finished_requests) == (1, ["s"])
+    [output] = outputs.outputs
+    assert (output.finish_reason, output.stop_reason) == (
+        FinishReason.ABORT,
+        "parked_idle_timeout",
+    )
 
 
 # @spec PSTATE-ADMIT-007

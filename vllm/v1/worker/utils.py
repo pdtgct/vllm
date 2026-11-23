@@ -259,12 +259,18 @@ class KVBlockZeroer:
 
 
 class StatePageInitializer:
-    """Writes a state group's declared initial values into newly allocated
-    pages, so a request reads valid state on its first forward."""
+    """Writes each state group's declared initial values into the pages newly
+    allocated to that group, so a request reads valid state on its first
+    forward. Groups may overlay one memory, so a group's values go only into
+    its own pages."""
 
-    def __init__(self, device: torch.device, pages: list[tuple[torch.Tensor, Any]]):
+    def __init__(
+        self,
+        device: torch.device,
+        pages_by_group: dict[int, list[tuple[torch.Tensor, Any]]],
+    ):
         self.device = device
-        self._pages = pages
+        self._pages_by_group = pages_by_group
 
     @classmethod
     def from_kv_cache_config(
@@ -273,27 +279,33 @@ class StatePageInitializer:
         kv_cache_config: KVCacheConfig,
         static_forward_context: dict[str, Any],
     ) -> "StatePageInitializer | None":
-        """The initializer of every non-recomputable `MambaSpec` layer, or
-        `None` when the model has no such layer."""
-        pages: list[tuple[torch.Tensor, Any]] = []
-        for group in kv_cache_config.kv_cache_groups:
+        """The initializer of every non-recomputable `MambaSpec` group, or
+        `None` when the model has no such group."""
+        pages_by_group: dict[int, list[tuple[torch.Tensor, Any]]] = {}
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
             if group.manager_config.recomputable:
                 continue
+            pages = pages_by_group[group_id] = []
             for layer_name, spec in group.kv_cache_specs.items():
                 assert isinstance(spec, MambaSpec)
                 states = static_forward_context[layer_name].kv_cache
                 values = spec.initial_values or (0,) * len(spec.shapes)
                 assert len(states) == len(values)
                 pages.extend(zip(states, values))
-        return cls(device, pages) if pages else None
+        return cls(device, pages_by_group) if pages_by_group else None
 
-    def initialize(self, block_ids: list[int]) -> None:
-        """Write the initial values into the pages of `block_ids`."""
-        if not block_ids:
-            return
-        idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
-        for state, value in self._pages:
-            state.index_fill_(0, idx, value)
+    @property
+    def group_ids(self) -> list[int]:
+        return list(self._pages_by_group)
+
+    def initialize(self, block_ids_by_group: dict[int, list[int]]) -> None:
+        """Write each group's initial values into its pages `block_ids`."""
+        for group_id, block_ids in block_ids_by_group.items():
+            if not block_ids:
+                continue
+            idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
+            for state, value in self._pages_by_group[group_id]:
+                state.index_fill_(0, idx, value)
 
 
 @dataclass(eq=False, slots=True)
