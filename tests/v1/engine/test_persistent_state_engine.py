@@ -818,10 +818,15 @@ async def test_state_stream_keeps_its_structured_outputs(monkeypatch, case):
         num_inputs = 1 + len(updates)
         await _until(lambda: len(_sent(llm)) == num_inputs + 1, "inputs and close")
         # Every input carries the opener's constraint as validation left it.
-        first, *rest = (
-            r.sampling_params.structured_outputs for r in _sent(llm)[:num_inputs]
+        expected = (
+            StructuredOutputsParams(grammar='root ::= "yes" | "no"')
+            if case in ("same_choice", "reused_choice")
+            else StructuredOutputsParams(regex="a+")
         )
-        assert all(same_structured_outputs(first, so) for so in rest)
+        sent = [r.sampling_params.structured_outputs for r in _sent(llm)[:num_inputs]]
+        assert all(
+            so is not None and same_structured_outputs(so, expected) for so in sent
+        )
 
 
 REFUSED_SAMPLING_PARAMETERS = [
