@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from vllm.config.kv_events import KVEventsConfig
     from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorBase
     from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
+    from vllm.outputs import RequestError
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.engine import EngineCoreOutputs
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -39,7 +40,7 @@ class SchedulerInterface(ABC):
     # Persistent state: the default describes an ordinary model, for which the
     # engine core calls none of the state-stream members below.
     has_unrecomputable_state: bool = False
-    ended_state_streams: "list[Request]"
+    ended_state_streams: "list[tuple[Request, RequestError | None]]"
 
     @abstractmethod
     def __init__(
@@ -160,6 +161,10 @@ class SchedulerInterface(ABC):
     def admit_stream(self, request: "Request") -> str | None:
         """Admit a persistent-state stream before any input, holding it
         parked, or return the refusal reason having changed nothing."""
+        raise NotImplementedError
+
+    def stream_admission_refusal(self) -> str | None:
+        """Why a new persistent-state stream cannot be admitted now, or None."""
         raise NotImplementedError
 
     def open_stream(self, request: "Request") -> str | None:

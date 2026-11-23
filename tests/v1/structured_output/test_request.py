@@ -5,7 +5,10 @@
 from concurrent.futures import Future
 
 from vllm.sampling_params import StructuredOutputsParams
-from vllm.v1.structured_output.request import StructuredOutputRequest
+from vllm.v1.structured_output.request import (
+    StructuredOutputRequest,
+    same_structured_outputs,
+)
 
 
 def _request_with_future(fut: Future) -> StructuredOutputRequest:
@@ -28,3 +31,32 @@ def test_grammar_compile_raising_timeout_error_is_a_failure():
     req = _request_with_future(fut)
     assert req.is_grammar_ready
     assert isinstance(req.grammar, TimeoutError)
+
+
+# @spec PSTATE-DECL-007
+def test_same_structured_outputs_ignores_the_backend_validation_records():
+    a = StructuredOutputsParams(regex="a+")
+    b = StructuredOutputsParams(regex="a+")
+    b._backend = "xgrammar"
+    b._backend_was_auto = True
+    assert a != b
+    assert same_structured_outputs(a, b)
+
+
+# @spec PSTATE-DECL-007
+def test_same_structured_outputs_compares_the_constraint():
+    assert not same_structured_outputs(
+        StructuredOutputsParams(json='{"type": "object"}'),
+        StructuredOutputsParams(json='{"type": "string"}'),
+    )
+    assert not same_structured_outputs(
+        StructuredOutputsParams(regex="a+"), StructuredOutputsParams(choice=["a"])
+    )
+
+
+# @spec PSTATE-DECL-007
+def test_same_structured_outputs_with_none():
+    params = StructuredOutputsParams(regex="a+")
+    assert same_structured_outputs(None, None)
+    assert not same_structured_outputs(None, params)
+    assert not same_structured_outputs(params, None)

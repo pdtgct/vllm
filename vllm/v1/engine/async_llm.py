@@ -83,6 +83,7 @@ from vllm.v1.metrics.loggers import (
 )
 from vllm.v1.metrics.prometheus import shutdown_prometheus
 from vllm.v1.metrics.stats import IterationStats
+from vllm.v1.structured_output.request import same_structured_outputs
 
 logger = init_logger(__name__)
 
@@ -700,6 +701,14 @@ class AsyncLLM(EngineClient):
             kv_hints=kv_hints,
         )
 
+        # Validation below rewrites structured outputs in place, so inputs
+        # are compared with the caller's constraint, copied first.
+        opener = sampling_params
+        opener_structured_outputs = (
+            copy(sampling_params.structured_outputs)
+            if isinstance(sampling_params, SamplingParams)
+            else None
+        )
         if not sampling_params.skip_clone:
             sampling_params = sampling_params.clone()
             sampling_params.skip_clone = True
@@ -762,9 +771,10 @@ class AsyncLLM(EngineClient):
                             # @spec PSTATE-DECL-007 PSTATE-TURN-020
                             if (
                                 isinstance(sp, SamplingParams)
-                                and isinstance(sampling_params, SamplingParams)
-                                and sp.structured_outputs
-                                != sampling_params.structured_outputs
+                                and sp is not opener
+                                and not same_structured_outputs(
+                                    sp.structured_outputs, opener_structured_outputs
+                                )
                             ):
                                 raise VLLMValidationError(
                                     "structured_outputs cannot change within a stream",

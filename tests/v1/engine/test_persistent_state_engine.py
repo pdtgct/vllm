@@ -23,7 +23,10 @@ import torch
 
 import vllm.v1.engine.async_llm as async_llm_module
 import vllm.v1.worker.gpu.sample.logits_processor.loader as logits_loader
-from tests.v1.core.test_persistent_state_scheduler import declare_state_facts
+from tests.v1.core.test_persistent_state_scheduler import (
+    _ReadyGrammar,
+    declare_state_facts,
+)
 from tests.v1.core.utils import (
     EOS_TOKEN_ID,
     create_requests,
@@ -74,6 +77,7 @@ from vllm.v1.engine.exceptions import EngineDeadError, StreamAdmissionError
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, MambaSpec
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
+from vllm.v1.structured_output.request import same_structured_outputs
 from vllm.v1.worker.gpu.sample.logits_processor.interface import LogitsProcessor
 
 DELTA = RequestOutputKind.DELTA
@@ -756,31 +760,54 @@ async def test_input_with_prompt_embeddings_ends_the_stream(monkeypatch, with_to
     assert _stream_id(llm) in _aborted(llm)
 
 
+def _validate_structured_outputs_in_place(llm: AsyncLLM) -> None:
+    """Make the mocked input processor record the backend on the structured
+    outputs it receives, as real validation does."""
+    process_inputs = llm.input_processor.process_inputs.side_effect
+
+    def validating(*, params, **kwargs):
+        if params.structured_outputs is not None:
+            params.structured_outputs._backend = "xgrammar"
+            params.structured_outputs._backend_was_auto = True
+        return process_inputs(params=params, **kwargs)
+
+    llm.input_processor.process_inputs.side_effect = validating
+
+
 # @spec PSTATE-DECL-007 PSTATE-TURN-020
 @pytest.mark.asyncio
-@pytest.mark.parametrize("changed", [False, True], ids=["same", "changed"])
-async def test_state_stream_keeps_its_structured_outputs(monkeypatch, changed):
+@pytest.mark.parametrize("case", ["same", "opener_object", "changed"])
+async def test_state_stream_keeps_its_structured_outputs(monkeypatch, case):
     llm = _state_llm(monkeypatch)
-    opened = StructuredOutputsParams(regex="a+")
-    later = StructuredOutputsParams(regex="b+") if changed else opened
+    _validate_structured_outputs_in_place(llm)
+    opener = _params(structured_outputs=StructuredOutputsParams(regex="a+"))
+    if case == "opener_object":
+        later = opener
+    else:
+        # Constructed apart from the opener's and not yet validated.
+        later = _params(
+            structured_outputs=StructuredOutputsParams(
+                regex="b+" if case == "changed" else "a+"
+            )
+        )
     update = StreamingInput(
-        prompt=TokensPrompt(prompt_token_ids=[2]),
-        sampling_params=_params(structured_outputs=later),
+        prompt=TokensPrompt(prompt_token_ids=[2]), sampling_params=later
     )
 
-    if changed:
+    if case == "changed":
         with pytest.raises(VLLMValidationError, match="structured_outputs"):
-            await _consume(
-                llm, _chunks([1], update), _params(structured_outputs=opened)
-            )
+            await _consume(llm, _chunks([1], update), opener)
         assert _sent_prompts(llm) == [[1]]
     else:
-        await _open(llm, _chunks([1], update), _params(structured_outputs=opened))
+        await _open(llm, _chunks([1], update), opener)
         await _until(lambda: len(_sent(llm)) == 3, "two inputs and the close")
-        assert [r.sampling_params.structured_outputs for r in _sent(llm)[:2]] == [
-            opened,
-            opened,
-        ]
+        assert all(
+            same_structured_outputs(
+                r.sampling_params.structured_outputs,
+                StructuredOutputsParams(regex="a+"),
+            )
+            for r in _sent(llm)[:2]
+        )
 
 
 REFUSED_SAMPLING_PARAMETERS = [
@@ -1776,11 +1803,14 @@ def test_abort_of_a_single_request_or_an_ordinary_stream_publishes_nothing(
     assert core.output_queue.published == []
 
 
-STRUCTURED = SamplingParams(
-    max_tokens=4,
-    output_kind=DELTA,
-    structured_outputs=StructuredOutputsParams(regex="a+"),
-)
+def _structured_params(backend: str | None = None) -> SamplingParams:
+    """Parameters whose structured outputs are built anew on each call; a
+    `backend` is recorded as validation records it."""
+    structured_outputs = StructuredOutputsParams(regex="a+")
+    structured_outputs._backend = backend
+    return SamplingParams(
+        max_tokens=4, output_kind=DELTA, structured_outputs=structured_outputs
+    )
 
 
 def _no_tokens(request_id: str = "s", continuation: bool = False):
@@ -1799,9 +1829,14 @@ def _with_embeddings(request_id: str = "s", continuation: bool = False):
     return request
 
 
-def _with_structured_outputs(request_id: str = "s", continuation: bool = False):
+def _with_structured_outputs(
+    request_id: str = "s", continuation: bool = False, backend: str | None = None
+):
     request = _stream_request(
-        request_id, 2, continuation=continuation, sampling_params=STRUCTURED
+        request_id,
+        2,
+        continuation=continuation,
+        sampling_params=_structured_params(backend),
     )
     assert request.use_structured_output
     return request
@@ -1866,7 +1901,8 @@ def test_feature_input_with_placeholder_tokens_is_applied(monkeypatch):
 
 
 # @spec PSTATE-TURN-020 PSTATE-ADMIT-018
-def test_opener_with_structured_outputs_opens_the_stream(monkeypatch):
+@pytest.mark.parametrize("compiled", ["pending", "failed"])
+def test_opener_with_structured_outputs_waits_for_its_grammar(monkeypatch, compiled):
     core, _ = _live_core(monkeypatch)
 
     _add(core, _with_structured_outputs())
@@ -1874,26 +1910,45 @@ def test_opener_with_structured_outputs_opens_the_stream(monkeypatch):
     held = core.scheduler.requests["s"]
     assert held.use_structured_output
     assert held in core.scheduler.resumed_streaming_sessions
+    assert held.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
     assert core.output_queue.published == []
+
+    if compiled == "pending":
+        assert "s" not in core.scheduler.schedule().num_scheduled_tokens
+        assert held.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
+    else:
+        held.structured_output_request.grammar = ValueError("bad schema")
+        outputs = _step(core.scheduler, [], [])
+        [output] = [o for eco in outputs.values() for o in eco.outputs]
+        assert (output.request_id, output.finish_reason, output.terminal) == (
+            "s",
+            FinishReason.ERROR,
+            True,
+        )
+        assert output.error is not None and output.error.code == "validation_error"
+        assert not core.scheduler.has_request("s")
 
 
 # @spec PSTATE-TURN-019 PSTATE-TURN-020
-@pytest.mark.parametrize("same", [True, False], ids=["same", "changed"])
-def test_continuation_must_keep_the_streams_structured_outputs(monkeypatch, same):
+@pytest.mark.parametrize("case", ["same", "backend_differs", "changed"])
+def test_continuation_must_keep_the_streams_structured_outputs(monkeypatch, case):
     core, free_pages = _live_core(monkeypatch)
-    request = _with_structured_outputs()
+    request = _with_structured_outputs(backend="xgrammar")
     core.scheduler.add_request(request)
 
-    if same:
-        _add(core, _with_structured_outputs(continuation=True))
-        assert core.output_queue.published == []
-        assert core.scheduler.has_request("s")
-    else:
+    if case == "changed":
         _add(core, _update("s", 2))
         assert request.status == RequestStatus.FINISHED_ERROR
         _assert_ended_after_free(
             core, free_pages, FinishReason.ERROR, "validation_error"
         )
+    else:
+        # An equal constraint built apart from the stream's; validation records
+        # its backend in place, so that can differ.
+        backend = "xgrammar" if case == "same" else None
+        _add(core, _with_structured_outputs(continuation=True, backend=backend))
+        assert core.output_queue.published == []
+        assert core.scheduler.has_request("s")
 
 
 # @spec PSTATE-TURN-006
@@ -2107,6 +2162,88 @@ def test_admit_stream_returns_the_first_refusal_in_order(monkeypatch, held, reas
         _hold_kind(core, "parked")
     _paused_and_full(core)
     assert core.admit_stream(_admission()) == reason
+
+
+def _structured_core_request(continuation: bool = False) -> EngineCoreRequest:
+    request = _core_request("s", [3, 4], resumable=True, client_index=1)
+    request.sampling_params = _structured_params()
+    request.continuation = continuation
+    return request
+
+
+def _spy_on_grammar_init(core: EngineCoreProc) -> MagicMock:
+    core.structured_output_manager = MagicMock()
+    return core.structured_output_manager.grammar_init
+
+
+# @spec PSTATE-ADMIT-022 PSTATE-ADMIT-001
+@pytest.mark.parametrize(
+    "refusal", [_admit_paused, _admit_full], ids=["paused", "full"]
+)
+def test_refused_admission_compiles_no_grammar(monkeypatch, refusal):
+    core, _ = _live_core(monkeypatch, max_num_seqs=1)
+    grammar_init = _spy_on_grammar_init(core)
+    refusal(core)
+    admission = _structured_core_request()
+    admission.prompt_token_ids = []
+
+    reason = core.admit_stream(admission)
+
+    assert reason == ("engine_paused" if refusal is _admit_paused else "active_limit")
+    grammar_init.assert_not_called()
+    assert not core.scheduler.has_request("s")
+
+
+# @spec PSTATE-ADMIT-022 PSTATE-ADMIT-001
+def test_accepted_admission_compiles_its_grammar(monkeypatch):
+    core, _ = _live_core(monkeypatch)
+    grammar_init = _spy_on_grammar_init(core)
+    admission = _structured_core_request()
+    admission.prompt_token_ids = []
+
+    assert core.admit_stream(admission) is None
+
+    grammar_init.assert_called_once()
+    assert core.scheduler.has_request("s")
+
+
+# @spec PSTATE-TURN-020
+@pytest.mark.parametrize("continuation", [False, True], ids=["opener", "continuation"])
+def test_only_an_opener_compiles_a_grammar_in_preprocessing(monkeypatch, continuation):
+    core, _ = _live_core(monkeypatch)
+    grammar_init = _spy_on_grammar_init(core)
+
+    req, _ = core.preprocess_add_request(_structured_core_request(continuation))
+
+    assert req.use_structured_output
+    if continuation:
+        grammar_init.assert_not_called()
+    else:
+        grammar_init.assert_called_once_with(req)
+
+
+# @spec PSTATE-TURN-015 PSTATE-TURN-020 PSTATE-PAGE-004
+@pytest.mark.parametrize("compiled", ["ready", "failed"])
+def test_close_publishes_the_streams_grammar_failure(monkeypatch, compiled):
+    core, free_pages = _live_core(monkeypatch)
+    held = _stream_request("s", 0, sampling_params=_structured_params())
+    assert core.scheduler.admit_stream(held) is None
+    held.structured_output_request.grammar = (
+        ValueError("bad schema") if compiled == "failed" else _ReadyGrammar()
+    )
+
+    _add(core, _close())
+
+    if compiled == "failed":
+        assert held.status == RequestStatus.FINISHED_ERROR
+        _assert_ended_after_free(
+            core, free_pages, FinishReason.ERROR, "validation_error"
+        )
+    else:
+        assert held.status == RequestStatus.FINISHED_STOPPED
+        output = _assert_ended_after_free(core, free_pages, FinishReason.STOP)
+        assert output.error is None
+    assert core.scheduler.ended_state_streams == []
 
 
 def _reject(core: EngineCoreProc, request: EngineCoreRequest) -> None:

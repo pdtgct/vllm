@@ -638,6 +638,9 @@ class EngineCore:
         if self.scheduler.has_request(request.request_id):
             self._end_held_stream(request.request_id, RequestStatus.FINISHED_ERROR)
             return "duplicate_request_id"
+        # Refuse before preprocessing, which starts compiling any grammar.
+        if (reason := self.scheduler.stream_admission_refusal()) is not None:
+            return reason
         if request.prompt_token_ids is None:
             # A utility call carries no packed prompt; the first input brings one.
             request.prompt_token_ids = []
@@ -1366,7 +1369,8 @@ class EngineCore:
         req = Request.from_engine_core_request(
             request, self.request_block_hasher, frontend_hashes
         )
-        if req.use_structured_output:
+        # A continuation keeps its stream's grammar, so it compiles none.
+        if req.use_structured_output and not request.continuation:
             # Note on thread safety: no race condition.
             # `grammar_init` is only invoked in input processing thread. For
             # `structured_output_manager`, each request is independent and
@@ -2065,8 +2069,8 @@ class EngineCoreProc(EngineCore):
             if self.scheduler.has_unrecomputable_state:
                 # @spec PSTATE-PAGE-004: published at this ADD's boundary.
                 ended = self.scheduler.ended_state_streams
-                for stream in ended:
-                    self._send_terminal_output(stream)
+                for stream, error in ended:
+                    self._send_terminal_output(stream, error)
                 ended.clear()
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)

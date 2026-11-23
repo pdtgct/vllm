@@ -74,6 +74,20 @@ class StructuredOutputRequest:
         return get_structured_output_key(self.params)
 
 
+def same_structured_outputs(
+    a: StructuredOutputsParams | None, b: StructuredOutputsParams | None
+) -> bool:
+    """Whether `a` and `b` set the same constraint. Compares the fields a
+    caller sets, not the backend that validation records in place."""
+    if a is None or b is None:
+        return a is b
+    return all(
+        getattr(a, f.name) == getattr(b, f.name)
+        for f in dataclasses.fields(a)
+        if not f.name.startswith("_")
+    )
+
+
 def get_structured_output_key(params: StructuredOutputsParams) -> StructuredOutputKey:
     if params.json is not None:
         if not isinstance(params.json, str):

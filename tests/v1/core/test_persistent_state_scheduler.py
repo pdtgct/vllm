@@ -835,7 +835,7 @@ def test_close_after_max_tokens_stop_takes_its_status_from_where_it_waits(
         assert turn_end.terminal is False
         scheduler.add_request(close("s"))
         # The engine core publishes this stream's terminal output.
-        assert scheduler.ended_state_streams == [request]
+        assert scheduler.ended_state_streams == [(request, None)]
     else:
         assert (turn_end.finish_reason, turn_end.terminal) == (
             FinishReason.LENGTH,
@@ -888,6 +888,68 @@ def test_first_input_of_an_admitted_stream_waits_for_its_grammar(monkeypatch, co
         assert (output.finish_reason, output.terminal) == (FinishReason.ERROR, True)
         assert output.error is not None and output.error.code == "validation_error"
         assert "s" not in scheduler.requests
+
+
+def structured_stream_input(req_id: str, num_tokens: int, **kwargs) -> Request:
+    request = stream_input(req_id, num_tokens, **kwargs)
+    request.sampling_params = SamplingParams(
+        max_tokens=100,
+        output_kind=RequestOutputKind.DELTA,
+        structured_outputs=StructuredOutputsParams(regex="a+"),
+    )
+    request.structured_output_request = StructuredOutputRequest.from_sampling_params(
+        request.sampling_params
+    )
+    return request
+
+
+# @spec PSTATE-TURN-015 PSTATE-TURN-020
+@pytest.mark.parametrize("compiled", ["ready", "failed"])
+def test_close_of_a_stream_whose_grammar_failed_ends_it_with_an_error(
+    monkeypatch, compiled
+):
+    scheduler = make_scheduler(monkeypatch)
+    admission = structured_stream_input("s", 0)
+    assert scheduler.admit_stream(admission) is None
+    admission.structured_output_request.grammar = (
+        ValueError("bad schema") if compiled == "failed" else _ReadyGrammar()
+    )
+
+    scheduler.add_request(close("s"))
+
+    [(ended, error)] = scheduler.ended_state_streams
+    assert ended is admission
+    if compiled == "failed":
+        assert admission.status == RequestStatus.FINISHED_ERROR
+        assert error is not None and error.code == "validation_error"
+        assert "bad schema" in error.message
+    else:
+        assert admission.status == RequestStatus.FINISHED_STOPPED
+        assert error is None
+    assert "s" not in scheduler.requests
+
+
+# @spec PSTATE-TURN-020
+@pytest.mark.parametrize("state_stream", [True, False], ids=["stream", "single"])
+def test_grammar_rejection_ends_a_state_stream_terminally(monkeypatch, state_stream):
+    scheduler = make_scheduler(monkeypatch)
+    request = stream_input("s", 4, resumable=state_stream)
+    scheduler.add_request(request)
+    monkeypatch.setattr(
+        scheduler.structured_output_manager,
+        "accept_tokens",
+        lambda request, tokens: False,
+    )
+
+    _, outputs = step(scheduler)
+
+    output = finished_output(outputs, "s")
+    assert request.status == RequestStatus.FINISHED_ERROR
+    assert output.finish_reason == FinishReason.ERROR
+    # Only a stream's output ends it for the frontend; a single request ends
+    # with its finish reason alone.
+    assert output.terminal is state_stream
+    assert "s" not in scheduler.requests
 
 
 # @spec PSTATE-TURN-014

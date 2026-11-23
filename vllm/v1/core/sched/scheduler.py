@@ -87,6 +87,7 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.structured_output.request import same_structured_outputs
 from vllm.v1.token_buffer import extend_from_slice
 from vllm.v1.utils import record_function_or_nullcontext
 
@@ -306,8 +307,8 @@ class Scheduler(SchedulerInterface):
         # Sessions whose streaming update was dropped for exceeding max_model_len.
         self.dropped_streaming_updates: list[Request] = []
         # State streams an input ended in add_request, freed and awaiting
-        # their terminal output.
-        self.ended_state_streams: list[Request] = []
+        # their terminal output, each with the error that output carries.
+        self.ended_state_streams: list[tuple[Request, RequestError | None]] = []
 
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
@@ -2117,11 +2118,29 @@ class Scheduler(SchedulerInterface):
             self.encoder_cache_manager.free(session)
             session.mm_features = []
 
-    def _end_parked_stream(self, request: Request, status: RequestStatus) -> None:
+    @staticmethod
+    def _grammar_compile_error(request: Request) -> RequestError | None:
+        """The error for `request`'s grammar if its compilation failed."""
+        struct_output_req = request.structured_output_request
+        if struct_output_req is None or not isinstance(
+            grammar := struct_output_req.grammar, Exception
+        ):
+            return None
+        return RequestError(
+            code="validation_error",
+            message=f"Invalid structured outputs: {grammar}",
+        )
+
+    def _end_parked_stream(
+        self,
+        request: Request,
+        status: RequestStatus,
+        error: RequestError | None = None,
+    ) -> None:
         """End a parked state stream that an input ended in add_request; the
         engine core publishes its terminal output once it is freed."""
         self.finish_requests(request.request_id, status)
-        self.ended_state_streams.append(request)
+        self.ended_state_streams.append((request, error))
 
     def _make_cached_request_data(
         self,
@@ -2636,6 +2655,7 @@ class Scheduler(SchedulerInterface):
             prefill_stats = None
             watermarking = None
             terminal = False
+            grammar_ended_stream = False
             status_before_stop = request.status
 
             # Check for stop and update request status.
@@ -2688,6 +2708,10 @@ class Scheduler(SchedulerInterface):
                     req_id,
                 )
                 request.status = RequestStatus.FINISHED_ERROR
+                # @spec PSTATE-TURN-020: a state stream's output still ends it.
+                grammar_ended_stream = (
+                    self.has_unrecomputable_state and request.resumable
+                )
                 request.resumable = False
                 stopped = True
 
@@ -2735,7 +2759,7 @@ class Scheduler(SchedulerInterface):
                         # @spec PSTATE-TURN-003: a rejected fold ends the
                         # stream with a length stop instead.
                         finish_reason = request.get_finished_reason()
-                        terminal = request.resumable
+                        terminal = request.resumable or grammar_ended_stream
                     kv_transfer_params, ec_transfer_params = self._free_request(request)
                     if (
                         prefill_stats is not None
@@ -3307,8 +3331,14 @@ class Scheduler(SchedulerInterface):
                         existing, RequestStatus.FINISHED_LENGTH_CAPPED
                     )
             elif self.has_unrecomputable_state:
-                # @spec PSTATE-TURN-015: the close ends a parked state stream.
-                self._end_parked_stream(existing, RequestStatus.FINISHED_STOPPED)
+                # @spec PSTATE-TURN-015 PSTATE-TURN-020: the close ends a parked
+                # state stream, with an error if its grammar failed to compile.
+                if (error := self._grammar_compile_error(existing)) is not None:
+                    self._end_parked_stream(
+                        existing, RequestStatus.FINISHED_ERROR, error
+                    )
+                else:
+                    self._end_parked_stream(existing, RequestStatus.FINISHED_STOPPED)
             else:
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
@@ -3340,7 +3370,7 @@ class Scheduler(SchedulerInterface):
         """Admit `request` as a parked state stream with an empty prompt, or
         return the refusal reason having changed nothing."""
         # @spec PSTATE-ADMIT-001 PSTATE-ADMIT-002
-        if (reason := self._stream_admission_refusal()) is not None:
+        if (reason := self.stream_admission_refusal()) is not None:
             return reason
         request.status = RequestStatus.WAITING_FOR_STREAMING_REQ
         request.streaming_queue = deque()
@@ -3351,7 +3381,7 @@ class Scheduler(SchedulerInterface):
             request.record_event(EngineCoreEventType.QUEUED)
         return None
 
-    def _stream_admission_refusal(self) -> str | None:
+    def stream_admission_refusal(self) -> str | None:
         """Why a new state stream cannot be admitted now, or None."""
         # @spec PSTATE-ADMIT-004
         if self._pause_state != PauseState.UNPAUSED:
@@ -3370,9 +3400,9 @@ class Scheduler(SchedulerInterface):
         structured outputs than the stream opened with."""
         held = self.requests[request.request_id]
         assert held.sampling_params is not None and request.sampling_params is not None
-        return (
-            request.sampling_params.structured_outputs
-            != held.sampling_params.structured_outputs
+        return not same_structured_outputs(
+            request.sampling_params.structured_outputs,
+            held.sampling_params.structured_outputs,
         )
 
     def holds_stream(self, request_id: str) -> bool:
@@ -3385,7 +3415,7 @@ class Scheduler(SchedulerInterface):
         `admit_stream`, with that input as its first, or return the refusal
         reason having changed nothing."""
         # @spec PSTATE-ADMIT-018
-        if (reason := self._stream_admission_refusal()) is not None:
+        if (reason := self.stream_admission_refusal()) is not None:
             return reason
         self.add_request(request)
         # The reservation starts now, as it would on a first input after
@@ -4010,11 +4040,8 @@ class Scheduler(SchedulerInterface):
             struct_output_req = request.structured_output_request
             if not struct_output_req or struct_output_req.grammar is None:
                 return False
-            if isinstance(struct_output_req.grammar, Exception):
-                self.grammar_compile_error_reqs[request.request_id] = RequestError(
-                    code="validation_error",
-                    message=f"Invalid structured outputs: {struct_output_req.grammar}",
-                )
+            if (error := self._grammar_compile_error(request)) is not None:
+                self.grammar_compile_error_reqs[request.request_id] = error
                 return False
             # Grammar is ready, promote to waiting state.
             request.status = RequestStatus.WAITING
