@@ -2173,12 +2173,13 @@ class EngineCoreProc(EngineCore):
         request_id: str,
         status: RequestStatus,
         error: RequestError | None = None,
+        mm_cache_miss_hashes: list[str] | None = None,
     ) -> None:
         """End a held persistent-state stream whose input was rejected, and
         publish its terminal output once it is freed."""
         # @spec PSTATE-PAGE-004
         for stream in self.scheduler.finish_requests(request_id, status):
-            self._send_terminal_output(stream, error)
+            self._send_terminal_output(stream, error, mm_cache_miss_hashes)
 
     # @spec PSTATE-TURN-003
     def abort_requests(self, request_ids: list[str]) -> list[Request]:
@@ -2191,10 +2192,14 @@ class EngineCoreProc(EngineCore):
 
     # @spec PSTATE-ADMIT-022 PSTATE-PAGE-004
     def _reject_preprocessed_input(
-        self, request: EngineCoreRequest, error: RequestError | None
+        self,
+        request: EngineCoreRequest,
+        error: RequestError | None,
+        mm_cache_miss_hashes: list[str] | None = None,
     ) -> None:
         """Give an input that preprocessing rejected the outcome its ADD would
-        get from the ordered guards."""
+        get from the ordered guards; a stream's state cannot replay the input,
+        so even a retryable cache miss ends it."""
         req_id = request.request_id
         scheduler = self.scheduler
         if self._drop_unknown_continuation(request) or self._reject_add_in_shutdown(
@@ -2202,17 +2207,27 @@ class EngineCoreProc(EngineCore):
         ):
             return
         if request.continuation:
-            self._end_held_stream(req_id, RequestStatus.FINISHED_ERROR, error)
+            self._end_held_stream(
+                req_id, RequestStatus.FINISHED_ERROR, error, mm_cache_miss_hashes
+            )
             return
         if scheduler.has_request(req_id):
             self._end_held_stream(req_id, RequestStatus.FINISHED_ERROR)
             return
         self._send_finish_outputs_to_client(
-            [req_id], request.client_index, FinishReason.ERROR, error, True
+            [req_id],
+            request.client_index,
+            FinishReason.ERROR,
+            error,
+            True,
+            mm_cache_miss_hashes,
         )
 
     def _send_terminal_output(
-        self, stream: Request, error: RequestError | None = None
+        self,
+        stream: Request,
+        error: RequestError | None = None,
+        mm_cache_miss_hashes: list[str] | None = None,
     ) -> None:
         finish_reason = stream.get_finished_reason()
         assert finish_reason is not None
@@ -2222,6 +2237,7 @@ class EngineCoreProc(EngineCore):
             finish_reason,
             error,
             terminal=True,
+            mm_cache_miss_hashes=mm_cache_miss_hashes,
         )
 
     def _reject_add_while_paused(self, request: Request) -> bool:
@@ -2571,7 +2587,8 @@ class EngineCoreProc(EngineCore):
     def _handle_mm_cache_miss(
         self, request: EngineCoreRequest, err: MultiModalCacheMissError
     ) -> None:
-        """Return a retryable response for a P0/P1 cache-drift miss.
+        """Return a retryable response for a P0/P1 cache-drift miss; a state
+        stream's input takes the ordered rejection instead.
 
         Surfaces every drifted hash via `EngineCoreOutput.mm_cache_miss_hashes` so
         the frontend drops them from its sender cache and the client resends with
@@ -2584,6 +2601,13 @@ class EngineCoreProc(EngineCore):
             request.request_id,
             err.mm_hashes,
         )
+        error = RequestError(
+            code="multimodal_cache_miss",
+            message="Multi-modal processor cache miss.",
+            retryable=True,
+        )
+        if self._route_stream_input_rejection(request, error, list(err.mm_hashes)):
+            return
         self.output_queue.put_nowait(
             (
                 request.client_index,
@@ -2645,7 +2669,10 @@ class EngineCoreProc(EngineCore):
             )
 
     def _route_stream_input_rejection(
-        self, request: EngineCoreRequest, error: RequestError | None
+        self,
+        request: EngineCoreRequest,
+        error: RequestError | None,
+        mm_cache_miss_hashes: list[str] | None = None,
     ) -> bool:
         """Hand a rejected input of a persistent-state stream to the core
         loop, which ends the stream it holds after freeing it."""
@@ -2655,7 +2682,10 @@ class EngineCoreProc(EngineCore):
         )
         if route:
             self.input_queue.put_nowait(
-                (EngineCoreRequestType.REJECTED_STREAM_INPUT, (request, error))
+                (
+                    EngineCoreRequestType.REJECTED_STREAM_INPUT,
+                    (request, error, mm_cache_miss_hashes),
+                )
             )
         return route
 
@@ -2785,10 +2815,16 @@ class EngineCoreProc(EngineCore):
         finish_reason: FinishReason,
         error: RequestError | None = None,
         terminal: bool = False,
+        mm_cache_miss_hashes: list[str] | None = None,
     ) -> None:
         outputs = [
             EngineCoreOutput(
-                req_id, [], finish_reason=finish_reason, error=error, terminal=terminal
+                req_id,
+                [],
+                finish_reason=finish_reason,
+                error=error,
+                terminal=terminal,
+                mm_cache_miss_hashes=mm_cache_miss_hashes,
             )
             for req_id in req_ids
         ]

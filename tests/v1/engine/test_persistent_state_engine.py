@@ -45,6 +45,7 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm.engine.protocol import StreamingInput
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import TokensPrompt
+from vllm.multimodal.cache.base import MultiModalCacheMissError
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.sampling_params import (
     RequestOutputKind,
@@ -2108,7 +2109,7 @@ def test_rejected_opener_for_a_held_id_ends_the_held_request(monkeypatch):
     _assert_ended_after_free(core, free_pages, FinishReason.ERROR)
 
 
-# @spec PSTATE-ADMIT-022 PSTATE-ADMIT-018
+# @spec PSTATE-ADMIT-022
 def test_rejected_opener_of_a_new_stream_gets_a_terminal_error(monkeypatch):
     core, _ = _live_core(monkeypatch)
 
@@ -2120,7 +2121,7 @@ def test_rejected_opener_of_a_new_stream_gets_a_terminal_error(monkeypatch):
     assert output.error is not None and output.error.code == "validation_error"
 
 
-# @spec PSTATE-DECL-013 PSTATE-ADMIT-022
+# @spec PSTATE-DECL-013
 def test_ordinary_model_streams_open_without_admission_at_capacity(monkeypatch):
     core, _ = _live_core(monkeypatch, ordinary=True, max_num_seqs=1)
 
@@ -2153,3 +2154,28 @@ def test_in_process_client_refuses_state_streams_only(state):
     else:
         client.add_request(stream)
         assert preprocessed == ["s"]
+
+
+# @spec PSTATE-ADMIT-022 PSTATE-PAGE-004
+@pytest.mark.parametrize("continuation", [True, False], ids=["continuation", "opener"])
+def test_cache_miss_on_a_state_stream_input_ends_it_terminally(
+    monkeypatch, continuation
+):
+    """A stream's state cannot replay the input, so even a retryable miss ends
+    the stream, and the output still names the hashes the frontend drops."""
+    core, free_pages = _live_core(monkeypatch)
+    if continuation:
+        _park(core.scheduler, "s")
+    missed = _core_request(
+        "s", [1], resumable=True, continuation=continuation, client_index=1
+    )
+
+    core._handle_mm_cache_miss(missed, MultiModalCacheMissError(["h1", "h2"]))
+    _drain_inputs(core)
+
+    output = _assert_ended_after_free(
+        core, free_pages, FinishReason.ERROR, "multimodal_cache_miss"
+    )
+    assert output.error.retryable
+    assert output.mm_cache_miss_hashes == ["h1", "h2"]
+    assert not core.scheduler.has_request("s")

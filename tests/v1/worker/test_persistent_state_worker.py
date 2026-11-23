@@ -823,6 +823,13 @@ def _check_bounded(sizes: dict[str, list[int]]) -> None:
     never on the number of turns."""
     for name, structure_sizes in sizes.items():
         reference = max(structure_sizes[WARMUP_SAMPLES : WARMUP_SAMPLES + WINDOW])
+        # Nor may the reference window outgrow the first cycle of turns, so a
+        # structure that grows before the window and then levels off fails.
+        first_cycle = max(structure_sizes[:WINDOW])
+        assert reference <= first_cycle + SLACK, (
+            f"{name} retained {reference} bytes in its reference window, over "
+            f"{first_cycle} bytes in its first {WINDOW} turns plus {SLACK}"
+        )
         later = structure_sizes[WARMUP_SAMPLES + WINDOW :]
         assert later, f"{name} has no walk after its reference window"
         worst = max(later)
