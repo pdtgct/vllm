@@ -1878,6 +1878,21 @@ class MambaManager(SingleTypeKVCacheManager):
     block_table_token_alignment: ClassVar[int | None] = None
 
     @classmethod
+    def layer_config(
+        cls, spec: KVCacheSpec, *, recomputable: bool = True, **params: Any
+    ) -> KVCacheLayerConfig:
+        config = cls.config(recomputable=recomputable, **params)
+        assert isinstance(config.params, MambaManager.Params)
+        if not recomputable and config.params.enable_prefix_caching:
+            # The prefix-caching allocator does not record the pages the
+            # worker initializes (PSTATE-PAGE-001).
+            raise ValueError(
+                "enable_prefix_caching is not supported for a non-recomputable "
+                "state group"
+            )
+        return KVCacheLayerConfig(config, spec)
+
+    @classmethod
     def can_share_block_table(cls, specs: Sequence[KVCacheSpec]) -> bool:
         mamba_specs = [spec for spec in specs if isinstance(spec, MambaSpec)]
         assert len(mamba_specs) == len(specs)

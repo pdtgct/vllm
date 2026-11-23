@@ -7,6 +7,7 @@ import gc
 import sys
 import types
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -28,6 +29,7 @@ from tests.v1.worker.test_gpu_model_runner_v2 import _make_capture_runner
 from vllm.config import ModelConfig, VllmConfig
 from vllm.model_executor.models.interfaces import SupportsPersistentState
 from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.tokenizers import get_tokenizer
 from vllm.utils.vmm_driver import vmm_unavailable_reason
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
@@ -180,15 +182,16 @@ def test_initializer_is_none_without_a_state_group():
 # @spec PSTATE-PREP-005
 def test_warmup_initializes_each_groups_pages_from_its_requests_blocks():
     output = SchedulerOutput.make_empty()
-    output.scheduled_new_reqs = [
+    new_reqs: list[Any] = [
         SimpleNamespace(block_ids=([1], [2, 3])),
         SimpleNamespace(block_ids=([4], [5])),
     ]
+    output.scheduled_new_reqs = new_reqs
     model_runner = SimpleNamespace(
         state_page_initializer=SimpleNamespace(group_ids=[1])
     )
 
-    warmup._initialize_state_pages(model_runner, output, range(1, 6))
+    warmup._initialize_state_pages(model_runner, output)
 
     assert output.new_state_block_ids == {1: [2, 3, 5]}
     assert output.new_block_ids_to_zero is None
@@ -326,7 +329,11 @@ def test_new_request_data_has_no_position_offset_by_default():
 
 
 # @spec PSTATE-FAIL-001
-def test_runner_attaches_failed_ids_after_the_state_postprocesses(monkeypatch):
+@pytest.mark.parametrize("persistent_state", [True, False])
+def test_runner_attaches_failed_ids_after_the_state_postprocesses(
+    monkeypatch, persistent_state
+):
+    """An ordinary model's runner never asks its model state for failures."""
     events: list[str] = []
     outputs: list[ModelRunnerOutput] = []
 
@@ -343,7 +350,9 @@ def test_runner_attaches_failed_ids_after_the_state_postprocesses(monkeypatch):
             events.append("take_failed_requests")
             return {"failed"}
 
+    fake_state = FakeModelState()
     runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.persistent_state = persistent_state
     runner.eplb = SimpleNamespace(step=lambda **kwargs: None)
     runner.is_last_pp_rank = True
     runner.pcp_manager = None
@@ -355,7 +364,7 @@ def test_runner_attaches_failed_ids_after_the_state_postprocesses(monkeypatch):
     runner.output_copy_stream = None
     runner.check_ep_fault = None
     runner.model = SimpleNamespace(compute_logits=None)
-    runner.model_state = FakeModelState()
+    runner.model_state = fake_state
     runner.kv_connector = SimpleNamespace(post_forward=lambda *args, **kwargs: None)
     runner.prompt_logprobs_worker = SimpleNamespace(
         compute_prompt_logprobs=lambda *args: {},
@@ -387,16 +396,18 @@ def test_runner_attaches_failed_ids_after_the_state_postprocesses(monkeypatch):
     )
     monkeypatch.setattr(runner, "_get_num_drafted_and_verified", lambda b: (None, None))
     monkeypatch.setattr(
-        runner,
-        "postprocess_sampled",
-        lambda *args: runner.model_state.postprocess_state(),
+        runner, "postprocess_sampled", lambda *args: fake_state.postprocess_state()
     )
     monkeypatch.setattr(model_runner_module, "AsyncOutput", FakeAsyncOutput)
 
     runner.sample_tokens(None)
 
-    assert events == ["postprocess_state", "take_failed_requests"]
-    assert outputs[0].failed_req_ids == {"failed"}
+    if persistent_state:
+        assert events == ["postprocess_state", "take_failed_requests"]
+        assert outputs[0].failed_req_ids == {"failed"}
+    else:
+        assert events == ["postprocess_state"]
+        assert outputs[0].failed_req_ids is None
 
 
 # Startup and resume preparation
@@ -637,13 +648,14 @@ def test_serving_capture_does_not_clear_the_model_state_graphs(monkeypatch):
     assert events == [("capture", False)]
 
 
-def _waking_core(*, fully_awake: bool, was_sleeping: bool = True):
+def _waking_core(monkeypatch, *, fully_awake: bool, was_sleeping: bool = True):
     """A core whose executor is asleep at level 1 or above when `was_sleeping`
     and, after a wake, asleep still unless `fully_awake`."""
     calls: list[str] = []
     core = _pausable_engine_core_proc()
-    core.scheduler.has_unrecomputable_state = True
-    core.scheduler.held_state_streams.return_value = []
+    scheduler = cast(MagicMock, core.scheduler)
+    scheduler.has_unrecomputable_state = True
+    scheduler.held_state_streams.return_value = []
     core.model_executor.is_sleeping = was_sleeping
 
     def wake_up(tags):
@@ -654,15 +666,17 @@ def _waking_core(*, fully_awake: bool, was_sleeping: bool = True):
     core.model_executor.collective_rpc.side_effect = lambda method, *args, **kwargs: (
         calls.append(method)
     )
-    core.scheduler.get_kv_connector.return_value = None
-    core._set_kv_connector_handshake_metadata = MagicMock()
-    core.resume_scheduler = MagicMock(side_effect=lambda: calls.append("resume"))
+    scheduler.get_kv_connector.return_value = None
+    monkeypatch.setattr(core, "_set_kv_connector_handshake_metadata", MagicMock())
+    monkeypatch.setattr(
+        core, "resume_scheduler", MagicMock(side_effect=lambda: calls.append("resume"))
+    )
     return core, calls
 
 
 # @spec PSTATE-PREP-006
-def test_full_wake_recaptures_before_scheduling_resumes():
-    core, calls = _waking_core(fully_awake=True)
+def test_full_wake_recaptures_before_scheduling_resumes(monkeypatch):
+    core, calls = _waking_core(monkeypatch, fully_awake=True)
 
     EngineCore.wake_up(core)
 
@@ -670,8 +684,8 @@ def test_full_wake_recaptures_before_scheduling_resumes():
 
 
 # @spec PSTATE-PREP-006
-def test_partial_wake_does_not_recapture():
-    core, calls = _waking_core(fully_awake=False)
+def test_partial_wake_does_not_recapture(monkeypatch):
+    core, calls = _waking_core(monkeypatch, fully_awake=False)
 
     EngineCore.wake_up(core, ["weights"])
 
@@ -679,8 +693,8 @@ def test_partial_wake_does_not_recapture():
 
 
 # @spec PSTATE-PREP-009
-def test_light_wake_keeps_captured_graphs():
-    core, calls = _waking_core(fully_awake=True, was_sleeping=False)
+def test_light_wake_keeps_captured_graphs(monkeypatch):
+    core, calls = _waking_core(monkeypatch, fully_awake=True, was_sleeping=False)
 
     EngineCore.wake_up(core, ["scheduling"])
 
@@ -689,9 +703,9 @@ def test_light_wake_keeps_captured_graphs():
 
 # @spec PSTATE-PREP-009
 @pytest.mark.parametrize("tags", [None, ["weights", "kv_cache"]])
-def test_wake_of_an_awake_executor_does_not_recapture(tags):
+def test_wake_of_an_awake_executor_does_not_recapture(monkeypatch, tags):
     """After a level-0 sleep, or a repeated wake, nothing was remapped."""
-    core, calls = _waking_core(fully_awake=True, was_sleeping=False)
+    core, calls = _waking_core(monkeypatch, fully_awake=True, was_sleeping=False)
 
     EngineCore.wake_up(core, tags)
 
@@ -699,15 +713,16 @@ def test_wake_of_an_awake_executor_does_not_recapture(tags):
 
 
 # @spec PSTATE-PREP-006
-def test_checkpoint_restore_recaptures_after_the_kv_cache_wakes():
+def test_checkpoint_restore_recaptures_after_the_kv_cache_wakes(monkeypatch):
     core = _pausable_engine_core_proc()
-    core.scheduler.has_unrecomputable_state = True
-    core.scheduler.held_state_streams.return_value = []
+    scheduler = cast(MagicMock, core.scheduler)
+    scheduler.has_unrecomputable_state = True
+    scheduler.held_state_streams.return_value = []
     core.vllm_config = MagicMock()
     core.model_executor.is_sleeping = False
-    core._reset_caches = MagicMock()
+    monkeypatch.setattr(core, "_reset_caches", MagicMock())
     core.reject_new_requests = False
-    core.scheduler.get_kv_connector.return_value = None
+    scheduler.get_kv_connector.return_value = None
     core.checkpoint_prepare("wait")
     core.model_executor.reset_mock()
     # Preparing released the KV cache; the restore's wake maps it again.
@@ -845,9 +860,7 @@ def _chunk(prompt: list[int]) -> EngineCoreRequest:
         request_id="stream",
         prompt_token_ids=prompt,
         mm_features=None,
-        sampling_params=SamplingParams(
-            detokenize=False, output_kind=RequestOutputKind.DELTA
-        ),
+        sampling_params=SamplingParams(output_kind=RequestOutputKind.DELTA),
         pooling_params=None,
         arrival_time=0,
         lora_request=None,
@@ -861,7 +874,9 @@ def _chunk(prompt: list[int]) -> EngineCoreRequest:
 # @spec PSTATE-HIST-008
 @pytest.mark.cpu_test
 def test_output_processor_history_stays_bounded_over_many_turns():
-    processor = OutputProcessor(None, log_stats=False, persistent_state=True)
+    """With a real tokenizer, so the detokenizer's tail is measured too."""
+    tokenizer = get_tokenizer("facebook/opt-125m")
+    processor = OutputProcessor(tokenizer, log_stats=False, persistent_state=True)
     queue = StreamingInputOutputCollector(RequestOutputKind.DELTA, "stream")
     processor.add_request(_chunk([1] * _input_len(0)), None, queue=queue)
     sizes: dict[str, list[int]] = {

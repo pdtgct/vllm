@@ -853,7 +853,6 @@ class Scheduler(SchedulerInterface):
                 continue
 
             if self.state_barrier and request.num_in_flight_tokens > 0:
-                # @spec PSTATE-ASYNC-001
                 req_index += 1
                 continue
 
@@ -975,6 +974,12 @@ class Scheduler(SchedulerInterface):
                     if self.has_unrecomputable_state:
                         # @spec PSTATE-PRES-001: no state request is a
                         # preemption victim; this one waits for a later step.
+                        logger.warning_once(
+                            "Request %s cannot be scheduled and persistent "
+                            "state is never preempted; it waits for a later "
+                            "step. Lower max_num_seqs or enlarge the cache.",
+                            request.request_id,
+                        )
                         break
 
                     # The request cannot be scheduled.
@@ -1898,7 +1903,6 @@ class Scheduler(SchedulerInterface):
             self.sched_step_seq += 1
 
         if self.has_unrecomputable_state:
-            # @spec PSTATE-PAGE-007
             (
                 scheduler_output.new_state_page_req_ids,
                 scheduler_output.new_state_block_ids,
@@ -2053,7 +2057,6 @@ class Scheduler(SchedulerInterface):
             keep_end,
         )
         if self.compacts_state_history and keep_end:
-            # @spec PSTATE-HIST-001 PSTATE-HIST-002
             self._compact_session(session, keep_end)
 
         if update.mm_features:
@@ -3468,8 +3471,6 @@ class Scheduler(SchedulerInterface):
 
     def held_state_streams(self) -> list[str]:
         """Ids of the state streams held: admitted, running or parked."""
-        if not self.has_unrecomputable_state:
-            return []
         return [r.request_id for r in self.requests.values() if r.resumable]
 
     def _stream_clock(self) -> float:
@@ -3762,7 +3763,6 @@ class Scheduler(SchedulerInterface):
         """
         if self.has_unrecomputable_state:
             if reset_running_requests and (held := self.held_state_streams()):
-                # @spec PSTATE-PRES-003
                 raise RuntimeError(
                     "Cannot reset running requests while state streams are "
                     f"held: {', '.join(held)}"

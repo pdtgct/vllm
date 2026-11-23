@@ -242,10 +242,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.kv_block_zeroer: KVBlockZeroer | None = None
         # Set with the zeroer for a model with non-recomputable state.
         self.state_page_initializer: StatePageInitializer | None = None
-        self.applies_position_offset = (
-            self.model_config.has_persistent_state
-            and self.model_config.persistent_state_reads_positions
-        )
+        self.persistent_state = self.model_config.has_persistent_state
 
         self.vocab_size = self.model_config.get_vocab_size()
         masked = self.model_config.masked_token_ids
@@ -322,7 +319,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             device=self.device,
             num_prefill_lookahead=num_prefill_lookahead,
             use_dense_all_token_ids=use_dense_all_token_ids,
-            tracks_position_offset=self.applies_position_offset,
+            tracks_position_offset=(
+                self.persistent_state
+                and self.model_config.persistent_state_reads_positions
+            ),
         )
 
         # Speculative decoding.
@@ -1460,7 +1460,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if scheduler_output.new_block_ids_to_zero:
             assert self.kv_block_zeroer is not None
             self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
-        # @spec PSTATE-PAGE-001
         if scheduler_output.new_state_block_ids:
             assert self.state_page_initializer is not None
             self.state_page_initializer.initialize(scheduler_output.new_state_block_ids)
@@ -1667,18 +1666,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         # Prepare positions and seq_lens.
-        # @spec PSTATE-HIST-004
+        position_offset = self.req_states.position_offset
         prepare_pos_seq_lens(
             idx_mapping,
             query_start_loc,
             self.req_states.num_computed_tokens.gpu,
             self.input_buffers.positions,
             self.input_buffers.seq_lens,
-            position_offset=(
-                self.req_states.position_offset.gpu
-                if self.applies_position_offset
-                else None
-            ),
+            position_offset=None if position_offset is None else position_offset.gpu,
         )
         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
 
@@ -2493,8 +2488,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_rejected,
             input_batch.query_start_loc,
         )
-        # @spec PSTATE-FAIL-001
-        if failed_req_ids := self.model_state.take_failed_requests():
+        if self.persistent_state and (
+            failed_req_ids := self.model_state.take_failed_requests()
+        ):
             model_runner_output.failed_req_ids = failed_req_ids
 
         if self.speculator is not None:

@@ -65,11 +65,12 @@ class RequestState:
         # Optimistic CPU mirror of num_computed_tokens (upper bound on GPU value).
         self.num_computed_tokens_np = np.zeros(self.max_num_reqs, dtype=np.int32)
         # Tokens compaction dropped from a persistent-state request; added to
-        # its positions, never its lengths. Staged only if the model reads it.
-        self.tracks_position_offset = tracks_position_offset
-        self.position_offset = StagedWriteTensor(
-            self.max_num_reqs, dtype=torch.int32, device=device
-        )
+        # its positions, never its lengths. Only for a model that reads it.
+        self.position_offset: StagedWriteTensor | None = None
+        if tracks_position_offset:
+            self.position_offset = StagedWriteTensor(
+                self.max_num_reqs, dtype=torch.int32, device=device
+            )
 
         # Last sampled tokens.
         self.last_sampled_tokens = torch.zeros(
@@ -121,7 +122,7 @@ class RequestState:
         self.num_computed_prefill_tokens[req_idx] = num_computed_tokens
         self.num_computed_tokens_np[req_idx] = num_computed_tokens
         self.num_computed_tokens.stage_write_elem(req_idx, num_computed_tokens)
-        if self.tracks_position_offset:
+        if self.position_offset is not None:
             self.position_offset.stage_write_elem(req_idx, position_offset)
 
         if self.num_speculative_steps > 0:
@@ -133,7 +134,7 @@ class RequestState:
         self.total_len.apply_write()
         self.all_token_ids.apply_write()
         self.num_computed_tokens.apply_write()
-        if self.tracks_position_offset:
+        if self.position_offset is not None:
             self.position_offset.apply_write()
 
     def remove_request(self, req_id: str) -> int | None:

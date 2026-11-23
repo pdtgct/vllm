@@ -1926,7 +1926,6 @@ class EngineCoreProc(EngineCore):
         self._sweep_stream_deadlines()
 
     def _sweep_stream_deadlines(self) -> None:
-        # @spec PSTATE-ADMIT-007
         if self.scheduler.has_unrecomputable_state:
             self._send_abort_outputs(self.scheduler.sweep_stream_deadlines())
 
@@ -2136,7 +2135,11 @@ class EngineCoreProc(EngineCore):
             return False
         error = RequestError(code=code, message=f"Stream {request.request_id} {why}.")
         self._send_finish_outputs_to_client(
-            [request.request_id], request.client_index, FinishReason.ERROR, error
+            [request.request_id],
+            request.client_index,
+            FinishReason.ERROR,
+            error,
+            terminal=True,
         )
         return True
 
@@ -2660,13 +2663,21 @@ class EngineCoreProc(EngineCore):
         client_index: int,
         finish_reason: FinishReason,
         error: RequestError | None = None,
+        terminal: bool = False,
     ) -> None:
-        outputs = [
-            EngineCoreOutput(req_id, [], finish_reason=finish_reason, error=error)
+        self._send_finish_outputs(
+            (
+                client_index,
+                EngineCoreOutput(
+                    req_id,
+                    [],
+                    finish_reason=finish_reason,
+                    error=error,
+                    terminal=terminal,
+                ),
+            )
             for req_id in req_ids
-        ]
-        eco = EngineCoreOutputs(finished_requests=req_ids, outputs=outputs)
-        self.output_queue.put_nowait((client_index, eco))
+        )
 
     def _send_abort_outputs_to_client(
         self, req_ids: list[str], client_index: int
@@ -2681,19 +2692,21 @@ class EngineCoreProc(EngineCore):
     def _send_abort_outputs(self, aborted_reqs: list[Request]) -> None:
         # TODO(nick) this will be moved inside the scheduler
         if aborted_reqs:
-            # A stop_reason names the deadline that aborted a state stream.
-            self._send_finish_outputs(
-                (
-                    request.client_index,
-                    EngineCoreOutput(
-                        request.request_id,
-                        [],
-                        finish_reason=FinishReason.ABORT,
-                        stop_reason=request.stop_reason,
-                    ),
+            # An aborted state stream ends terminally, and its stop_reason
+            # names the deadline that expired.
+            state_streams = self.scheduler.has_unrecomputable_state
+            outputs = []
+            for request in aborted_reqs:
+                state = state_streams and request.resumable
+                output = EngineCoreOutput(
+                    request.request_id,
+                    [],
+                    finish_reason=FinishReason.ABORT,
+                    stop_reason=request.stop_reason if state else None,
+                    terminal=state,
                 )
-                for request in aborted_reqs
-            )
+                outputs.append((request.client_index, output))
+            self._send_finish_outputs(outputs)
 
     def _send_finish_outputs(
         self, outputs: Iterable[tuple[int, EngineCoreOutput]]

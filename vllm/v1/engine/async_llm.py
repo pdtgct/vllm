@@ -89,22 +89,37 @@ logger = init_logger(__name__)
 
 
 def _unbind_retired_streams(
-    state_stream_ids: dict[str, str], retired: Iterable[str]
+    state_stream_ids: dict[str, set[str]], retired: Iterable[str]
 ) -> None:
     """An internal id is `<external id>-<client index>-<number>`."""
     for internal_req_id in retired:
         external_req_id = internal_req_id.rsplit("-", 2)[0]
-        if state_stream_ids.get(external_req_id) == internal_req_id:
-            del state_stream_ids[external_req_id]
+        internal_req_ids = state_stream_ids.get(external_req_id)
+        if internal_req_ids is not None:
+            internal_req_ids.discard(internal_req_id)
+            if not internal_req_ids:
+                del state_stream_ids[external_req_id]
 
 
-def _is_empty_update(prompt: PromptType | EngineInput) -> bool:
+def _is_empty_update(prompt: object) -> bool:
+    """Whether a stream update carries no text, tokens, features or embeds in
+    any prompt or rendered-input form; an encoder-decoder input is empty only
+    if both of its parts are."""
     if isinstance(prompt, str):
         return not prompt
-    return isinstance(prompt, dict) and not (
+    if not isinstance(prompt, Mapping):
+        return False
+    if "encoder_prompt" in prompt:
+        return all(
+            part is None or _is_empty_update(part)
+            for part in (prompt["encoder_prompt"], prompt.get("decoder_prompt"))
+        )
+    return not (
         prompt.get("prompt")
         or prompt.get("prompt_token_ids")
+        or prompt.get("encoder_prompt_token_ids")
         or prompt.get("multi_modal_data")
+        or prompt.get("mm_kwargs")
         or prompt.get("prompt_embeds") is not None
     )
 
@@ -240,10 +255,10 @@ class AsyncLLM(EngineClient):
         )
 
         # Persistent-state streams: this client's id counter, and the binding
-        # of each external id to the internal id of its current stream, which
-        # the engine core's retirements release.
+        # of each external id to the internal ids of the streams the engine
+        # core holds under it, which the core's retirements release.
         self._state_stream_numbers = itertools.count(1)
-        self._state_stream_ids: dict[str, str] = {}
+        self._state_stream_ids: dict[str, set[str]] = {}
         if self.persistent_state:
             self.engine_core.stream_retired_callback = partial(
                 _unbind_retired_streams, self._state_stream_ids
@@ -521,10 +536,16 @@ class AsyncLLM(EngineClient):
         if stream_admission:
             raise VLLMValidationError(
                 "stream_admission requires an async generator of StreamingInput"
+                if self.persistent_state
+                else "stream_admission is not supported for this model"
             )
-        if self.persistent_state and not is_pooling:
-            # A single turn; its output kind is free.
-            self._validate_state_sampling_params(params, stream=False)
+        if self.persistent_state and isinstance(params, SamplingParams):
+            # @spec PSTATE-DECL-007: a single turn; its output kind is free.
+            parameter = unsupported_stream_sampling_parameter(params, stream=False)
+            if parameter is not None:
+                raise VLLMValidationError(
+                    f"{parameter} is not supported for this model"
+                )
 
         # Convert Input --> Request.
         if isinstance(prompt, EngineCoreRequest):
@@ -684,12 +705,16 @@ class AsyncLLM(EngineClient):
         self._validate_resumable_request()
         state_stream = self.persistent_state
         if stream_admission and not state_stream:
-            # @spec PSTATE-ADMIT-011
             raise VLLMValidationError(
                 "stream_admission is not supported for this model"
             )
         if state_stream and isinstance(sampling_params, SamplingParams):
-            self._validate_state_sampling_params(sampling_params, stream=True)
+            # @spec PSTATE-DECL-007
+            parameter = unsupported_stream_sampling_parameter(sampling_params)
+            if parameter is not None:
+                raise VLLMValidationError(
+                    f"{parameter} is not supported for this model"
+                )
         self._validate_streaming_input_sampling_params(sampling_params)
 
         inputs = dict(
@@ -750,17 +775,17 @@ class AsyncLLM(EngineClient):
             try:
                 reason = await self.engine_core.admit_stream_async(admission)
             except BaseException:
+                # The engine may hold the stream: a cancelled admission
+                # releases it rather than leaving it to its deadline.
                 self.output_processor.abort_requests([internal_req_id], internal=True)
+                await self.engine_core.abort_requests_async([internal_req_id])
                 raise
             if reason is not None:
                 self.output_processor.abort_requests([internal_req_id], internal=True)
                 raise StreamAdmissionError(reason)
+            self._state_stream_ids.setdefault(request_id, set()).add(internal_req_id)
             if self.log_requests:
                 logger.info("Admitted stream %s.", internal_req_id)
-        if state_stream:
-            # A live binding is never overwritten: the engine refuses the
-            # newcomer's id as in use.
-            self._state_stream_ids.setdefault(request_id, internal_req_id)
 
         async def handle_inputs():
             cancelled = False
@@ -776,16 +801,20 @@ class AsyncLLM(EngineClient):
                     ):
                         break
                     if state_stream and _is_empty_update(input_chunk.prompt):
-                        # @spec PSTATE-TURN-005 PSTATE-TURN-007: no turn.
                         continue
                     sp = input_chunk.sampling_params
-                    if sp:
-                        if state_stream and not any_added:
-                            # The scheduler refuses a held stream's update.
-                            self._validate_state_sampling_params(sp, stream=True)
-                        self._validate_streaming_input_sampling_params(sp)
-                    else:
+                    if not sp:
                         sp = sampling_params
+                    elif not (state_stream and any_added):
+                        # A held state stream's update is the scheduler's to
+                        # refuse (PSTATE-DECL-014), by a named error.
+                        if state_stream and (
+                            parameter := unsupported_stream_sampling_parameter(sp)
+                        ):
+                            raise VLLMValidationError(
+                                f"{parameter} is not supported for this model"
+                            )
+                        self._validate_streaming_input_sampling_params(sp)
                     # TODO(nick): Avoid re-validating reused sampling parameters
                     req = self.input_processor.process_inputs(
                         request_id=internal_req_id,
@@ -804,7 +833,22 @@ class AsyncLLM(EngineClient):
                     prompt_text, _, _ = extract_prompt_components(
                         self.model_config, input_chunk.prompt
                     )
+                    if state_stream and not any_added:
+                        # Bound from the first input the engine sees until
+                        # the engine retires the stream (PSTATE-ADMIT-005).
+                        self._state_stream_ids.setdefault(request_id, set()).add(
+                            internal_req_id
+                        )
                     await self._add_request(req, prompt_text, None, 0, queue)
+                    if (
+                        state_stream
+                        and not any_added
+                        and not self.output_processor.has_request(internal_req_id)
+                    ):
+                        # Ended on its opener; the engine holds nothing.
+                        _unbind_retired_streams(
+                            self._state_stream_ids, (internal_req_id,)
+                        )
                     any_added = True
             except (asyncio.CancelledError, GeneratorExit):
                 cancelled = True
@@ -829,15 +873,12 @@ class AsyncLLM(EngineClient):
         return queue
 
     async def wait_stream_retired(self, request_id: str) -> None:
-        """Return once the engine has retired the stream opened under the
+        """Return once the engine has retired every stream it holds under the
         external `request_id`; at once for an id with no such stream."""
         # @spec PSTATE-ADMIT-005
-        internal_req_id = self._state_stream_ids.get(request_id)
-        if internal_req_id is None:
-            return
-        await self.engine_core.wait_stream_retired_async(internal_req_id)
-        if self._state_stream_ids.get(request_id) == internal_req_id:
-            del self._state_stream_ids[request_id]
+        for internal_req_id in list(self._state_stream_ids.get(request_id, ())):
+            await self.engine_core.wait_stream_retired_async(internal_req_id)
+            _unbind_retired_streams(self._state_stream_ids, (internal_req_id,))
 
     def _validate_resumable_request(self) -> None:
         if self.vllm_config.is_mm_encoder_only or self.model_config.is_diffusion:
@@ -845,16 +886,6 @@ class AsyncLLM(EngineClient):
                 "Resumable requests are not supported for encoder-only or "
                 "diffusion models."
             )
-
-    @staticmethod
-    def _validate_state_sampling_params(
-        params: SamplingParams | PoolingParams, *, stream: bool
-    ) -> None:
-        # @spec PSTATE-DECL-007
-        assert isinstance(params, SamplingParams)
-        parameter = unsupported_stream_sampling_parameter(params, stream=stream)
-        if parameter is not None:
-            raise VLLMValidationError(f"{parameter} is not supported for this model")
 
     @staticmethod
     def _validate_streaming_input_sampling_params(

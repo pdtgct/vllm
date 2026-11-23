@@ -116,7 +116,6 @@ def check_stop(
 
     num_positions = request.num_tokens + position_offset
     if length_before_eos and num_positions >= max_model_len:
-        # @spec PSTATE-TURN-011
         request.status = RequestStatus.FINISHED_LENGTH_CAPPED
         return True
 

@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorBase
     from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-    from vllm.v1.engine import EngineCoreOutputs
+    from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.metrics.stats import SchedulerStats
     from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
@@ -36,7 +36,10 @@ class PauseState(enum.IntEnum):
 
 
 class SchedulerInterface(ABC):
+    # Persistent-state streams: the defaults describe an ordinary model, for
+    # which the engine core never calls the stream methods below.
     has_unrecomputable_state: bool = False
+    stream_finish_outputs: "list[tuple[int, EngineCoreOutput]]"
 
     @abstractmethod
     def __init__(
@@ -153,6 +156,31 @@ class SchedulerInterface(ABC):
         """Returns True if the scheduler holds the request, including an open
         streaming-input session waiting for its next input."""
         raise NotImplementedError
+
+    def admit_stream(self, request: "Request") -> str | None:
+        """Admit a persistent-state stream before any input, holding it
+        parked, or return the refusal reason having changed nothing."""
+        raise NotImplementedError
+
+    def stream_id_in_use(self, request: "Request") -> bool:
+        """Whether the id or external id of an opening persistent-state
+        stream belongs to a held stream."""
+        return False
+
+    def held_state_streams(self) -> list[str]:
+        """Ids of the persistent-state streams held: admitted, running or
+        parked."""
+        return []
+
+    def sweep_stream_deadlines(self) -> "list[Request]":
+        """Finish and return the persistent-state streams whose deadline
+        has passed."""
+        return []
+
+    def next_stream_deadline(self) -> float | None:
+        """Seconds until the nearest persistent-state stream deadline; None
+        when none can expire."""
+        return None
 
     @abstractmethod
     def finish_requests(

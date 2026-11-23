@@ -51,7 +51,11 @@ from vllm.v1.core.kv_cache_utils import verify_persistent_state_groups
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.engine import EngineCoreRequest, EngineCoreRequestType, FinishReason
-from vllm.v1.engine.async_llm import AsyncLLM
+from vllm.v1.engine.async_llm import (
+    AsyncLLM,
+    _is_empty_update,
+    _unbind_retired_streams,
+)
 from vllm.v1.engine.core import (
     CheckpointState,
     EngineCore,
@@ -246,6 +250,16 @@ def test_state_group_refuses_initial_values_of_the_wrong_length():
         _verify_groups(_state_group(_state_spec(initial_values=(0, 1))))
 
 
+# @spec PSTATE-PAGE-001
+def test_state_group_refuses_prefix_caching():
+    """The prefix-caching allocator does not record the pages to initialize."""
+    with pytest.raises(ValueError, match="enable_prefix_caching is not supported"):
+        MambaManager.layer_config(
+            _state_spec(), recomputable=False, enable_prefix_caching=True
+        )
+    MambaManager.layer_config(_state_spec(), enable_prefix_caching=True)
+
+
 # @spec PSTATE-DECL-004 PSTATE-DECL-013
 def test_state_declaration_and_state_groups_must_agree():
     """A model has a state group if and only if it declares persistent state,
@@ -322,6 +336,7 @@ def _state_llm(monkeypatch: pytest.MonkeyPatch, mm_features=None) -> AsyncLLM:
     llm.engine_core.resources.engine_dead = False
     llm.engine_core.admit_stream_async = AsyncMock(return_value=None)
     llm.engine_core.wait_stream_retired_async = AsyncMock()
+    llm.engine_core.abort_requests_async = AsyncMock()
     llm.output_processor = MagicMock()
     llm.output_processor.has_request.return_value = True
     llm.input_processor = MagicMock()
@@ -456,6 +471,30 @@ async def test_single_state_request_allows_every_output_kind(monkeypatch, output
     llm._add_request.assert_awaited_once()
 
 
+# @spec PSTATE-ADMIT-011
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("persistent_state", "message"),
+    [
+        (False, "stream_admission is not supported for this model"),
+        (True, "stream_admission requires an async generator"),
+    ],
+)
+async def test_stream_admission_with_a_plain_prompt_is_refused(
+    monkeypatch, persistent_state, message
+):
+    llm = _state_llm(monkeypatch)
+    llm.persistent_state = persistent_state
+    with pytest.raises(VLLMValidationError, match=message):
+        await llm.add_request(
+            "single",
+            TokensPrompt(prompt_token_ids=[1]),
+            SamplingParams(max_tokens=4),
+            stream_admission=True,
+        )
+    llm._add_request.assert_not_awaited()
+
+
 # @spec PSTATE-ADMIT-001
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -579,9 +618,10 @@ async def test_refused_admission_keeps_the_live_streams_binding(monkeypatch):
             stream_admission=True,
         )
 
-    assert llm._state_stream_ids["ext"] == live.request_id
+    assert llm._state_stream_ids["ext"] == {live.request_id}
     await llm.wait_stream_retired("ext")
     llm.engine_core.wait_stream_retired_async.assert_awaited_once_with(live.request_id)
+    assert "ext" not in llm._state_stream_ids
 
 
 # @spec PSTATE-ADMIT-005
@@ -590,6 +630,85 @@ async def test_wait_stream_retired_resolves_at_once_for_an_unknown_id(monkeypatc
     llm = _state_llm(monkeypatch)
     await asyncio.wait_for(llm.wait_stream_retired("never-admitted"), 1)
     llm.engine_core.wait_stream_retired_async.assert_not_awaited()
+
+
+# @spec PSTATE-ADMIT-005
+@pytest.mark.asyncio
+async def test_stream_the_engine_never_saw_leaves_no_binding(monkeypatch):
+    """An iterator that ends before any input binds nothing, so an admitted
+    stream under the same external id is the one waited for."""
+    llm = _state_llm(monkeypatch)
+    await _open_stream(llm, "ext", _chunks())
+    assert "ext" not in llm._state_stream_ids
+    llm._add_request.assert_not_awaited()
+
+    admitted = await _open_stream(llm, "ext", _chunks([1]), stream_admission=True)
+    assert llm._state_stream_ids["ext"] == {admitted.request_id}
+
+    await llm.wait_stream_retired("ext")
+    llm.engine_core.wait_stream_retired_async.assert_awaited_once_with(
+        admitted.request_id
+    )
+    assert "ext" not in llm._state_stream_ids
+
+
+# @spec PSTATE-ADMIT-005
+@pytest.mark.asyncio
+async def test_reopened_external_id_waits_for_every_stream_held_under_it(
+    monkeypatch,
+):
+    """A stream reopened right after its close: both streams stay bound until
+    the engine retires each, and `wait_stream_retired` waits for both."""
+    llm = _state_llm(monkeypatch)
+    first = await _open_stream(llm, "ext", _chunks([1]))
+    second = await _open_stream(llm, "ext", _chunks([2]))
+    assert llm._state_stream_ids["ext"] == {first.request_id, second.request_id}
+
+    _unbind_retired_streams(llm._state_stream_ids, [first.request_id])
+    assert llm._state_stream_ids["ext"] == {second.request_id}
+
+    llm._state_stream_ids["ext"].add(first.request_id)
+    await llm.wait_stream_retired("ext")
+    awaited = [
+        call.args[0]
+        for call in llm.engine_core.wait_stream_retired_async.await_args_list
+    ]
+    assert sorted(awaited) == sorted([first.request_id, second.request_id])
+    assert "ext" not in llm._state_stream_ids
+
+
+# @spec PSTATE-ADMIT-001 PSTATE-ADMIT-005
+@pytest.mark.asyncio
+async def test_cancelled_admission_aborts_the_stream_in_the_engine(monkeypatch):
+    llm = _state_llm(monkeypatch)
+    admitting = asyncio.Event()
+
+    async def admit(request):
+        admitting.set()
+        await asyncio.sleep(10)
+
+    llm.engine_core.admit_stream_async.side_effect = admit
+    task = asyncio.ensure_future(
+        llm._add_streaming_input_request(
+            "ext",
+            _chunks([1]),
+            SamplingParams(max_tokens=4, output_kind=DELTA),
+            stream_admission=True,
+        )
+    )
+    await admitting.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    [admission] = llm.engine_core.admit_stream_async.await_args.args
+    llm.engine_core.abort_requests_async.assert_awaited_once_with(
+        [admission.request_id]
+    )
+    llm.output_processor.abort_requests.assert_called_once_with(
+        [admission.request_id], internal=True
+    )
+    assert "ext" not in llm._state_stream_ids
 
 
 # @spec PSTATE-TURN-005
@@ -630,6 +749,73 @@ async def test_empty_update_never_reaches_the_output_processor_or_engine(
 
 
 # @spec PSTATE-TURN-007
+@pytest.mark.parametrize(
+    ("prompt", "empty"),
+    [
+        ("", True),
+        ("hi", False),
+        (TokensPrompt(prompt_token_ids=[]), True),
+        (TokensPrompt(prompt_token_ids=[], multi_modal_data={"audio": [1]}), False),
+        (
+            {
+                "encoder_prompt": TokensPrompt(prompt_token_ids=[1]),
+                "decoder_prompt": None,
+            },
+            False,
+        ),
+        (
+            {
+                "encoder_prompt": TokensPrompt(prompt_token_ids=[]),
+                "decoder_prompt": TokensPrompt(prompt_token_ids=[]),
+            },
+            True,
+        ),
+        (
+            {
+                "type": "enc_dec",
+                "encoder_prompt": {"type": "token", "prompt_token_ids": []},
+                "decoder_prompt": {"type": "token", "prompt_token_ids": [7]},
+            },
+            False,
+        ),
+        (
+            {
+                "type": "multimodal",
+                "prompt_token_ids": [],
+                "mm_kwargs": {"audio": [object()]},
+                "mm_hashes": {},
+                "mm_placeholders": {},
+            },
+            False,
+        ),
+        (
+            {
+                "type": "multimodal",
+                "prompt_token_ids": [],
+                "mm_kwargs": {},
+                "mm_hashes": {},
+                "mm_placeholders": {},
+            },
+            True,
+        ),
+    ],
+    ids=[
+        "empty-text",
+        "text",
+        "no-tokens",
+        "features",
+        "encoder-tokens",
+        "empty-encoder-decoder",
+        "rendered-decoder-tokens",
+        "rendered-features",
+        "rendered-empty",
+    ],
+)
+def test_empty_update_is_recognised_in_every_input_form(prompt, empty):
+    assert _is_empty_update(prompt) is empty
+
+
+# @spec PSTATE-TURN-007
 @pytest.mark.asyncio
 async def test_update_with_only_features_is_forwarded(monkeypatch):
     feature = MagicMock(spec=MultiModalFeatureSpec)
@@ -647,10 +833,20 @@ async def test_update_with_only_features_is_forwarded(monkeypatch):
     assert len(_sent(llm)) == 3
 
 
+UNSUPPORTED_UPDATE_PARAMETERS = [
+    dict(presence_penalty=0.5),
+    dict(n=2),
+    dict(output_kind=RequestOutputKind.FINAL_ONLY),
+]
+"""Parameters a held stream's update cannot carry; the last two are also
+refused by the frontend's validation of ordinary streaming inputs."""
+
+
 # @spec PSTATE-DECL-014
 @pytest.mark.asyncio
+@pytest.mark.parametrize("params", UNSUPPORTED_UPDATE_PARAMETERS)
 async def test_unsupported_update_of_a_held_stream_is_left_to_the_scheduler(
-    monkeypatch,
+    monkeypatch, params
 ):
     """Only the opening parameters are validated here; an update's are the
     scheduler's to refuse, ending the stream with a named code."""
@@ -661,7 +857,7 @@ async def test_unsupported_update_of_a_held_stream_is_left_to_the_scheduler(
         yield StreamingInput(
             prompt=TokensPrompt(prompt_token_ids=[2]),
             sampling_params=SamplingParams(
-                presence_penalty=0.5, max_tokens=4, output_kind=DELTA
+                **{"max_tokens": 4, "output_kind": DELTA, **params}
             ),
         )
 
@@ -719,7 +915,10 @@ def _park(scheduler, request_id: str):
 
 
 # @spec PSTATE-DECL-014
-def test_update_with_refused_sampling_parameters_finishes_the_stream(monkeypatch):
+@pytest.mark.parametrize("params", UNSUPPORTED_UPDATE_PARAMETERS)
+def test_update_with_refused_sampling_parameters_finishes_the_stream(
+    monkeypatch, params
+):
     scheduler = _state_scheduler(monkeypatch)
     request = _park(scheduler, "s")
     update = _stream_request(
@@ -727,7 +926,7 @@ def test_update_with_refused_sampling_parameters_finishes_the_stream(monkeypatch
         2,
         continuation=True,
         sampling_params=SamplingParams(
-            presence_penalty=0.5, max_tokens=4, output_kind=DELTA
+            **{"max_tokens": 4, "output_kind": DELTA, **params}
         ),
     )
     scheduler.add_request(update)
@@ -979,7 +1178,9 @@ def _add(core: EngineCoreProc, **fields) -> MagicMock:
 
 
 def _refusal(core: EngineCoreProc) -> tuple[list[str], int, FinishReason, RequestError]:
+    """The one refusal the core sent, which ends the stream (PSTATE-TURN-003)."""
     [call] = core._send_finish_outputs_to_client.call_args_list
+    assert call.kwargs == {"terminal": True}
     return call.args
 
 
@@ -1298,11 +1499,21 @@ def test_ordinary_engine_iterations_traverse_no_deadlines():
     core.scheduler.next_stream_deadline.assert_not_called()
 
 
-# @spec PSTATE-ADMIT-007
-def test_abort_outputs_name_the_deadline_that_expired():
+# @spec PSTATE-ADMIT-007 PSTATE-TURN-003
+@pytest.mark.parametrize(
+    ("resumable", "stop_reason", "terminal"),
+    [(True, "parked_idle_timeout", True), (False, None, False)],
+    ids=["state-stream", "ordinary-request"],
+)
+def test_abort_outputs_name_the_deadline_that_expired(resumable, stop_reason, terminal):
+    """A state stream's abort is terminal and names its deadline; an ordinary
+    request's abort carries neither, whatever stop_reason it kept."""
     core = _state_core()
     expired = MagicMock(
-        request_id="s", client_index=1, stop_reason="parked_idle_timeout"
+        request_id="s",
+        client_index=1,
+        stop_reason="parked_idle_timeout",
+        resumable=resumable,
     )
 
     core._send_abort_outputs([expired])
@@ -1310,9 +1521,10 @@ def test_abort_outputs_name_the_deadline_that_expired():
     client_index, outputs = core.output_queue.get_nowait()
     assert (client_index, outputs.finished_requests) == (1, ["s"])
     [output] = outputs.outputs
-    assert (output.finish_reason, output.stop_reason) == (
+    assert (output.finish_reason, output.stop_reason, output.terminal) == (
         FinishReason.ABORT,
-        "parked_idle_timeout",
+        stop_reason,
+        terminal,
     )
 
 

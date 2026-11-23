@@ -763,7 +763,6 @@ class OutputProcessor:
             req_state.persistent_state
             and len(req_state.input_chunk_queue) >= self.max_pending_stream_inputs
         ):
-            # @spec PSTATE-HIST-006
             self._end_stream(req_state, "pending_input_limit")
         else:
             # Queue the streaming update otherwise.
@@ -906,7 +905,6 @@ class OutputProcessor:
                 # if required.
                 req_state.logprobs_processor.update_from_output(engine_core_output)
 
-            # @spec PSTATE-TURN-003 PSTATE-HIST-010
             streaming_chunk_boundary = (
                 req_state.streaming_input
                 and finish_reason not in (FinishReason.ABORT, FinishReason.ERROR)
