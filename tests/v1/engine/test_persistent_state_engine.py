@@ -45,6 +45,7 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm.engine.protocol import StreamingInput
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import TokensPrompt
+from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.sampling_params import (
     RequestOutputKind,
     SamplingParams,
@@ -311,10 +312,12 @@ def _request_from(*, request_id, prompt, params, resumable=False, **kwargs):
     """What the input processor makes of `prompt`: its tokens, or one token
     for any other content."""
     ids = prompt.get("prompt_token_ids") if isinstance(prompt, Mapping) else None
+    embeds = prompt.get("prompt_embeds") if isinstance(prompt, Mapping) else None
     fields = {k: kwargs[k] for k in ("continuation", "external_req_id") if k in kwargs}
     return EngineCoreRequest(
         request_id=request_id,
         prompt_token_ids=list(ids or [1]),
+        prompt_embeds=embeds,
         mm_features=None,
         sampling_params=params,
         pooling_params=None,
@@ -735,6 +738,22 @@ async def test_input_with_any_content_is_forwarded(monkeypatch, prompt):
     assert [r.resumable for r in _sent(llm)] == [True, True, False]
 
 
+# @spec PSTATE-TURN-007 PSTATE-ADMIT-015
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_tokens", [False, True], ids=["embeddings", "mixed"])
+async def test_input_with_prompt_embeddings_ends_the_stream(monkeypatch, with_tokens):
+    llm = _state_llm(monkeypatch)
+    prompt = {"prompt_embeds": torch.zeros(2, 4)}
+    if with_tokens:
+        prompt["prompt_token_ids"] = [7, 7]
+
+    with pytest.raises(VLLMValidationError, match="prompt_embeds"):
+        await _consume(llm, _chunks([1], prompt, [2]))
+
+    assert _sent_prompts(llm) == [[1]]
+    assert _stream_id(llm) in _aborted(llm)
+
+
 REFUSED_SAMPLING_PARAMETERS = [
     ("presence_penalty", dict(presence_penalty=0.5)),
     ("frequency_penalty", dict(frequency_penalty=0.5)),
@@ -958,6 +977,8 @@ async def test_stream_closes_and_ends_with_its_only_credit_held(monkeypatch):
     outputs = await asyncio.wait_for(consumer, WATCHDOG)
 
     assert [output.finished for output in outputs] == [False, True]
+    await _let_ready_tasks_run()
+    assert [r.resumable for r in _sent(llm)] == [True, False]
 
 
 # @spec PSTATE-HIST-006 PSTATE-ADMIT-015
@@ -1645,6 +1666,58 @@ def _abort_from_eager_queue(core: EngineCoreProc) -> None:
 
 
 # @spec PSTATE-TURN-003 PSTATE-PAGE-004
+def test_abort_of_a_running_stream_publishes_one_end(monkeypatch):
+    """The step in flight when the abort lands publishes nothing more."""
+    core, free_pages = _live_core(monkeypatch)
+    core.scheduler.add_request(_stream_request("s"))
+    in_flight = core.scheduler.schedule()
+
+    _abort_from_input_queue(core)
+    outputs = core.scheduler.update_from_output(
+        in_flight, ModelRunnerOutput(req_ids=["s"], sampled_token_ids=[[7]])
+    )
+
+    _assert_ended_after_free(core, free_pages, FinishReason.ABORT)
+    assert not any(
+        output.request_id == "s"
+        for client_outputs in outputs.values()
+        for output in client_outputs.outputs
+    )
+
+
+# @spec PSTATE-TURN-019 PSTATE-TURN-015
+def test_close_without_tokens_still_ends_a_parked_stream(monkeypatch):
+    core, free_pages = _live_core(monkeypatch)
+    request = _park(core.scheduler, "s")
+
+    _add(core, _stream_request("s", 0, resumable=False, continuation=True))
+
+    assert request.status == RequestStatus.FINISHED_STOPPED
+    _assert_ended_after_free(core, free_pages, FinishReason.STOP)
+
+
+# @spec PSTATE-ADMIT-022 PSTATE-DECL-013
+def test_single_request_add_keeps_the_upstream_paths(monkeypatch):
+    """Neither admitted nor refused at the limit, and rejected in shutdown
+    with a non-terminal abort output."""
+    core, _ = _live_core(monkeypatch, max_num_seqs=1)
+    _admit_full(core)
+
+    _add(core, _stream_request("single", 3, resumable=False))
+    assert core.scheduler.has_request("single")
+    assert core.output_queue.published == []
+
+    core.shutdown_state = EngineShutdownState.REQUESTED
+    _add(core, _stream_request("late", 3, resumable=False))
+    [(_, output, _, _)] = core.output_queue.published
+    assert (output.request_id, output.finish_reason, output.terminal) == (
+        "late",
+        FinishReason.ABORT,
+        False,
+    )
+
+
+# @spec PSTATE-TURN-003 PSTATE-PAGE-004
 @pytest.mark.parametrize("kind", HOLD_KINDS)
 @pytest.mark.parametrize(
     "abort",
@@ -1678,29 +1751,49 @@ def test_abort_of_a_single_request_or_an_ordinary_stream_publishes_nothing(
     assert core.output_queue.published == []
 
 
-def _no_tokens(request):
-    request.prompt_token_ids = []
-    request._all_token_ids.clear()
-    request.num_prompt_tokens = 0
+STRUCTURED = SamplingParams(
+    max_tokens=4,
+    output_kind=DELTA,
+    structured_outputs=StructuredOutputsParams(regex="a+"),
+)
+
+
+def _no_tokens(request_id: str = "s", continuation: bool = False):
+    return _stream_request(request_id, 0, continuation=continuation)
+
+
+def _features_without_tokens(request_id: str = "s", continuation: bool = False):
+    request = _no_tokens(request_id, continuation)
+    request.mm_features = [_feature(offset=0, length=2)]
     return request
 
 
-def _with_embeddings(request):
-    request.prompt_embeds = torch.zeros(len(request.prompt_token_ids), 4)
+def _with_embeddings(request_id: str = "s", continuation: bool = False):
+    request = _stream_request(request_id, 2, continuation=continuation)
+    request.prompt_embeds = torch.zeros(2, 4)
     return request
 
 
-def _with_structured_outputs(request):
-    request.sampling_params = SamplingParams(
-        max_tokens=4,
-        output_kind=DELTA,
-        structured_outputs=StructuredOutputsParams(regex="a+"),
+def _with_structured_outputs(request_id: str = "s", continuation: bool = False):
+    request = _stream_request(
+        request_id, 2, continuation=continuation, sampling_params=STRUCTURED
     )
+    assert request.use_structured_output
     return request
+
+
+def _feature(offset: int, length: int) -> MultiModalFeatureSpec:
+    return MultiModalFeatureSpec(
+        data=None,
+        modality="audio",
+        identifier=f"audio-{offset}",
+        mm_position=PlaceholderRange(offset=offset, length=length),
+    )
 
 
 INAPPLICABLE = {
     "no_tokens": _no_tokens,
+    "features_without_tokens": _features_without_tokens,
     "embeddings": _with_embeddings,
     "structured_outputs": _with_structured_outputs,
 }
@@ -1715,7 +1808,7 @@ def test_inapplicable_continuation_ends_its_stream_with_a_validation_error(
     core, free_pages = _live_core(monkeypatch)
     request = _hold_kind(core, kind)
 
-    _add(core, make(_update("s", 2)))
+    _add(core, make(continuation=True))
 
     assert request.status == RequestStatus.FINISHED_ERROR
     _assert_ended_after_free(core, free_pages, FinishReason.ERROR, "validation_error")
@@ -1726,22 +1819,25 @@ def test_inapplicable_continuation_ends_its_stream_with_a_validation_error(
 def test_inapplicable_opener_creates_no_request(monkeypatch, make):
     core, free_pages = _live_core(monkeypatch)
 
-    _add(core, make(_stream_request("s", 2)))
+    _add(core, make())
 
     assert not core.scheduler.has_request("s")
     _assert_ended_after_free(core, free_pages, FinishReason.ERROR, "validation_error")
 
 
 # @spec PSTATE-TURN-019
-def test_feature_only_input_with_tokens_is_applied(monkeypatch):
+def test_feature_input_with_placeholder_tokens_is_applied(monkeypatch):
     """After preprocessing a feature occupies placeholder token positions, so
-    such an input has tokens and joins the stream."""
+    a feature input has tokens and joins the stream."""
     core, _ = _live_core(monkeypatch)
     request = _park(core.scheduler, "s")
+    update = _update("s", 3)
+    update.mm_features = [_feature(offset=0, length=3)]
 
-    _add(core, _update("s", 3))
+    _add(core, update)
 
     assert request.status == RequestStatus.WAITING
+    assert [f.identifier for f in request.mm_features] == ["audio-0"]
     assert core.output_queue.published == []
 
 
@@ -1749,11 +1845,7 @@ def test_feature_only_input_with_tokens_is_applied(monkeypatch):
 def test_admit_stream_refuses_structured_outputs(monkeypatch):
     core, _ = _live_core(monkeypatch)
     admission = _admission()
-    admission.sampling_params = SamplingParams(
-        max_tokens=4,
-        output_kind=DELTA,
-        structured_outputs=StructuredOutputsParams(regex="a+"),
-    )
+    admission.sampling_params = STRUCTURED
 
     assert core.admit_stream(admission) == "validation_error"
 
@@ -1864,7 +1956,7 @@ def test_unadmitted_opener_while_paused_is_refused_terminally(monkeypatch):
         (None, lambda: _stream_request("s", 3), FinishReason.ABORT),
         ("parked", lambda: _stream_request("s", 3), FinishReason.ABORT),
         ("parked", _update, FinishReason.ABORT),
-        ("parked", lambda: _no_tokens(_update("s", 2)), FinishReason.ABORT),
+        ("parked", lambda: _no_tokens(continuation=True), FinishReason.ABORT),
     ],
     ids=["opener", "opener_for_held_id", "continuation", "inapplicable_continuation"],
 )
@@ -1887,7 +1979,96 @@ def test_inapplicable_opener_for_a_held_id_publishes_one_output(monkeypatch):
     core, free_pages = _live_core(monkeypatch)
     held = _hold_kind(core, "parked")
 
-    _add(core, _no_tokens(_stream_request("s", 2)))
+    _add(core, _no_tokens())
 
     assert held.status == RequestStatus.FINISHED_ERROR
     _assert_ended_after_free(core, free_pages, FinishReason.ERROR)
+
+
+# @spec PSTATE-ADMIT-022
+@pytest.mark.parametrize("make_input", [_update, _close], ids=["input", "close"])
+@pytest.mark.parametrize("held", [None, "single_request"])
+def test_shutdown_still_drops_continuations_core_does_not_hold_as_streams(
+    monkeypatch, make_input, held
+):
+    core, _ = _live_core(monkeypatch)
+    if held is not None:
+        core.scheduler.add_request(_stream_request("s", resumable=False))
+    core.shutdown_state = EngineShutdownState.REQUESTED
+
+    _add(core, make_input())
+
+    assert core.scheduler.has_request("s") is (held is not None)
+    assert core.output_queue.published == []
+
+
+def _paused_and_full(core: EngineCoreProc) -> None:
+    _admit_full(core)
+    _admit_paused(core)
+    core.reject_new_requests = True
+
+
+# @spec PSTATE-ADMIT-022 PSTATE-ADMIT-021
+def test_held_id_outranks_an_inapplicable_input_pause_and_capacity(monkeypatch):
+    core, free_pages = _live_core(monkeypatch, max_num_seqs=2)
+    held = _hold_kind(core, "parked")
+    _paused_and_full(core)
+
+    _add(core, _with_structured_outputs())
+
+    assert held.status == RequestStatus.FINISHED_ERROR
+    client_index, output, still_held, _ = _only_output(core)
+    assert (output.request_id, output.finish_reason, output.terminal) == (
+        "s",
+        FinishReason.ERROR,
+        True,
+    )
+    assert output.error is None
+    assert not still_held
+
+
+# @spec PSTATE-ADMIT-022 PSTATE-TURN-019
+def test_inapplicable_opener_outranks_pause_and_capacity(monkeypatch):
+    core, _ = _live_core(monkeypatch, max_num_seqs=1)
+    _paused_and_full(core)
+
+    _add(core, _no_tokens())
+
+    _, output, _, _ = _only_output(core)
+    assert output.error is not None and output.error.code == "validation_error"
+    assert not core.scheduler.has_request("s")
+
+
+# @spec PSTATE-ADMIT-022
+def test_pause_outranks_capacity_for_an_opener(monkeypatch):
+    core, _ = _live_core(monkeypatch, max_num_seqs=1)
+    _paused_and_full(core)
+
+    _add(core, _stream_request("s", 3))
+
+    _, output, _, _ = _only_output(core)
+    assert output.error is not None and output.error.code == "engine_paused"
+
+
+# @spec PSTATE-ADMIT-022
+@pytest.mark.parametrize(
+    ("held", "structured", "reason"),
+    [
+        (True, True, "duplicate_request_id"),
+        (False, True, "validation_error"),
+        (False, False, "engine_paused"),
+    ],
+    ids=["held_id_first", "structured_outputs_next", "pause_before_capacity"],
+)
+def test_admit_stream_returns_the_first_refusal_in_order(
+    monkeypatch, held, structured, reason
+):
+    core, _ = _live_core(monkeypatch, max_num_seqs=2)
+    if held:
+        _hold_kind(core, "parked")
+    _paused_and_full(core)
+    admission = _admission()
+    if structured:
+        admission.sampling_params = STRUCTURED
+
+    assert core.admit_stream(admission) == reason

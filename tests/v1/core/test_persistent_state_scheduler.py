@@ -827,9 +827,18 @@ def test_close_after_max_tokens_stop_takes_its_status_from_where_it_waits(
     if not parked:
         scheduler.add_request(close("s"))
 
-    run_turn(scheduler, "s", [TOKEN])
+    _, outputs = step(scheduler, {"s": TOKEN})
+    turn_end = finished_output(outputs, "s")
     if parked:
+        assert turn_end.terminal is False
         scheduler.add_request(close("s"))
+        # The engine core publishes this stream's terminal output.
+        assert scheduler.ended_state_streams == [request]
+    else:
+        assert (turn_end.finish_reason, turn_end.terminal) == (
+            FinishReason.LENGTH,
+            True,
+        )
 
     assert request.status == status
     assert "s" not in scheduler.requests

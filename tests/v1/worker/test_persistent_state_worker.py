@@ -914,6 +914,8 @@ def test_output_processor_history_stays_bounded_over_many_turns():
         processor.add_request(_chunk([2] * _input_len(turn + MAX_PENDING + 1)), None)
         state = processor.request_states["stream"]
         assert len(state.input_chunk_queue) == MAX_PENDING
+        # Every turn, in tokens: one input's prompt, never the history.
+        assert len(state.prompt_token_ids or ()) <= MAX_INPUT
         if _measured(turn):
             sizes["request state"].append(
                 retained_bytes(state, exclude=(state.queue, state.input_chunk_queue))
@@ -987,6 +989,10 @@ def test_scheduler_request_history_stays_bounded_over_many_turns(monkeypatch):
             )
         scheduler.add_request(_stream_input(turn + MAX_PENDING + 1))
         assert len(request.streaming_queue) == MAX_PENDING
+        # Every turn, in tokens: the frontier, one input and one turn's output.
+        assert len(request.prompt_token_ids) <= 1 + MAX_INPUT
+        assert len(request.all_token_ids) <= 1 + MAX_INPUT + MAX_OUTPUT
+        assert len(request.block_hashes) <= 1
         if not measured:
             continue
         sizes["request"].append(

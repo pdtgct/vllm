@@ -25,7 +25,6 @@ from vllm.config import ModelConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.protocol import StreamingInput
 from vllm.inputs import TokensPrompt
-from vllm.model_executor.models.registry import _ModelInfo
 from vllm.plugins import load_general_plugins
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine.async_llm import AsyncLLM
@@ -125,12 +124,26 @@ class _UnknownStopStub(stub.StubPersistentStateForCausalLM):
     persistent_state_resumable_stops = frozenset({"eos", "stop_token"})
 
 
+def _config_for(model_cls) -> ModelConfig:
+    arch = model_cls.__name__
+    ModelRegistry.register_model(arch, model_cls)
+    return ModelConfig(
+        model="facebook/opt-125m", hf_overrides={"architectures": [arch]}
+    )
+
+
 # @spec PSTATE-DECL-004
-def test_resumable_stops_take_a_declared_subset_and_refuse_others():
-    info = _ModelInfo.from_model_cls(_DuplexStub)
-    assert info.persistent_state_resumable_stops == frozenset({"eos", "max_tokens"})
+def test_model_config_exposes_declared_resumable_stops():
+    load_general_plugins()
+    config = _config_for(_DuplexStub)
+    assert config.persistent_state_resumable_stops == frozenset({"eos", "max_tokens"})
+
+
+# @spec PSTATE-DECL-004
+def test_configuration_refuses_an_unknown_resumable_stop():
+    load_general_plugins()
     with pytest.raises(ValueError, match="persistent_state_resumable_stops"):
-        _ModelInfo.from_model_cls(_UnknownStopStub)
+        _config_for(_UnknownStopStub)
 
 
 def _stub_layer_spec(**hf_config):
