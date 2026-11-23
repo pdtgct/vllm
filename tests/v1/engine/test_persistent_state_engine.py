@@ -2195,6 +2195,46 @@ def test_in_process_client_refuses_state_streams_only(state):
         assert preprocessed == ["s"]
 
 
+# @spec PSTATE-ADMIT-022
+@pytest.mark.parametrize("shutdown", [False, True], ids=["running", "shutdown"])
+def test_cache_miss_naming_a_held_stream_carries_the_hashes(monkeypatch, shutdown):
+    """A single request that names a held stream ends it, and its output still
+    carries the hashes, whether or not the engine core is shutting down."""
+    core, free_pages = _live_core(monkeypatch)
+    _park(core.scheduler, "s")
+    if shutdown:
+        core.shutdown_state = EngineShutdownState.REQUESTED
+
+    core._handle_mm_cache_miss(
+        _core_request("s", [1], client_index=1), MultiModalCacheMissError(["h1"])
+    )
+    _drain_inputs(core)
+
+    output = _assert_ended_after_free(
+        core, free_pages, FinishReason.ABORT if shutdown else FinishReason.ERROR
+    )
+    assert output.mm_cache_miss_hashes == ["h1"]
+
+
+# @spec PSTATE-ADMIT-022 PSTATE-DECL-013
+def test_cache_miss_of_a_single_request_keeps_the_upstream_output(monkeypatch):
+    core, _ = _live_core(monkeypatch)
+
+    core._handle_mm_cache_miss(
+        _core_request("single", [1], client_index=1),
+        MultiModalCacheMissError(["h1"]),
+    )
+    _drain_inputs(core)
+
+    _, output, _, _ = _only_output(core)
+    assert (output.finish_reason, output.terminal, output.error) == (
+        FinishReason.ERROR,
+        False,
+        None,
+    )
+    assert output.mm_cache_miss_hashes == ["h1"]
+
+
 # @spec PSTATE-ADMIT-022 PSTATE-PAGE-004
 @pytest.mark.parametrize("continuation", [True, False], ids=["continuation", "opener"])
 def test_cache_miss_on_a_state_stream_input_ends_it_terminally(

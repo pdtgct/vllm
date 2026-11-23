@@ -2100,7 +2100,11 @@ class EngineCoreProc(EngineCore):
             )
 
     # @spec PSTATE-ADMIT-022
-    def _reject_add_in_shutdown(self, request: Request | EngineCoreRequest) -> bool:
+    def _reject_add_in_shutdown(
+        self,
+        request: Request | EngineCoreRequest,
+        mm_cache_miss_hashes: list[str] | None = None,
+    ) -> bool:
         if self.shutdown_state == EngineShutdownState.RUNNING:
             return False
 
@@ -2111,13 +2115,18 @@ class EngineCoreProc(EngineCore):
         # Other continuations were dropped already.
         state = self.scheduler.has_unrecomputable_state
         if state and self.scheduler.has_request(request.request_id):
-            self._end_held_stream(request.request_id, RequestStatus.FINISHED_ABORTED)
+            self._end_held_stream(
+                request.request_id,
+                RequestStatus.FINISHED_ABORTED,
+                mm_cache_miss_hashes=mm_cache_miss_hashes,
+            )
         else:
             self._send_finish_outputs_to_client(
                 [request.request_id],
                 request.client_index,
                 FinishReason.ABORT,
                 terminal=state and request.resumable,
+                mm_cache_miss_hashes=mm_cache_miss_hashes,
             )
         return True
 
@@ -2204,7 +2213,7 @@ class EngineCoreProc(EngineCore):
         req_id = request.request_id
         scheduler = self.scheduler
         if self._drop_unknown_continuation(request) or self._reject_add_in_shutdown(
-            request
+            request, mm_cache_miss_hashes
         ):
             return
         if request.continuation:
@@ -2213,7 +2222,11 @@ class EngineCoreProc(EngineCore):
             )
             return
         if scheduler.has_request(req_id):
-            self._end_held_stream(req_id, RequestStatus.FINISHED_ERROR)
+            self._end_held_stream(
+                req_id,
+                RequestStatus.FINISHED_ERROR,
+                mm_cache_miss_hashes=mm_cache_miss_hashes,
+            )
             return
         # A single request keeps upstream's rejection output.
         self._send_finish_outputs_to_client(
@@ -2603,15 +2616,17 @@ class EngineCoreProc(EngineCore):
             request.request_id,
             err.mm_hashes,
         )
-        error = RequestError(
-            code="multimodal_cache_miss",
-            message="Multi-modal processor cache miss.",
-            retryable=True,
+        # A single request keeps upstream's output, which carries no error.
+        error = (
+            RequestError(
+                code="multimodal_cache_miss",
+                message="Multi-modal processor cache miss.",
+                retryable=True,
+            )
+            if request.continuation or request.resumable
+            else None
         )
-        stream_input = request.continuation or request.resumable
-        if stream_input and self._route_stream_input_rejection(
-            request, error, list(err.mm_hashes)
-        ):
+        if self._route_stream_input_rejection(request, error, list(err.mm_hashes)):
             return
         self.output_queue.put_nowait(
             (
