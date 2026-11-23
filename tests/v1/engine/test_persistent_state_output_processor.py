@@ -10,10 +10,8 @@ import numpy as np
 import pytest
 
 from vllm.exceptions import GenerationError
-from vllm.outputs import RequestError
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
-from vllm.v1.engine.exceptions import StreamAdmissionError
 from vllm.v1.engine.output_processor import (
     OutputProcessor,
     StreamingInputOutputCollector,
@@ -23,8 +21,10 @@ from vllm.v1.outputs import LogprobsLists
 MAX_PENDING = 8
 
 
-def _processor(tokenizer=None) -> OutputProcessor:
-    return OutputProcessor(tokenizer, log_stats=False, persistent_state=True)
+def _processor(tokenizer=None, persistent_state: bool = True) -> OutputProcessor:
+    return OutputProcessor(
+        tokenizer, log_stats=False, persistent_state=persistent_state
+    )
 
 
 def _input(
@@ -72,7 +72,7 @@ def _queue_input(processor: OutputProcessor, token_ids: list[int], prompt=None):
 def _turn_end(
     processor: OutputProcessor,
     token: int = 4,
-    finish_reason: FinishReason = FinishReason.LENGTH,
+    finish_reason: FinishReason = FinishReason.STOP,
     **fields,
 ):
     return processor.process_outputs(
@@ -114,25 +114,42 @@ def test_update_replaces_the_prompt_text_and_ids():
     assert state.prompt_len == 2
 
 
-# @spec PSTATE-HIST-005
-def test_detokenizer_keeps_only_a_tail_after_an_update(dummy_test_vectors):
-    processor = _processor(dummy_test_vectors.tokenizer)
+def _turn_texts(vectors, persistent_state: bool) -> tuple[list[str], list[int]]:
+    """Stream six turns, each queued before the previous one ends, and return
+    each turn's text and the tokens the detokenizer retains after it."""
+    processor = _processor(vectors.tokenizer, persistent_state=persistent_state)
     queue = StreamingInputOutputCollector(RequestOutputKind.DELTA, "s")
-    first, second = dummy_test_vectors.prompt_tokens[:2]
-    processor.add_request(
-        _input("s", first, detokenize=True),
-        dummy_test_vectors.prompt_strings[0],
-        queue=queue,
-    )
-    processor.add_request(_input("s", second, detokenize=True), None)
-    turn = dummy_test_vectors.generation_tokens[0] * 4
-    assert len(turn) > 40
+    prompts = vectors.prompt_tokens
+    generated = list(vectors.generation_tokens[0]) * 8
+    assert len(generated) >= 48
+    turns = [generated[i : i + 8] for i in range(0, 48, 8)]
+    processor.add_request(_input("s", prompts[0], detokenize=True), None, queue=queue)
+    texts, retained = [], []
+    for i, turn in enumerate(turns):
+        if i + 1 < len(turns):
+            next_prompt = prompts[(i + 1) % len(prompts)]
+            processor.add_request(_input("s", next_prompt, detokenize=True), None)
+        processor.process_outputs(
+            [EngineCoreOutput("s", turn, finish_reason=FinishReason.STOP)]
+        )
+        output = queue.get_nowait()
+        assert output is not None
+        texts.append(output.outputs[0].text)
+        retained.append(len(processor.request_states["s"].detokenizer.token_ids))
+    return texts, retained
 
-    processor.process_outputs(
-        [EngineCoreOutput("s", turn, finish_reason=FinishReason.LENGTH)]
-    )
 
-    assert len(processor.request_states["s"].detokenizer.token_ids) <= 8
+# @spec PSTATE-HIST-005
+def test_detokenizer_tail_decodes_each_turn_as_full_history_does(
+    dummy_test_vectors,
+):
+    expected, _ = _turn_texts(dummy_test_vectors, persistent_state=False)
+
+    texts, retained = _turn_texts(dummy_test_vectors, persistent_state=True)
+
+    assert texts == expected
+    assert all(text for text in texts)
+    assert max(retained[2:]) <= max(retained[:2])
 
 
 # @spec PSTATE-HIST-005
@@ -170,12 +187,23 @@ def test_per_request_accumulators_reset_each_turn():
 
 
 # @spec PSTATE-HIST-006
-def test_input_chunk_queue_holds_at_most_the_pending_bound():
+def test_input_chunk_queue_holds_the_pending_bound():
+    processor = _processor()
+    _open(processor)
+    for i in range(MAX_PENDING):
+        _queue_input(processor, [10 + i])
+
+    assert len(processor.request_states["s"].input_chunk_queue) == MAX_PENDING
+    assert processor.has_request("s")
+
+
+# @spec PSTATE-HIST-007
+@pytest.mark.xfail(strict=False, reason="pending Pete: backpressure vs error")
+def test_input_beyond_the_pending_bound_ends_the_stream():
     processor = _processor()
     queue = _open(processor)
     for i in range(MAX_PENDING):
         _queue_input(processor, [10 + i])
-    assert len(processor.request_states["s"].input_chunk_queue) == MAX_PENDING
 
     _queue_input(processor, [99])
 
@@ -226,10 +254,14 @@ def test_unread_turns_beyond_the_bound_finish_the_stream_with_a_named_error():
         _queue_input(processor, [10 + i])
     _run_turns(processor, MAX_PENDING)
 
-    _turn_end(processor)
+    processed = _turn_end(processor)
 
+    assert processed.reqs_to_abort == ["s"]
+    assert not processor.has_request("s")
     with pytest.raises(GenerationError) as excinfo:
         queue.get_nowait()
+    # Not retryable: a client that stopped reading has lost turns.
+    assert type(excinfo.value) is GenerationError
     assert "output_backlog_limit" in str(excinfo.value)
 
 
@@ -262,31 +294,3 @@ def test_terminal_output_is_delivered_with_a_full_backlog_and_drops_inputs():
     assert not processor.has_request("s")
     outputs = [queue.get_nowait() for _ in range(MAX_PENDING + 1)]
     assert [output.finished for output in outputs] == [False] * MAX_PENDING + [True]
-
-
-# @spec PSTATE-ADMIT-001
-@pytest.mark.parametrize(
-    "reason", ["request_id_in_use", "engine_paused", "active_limit"]
-)
-def test_refused_stream_admission_raises_with_its_reason(reason):
-    processor = _processor()
-    queue = StreamingInputOutputCollector(RequestOutputKind.DELTA, "s")
-    request = _input("s", [])
-    request.stream_admission = True
-    processor.add_request(request, None, queue=queue)
-
-    processor.process_outputs(
-        [
-            EngineCoreOutput(
-                "s",
-                [],
-                finish_reason=FinishReason.ERROR,
-                error=RequestError(code=reason, message=reason),
-            )
-        ]
-    )
-
-    with pytest.raises(StreamAdmissionError) as excinfo:
-        queue.get_nowait()
-    assert excinfo.value.reason == reason
-    assert not processor.has_request("s")

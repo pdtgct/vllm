@@ -59,7 +59,12 @@ def _in_process_llm(arch: str = STUB_ARCH, **kwargs) -> LLM:
     _register_no_warmup_arch()
     stub.EVENTS.clear()
     stub.PREFILL_STARTS.clear()
-    return LLM(**_engine_kwargs(arch, stub_initial_total=INITIAL_TOTAL), **kwargs)
+    engine_kwargs = _engine_kwargs(arch, stub_initial_total=INITIAL_TOTAL)
+    if kwargs.get("enable_extensible_kv_cache"):
+        # An extensible cache is sized from measured memory, which a block
+        # count override would replace.
+        del engine_kwargs["num_gpu_blocks_override"]
+    return LLM(**engine_kwargs, **kwargs)
 
 
 def _requires_extensible_kv_cache() -> None:
@@ -67,6 +72,7 @@ def _requires_extensible_kv_cache() -> None:
         pytest.skip(f"VMM unavailable: {reason}")
 
 
+# @spec PSTATE-DECL-004
 @pytest.mark.parametrize(
     ("arch", "declared"),
     [
@@ -74,7 +80,6 @@ def _requires_extensible_kv_cache() -> None:
         (NO_WARMUP_ARCH, (False, True, False, False)),
     ],
 )
-# @spec PSTATE-DECL-004
 def test_model_config_exposes_the_state_declarations(arch, declared):
     load_general_plugins()
     _register_no_warmup_arch()
@@ -103,8 +108,8 @@ def _stub_layer_spec(**hf_config):
     return layer.get_kv_cache_config(vllm_config).spec
 
 
-@pytest.mark.parametrize("initial_total", [0, INITIAL_TOTAL])
 # @spec PSTATE-DECL-002
+@pytest.mark.parametrize("initial_total", [0, INITIAL_TOTAL])
 def test_stub_state_declares_one_initial_value_per_component(initial_total):
     spec = _stub_layer_spec(stub_initial_total=initial_total)
     assert spec.initial_values == (initial_total, 0)
@@ -116,10 +121,10 @@ def test_stub_state_declares_its_tensor_parallel_ownership():
     assert _stub_layer_spec().tp_replicated is True
 
 
+# @spec PSTATE-PAGE-001
 @create_new_process_for_each_test("spawn")
 @pytest.mark.parametrize("enforce_eager", [True, False])
 @pytest.mark.parametrize("initial_total", [0, INITIAL_TOTAL])
-# @spec PSTATE-PAGE-001
 def test_llm_reuses_slots_from_a_fresh_state(enforce_eager, initial_total):
     """Six prompts through two slots: each produces the tokens of a page that
     holds its initial values, so a reused slot never carries its previous
@@ -174,8 +179,8 @@ async def test_async_llm_streams_keep_their_state_across_inputs():
         llm.shutdown()
 
 
-@pytest.mark.asyncio
 # @spec PSTATE-PAGE-002
+@pytest.mark.asyncio
 async def test_page_is_initialized_once_across_the_turns_of_a_stream():
     """A later turn, which core compacts, continues from its page rather than
     from the initial values."""
@@ -192,8 +197,8 @@ async def test_page_is_initialized_once_across_the_turns_of_a_stream():
         llm.shutdown()
 
 
-@pytest.mark.asyncio
 # @spec PSTATE-ASYNC-003
+@pytest.mark.asyncio
 async def test_async_scheduling_applies_each_committed_input_exactly_once():
     """Four sessions share two slots under async scheduling. A step run for a
     row after its stop would add the EOS token to the session's state and
@@ -214,8 +219,8 @@ async def test_async_scheduling_applies_each_committed_input_exactly_once():
         llm.shutdown()
 
 
-@pytest.mark.asyncio
 # @spec PSTATE-HIST-004
+@pytest.mark.asyncio
 async def test_positions_stay_absolute_across_compacted_turns():
     llm = AsyncLLM.from_engine_args(
         AsyncEngineArgs(**_engine_kwargs(stub_reads_positions=True))
@@ -230,8 +235,8 @@ async def test_positions_stay_absolute_across_compacted_turns():
         llm.shutdown()
 
 
-@create_new_process_for_each_test("spawn")
 # @spec PSTATE-FAIL-001
+@create_new_process_for_each_test("spawn")
 def test_model_reported_failure_ends_only_its_request():
     llm = LLM(**_engine_kwargs())
     vocab_size = llm.llm_engine.model_config.get_vocab_size()
@@ -249,16 +254,16 @@ def test_model_reported_failure_ends_only_its_request():
     assert outputs[1].outputs[0].finish_reason == "error"
 
 
+# @spec PSTATE-PREP-001 PSTATE-PREP-002 PSTATE-PREP-003
 @create_new_process_for_each_test("spawn")
-# @spec PSTATE-PREP-001, PSTATE-PREP-002, PSTATE-PREP-003
 def test_startup_runs_no_request_through_a_model_that_declines_warmup():
     _requires_extensible_kv_cache()
     _in_process_llm(NO_WARMUP_ARCH, enable_extensible_kv_cache=True)
     assert [event for event in stub.EVENTS if event[0] == "add"] == []
 
 
-@create_new_process_for_each_test("spawn")
 # @spec PSTATE-PREP-001
+@create_new_process_for_each_test("spawn")
 def test_startup_warms_up_a_model_that_accepts_it():
     """The control of the test above: the same startup does run warmup
     requests through a model that accepts them."""
@@ -267,8 +272,8 @@ def test_startup_warms_up_a_model_that_accepts_it():
     assert [event for event in stub.EVENTS if event[0] == "add"] != []
 
 
-@create_new_process_for_each_test("spawn")
 # @spec PSTATE-PREP-005
+@create_new_process_for_each_test("spawn")
 def test_warmup_requests_read_initialized_pages():
     _requires_extensible_kv_cache()
     llm = _in_process_llm(enable_extensible_kv_cache=True)
@@ -277,8 +282,8 @@ def test_warmup_requests_read_initialized_pages():
     del llm
 
 
+# @spec PSTATE-PREP-004 PSTATE-PREP-008
 @create_new_process_for_each_test("spawn")
-# @spec PSTATE-PREP-004, PSTATE-PREP-008
 def test_engine_is_ready_after_the_model_state_is_prepared_and_captured():
     llm = _in_process_llm()
     assert stub.EVENTS.count(("prepare_execution_memory",)) == 1
@@ -288,8 +293,8 @@ def test_engine_is_ready_after_the_model_state_is_prepared_and_captured():
     assert llm.llm_engine.engine_core.engine_core.is_inference_ready()
 
 
-@create_new_process_for_each_test("spawn")
 # @spec PSTATE-PREP-006
+@create_new_process_for_each_test("spawn")
 def test_full_wake_after_deep_sleep_recaptures_model_state_graphs_once():
     llm = _in_process_llm(enable_sleep_mode=True)
     ready = len(stub.EVENTS)
@@ -300,8 +305,8 @@ def test_full_wake_after_deep_sleep_recaptures_model_state_graphs_once():
     assert stub.EVENTS[ready:] == [("clear",), ("capture", False)]
 
 
-@create_new_process_for_each_test("spawn")
 # @spec PSTATE-PREP-009
+@create_new_process_for_each_test("spawn")
 def test_light_sleep_and_cache_reset_keep_model_state_graphs():
     llm = _in_process_llm(enable_sleep_mode=True)
     ready = len(stub.EVENTS)

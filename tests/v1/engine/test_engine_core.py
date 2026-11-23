@@ -818,6 +818,7 @@ def _pausable_engine_core_proc() -> EngineCoreProc:
     core.model_executor.vllm_config.cache_config.enable_extensible_kv_cache = False
     core.scheduler = MagicMock()
     core.scheduler.has_requests.return_value = False
+    core.scheduler.has_unrecomputable_state = False
     core.batch_queue = None
     core.engines_running = False
     core._idle_state_callbacks = []
