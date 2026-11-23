@@ -759,6 +759,17 @@ class AsyncLLM(EngineClient):
                     if sp:
                         if state_stream:
                             self._validate_state_stream_input(sp)
+                            # @spec PSTATE-DECL-007 PSTATE-TURN-020
+                            if (
+                                isinstance(sp, SamplingParams)
+                                and isinstance(sampling_params, SamplingParams)
+                                and sp.structured_outputs
+                                != sampling_params.structured_outputs
+                            ):
+                                raise VLLMValidationError(
+                                    "structured_outputs cannot change within a stream",
+                                    parameter="structured_outputs",
+                                )
                         self._validate_streaming_input_sampling_params(sp)
                     else:
                         sp = sampling_params
@@ -856,7 +867,6 @@ class AsyncLLM(EngineClient):
             ("frequency_penalty", params.frequency_penalty != 0),
             ("repetition_penalty", params.repetition_penalty != 1),
             ("bad_words", bool(params.bad_words)),
-            ("structured_outputs", params.structured_outputs is not None),
             ("prompt_logprobs", params.prompt_logprobs is not None),
             ("thinking_token_budget", params.thinking_token_budget is not None),
         )

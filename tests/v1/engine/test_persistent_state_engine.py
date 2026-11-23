@@ -756,15 +756,38 @@ async def test_input_with_prompt_embeddings_ends_the_stream(monkeypatch, with_to
     assert _stream_id(llm) in _aborted(llm)
 
 
+# @spec PSTATE-DECL-007 PSTATE-TURN-020
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", [False, True], ids=["same", "changed"])
+async def test_state_stream_keeps_its_structured_outputs(monkeypatch, changed):
+    llm = _state_llm(monkeypatch)
+    opened = StructuredOutputsParams(regex="a+")
+    later = StructuredOutputsParams(regex="b+") if changed else opened
+    update = StreamingInput(
+        prompt=TokensPrompt(prompt_token_ids=[2]),
+        sampling_params=_params(structured_outputs=later),
+    )
+
+    if changed:
+        with pytest.raises(VLLMValidationError, match="structured_outputs"):
+            await _consume(
+                llm, _chunks([1], update), _params(structured_outputs=opened)
+            )
+        assert _sent_prompts(llm) == [[1]]
+    else:
+        await _open(llm, _chunks([1], update), _params(structured_outputs=opened))
+        await _until(lambda: len(_sent(llm)) == 3, "two inputs and the close")
+        assert [r.sampling_params.structured_outputs for r in _sent(llm)[:2]] == [
+            opened,
+            opened,
+        ]
+
+
 REFUSED_SAMPLING_PARAMETERS = [
     ("presence_penalty", dict(presence_penalty=0.5)),
     ("frequency_penalty", dict(frequency_penalty=0.5)),
     ("repetition_penalty", dict(repetition_penalty=1.1)),
     ("bad_words", dict(bad_words=["no"])),
-    (
-        "structured_outputs",
-        dict(structured_outputs=StructuredOutputsParams(json_object=True)),
-    ),
     ("prompt_logprobs", dict(prompt_logprobs=1)),
     ("thinking_token_budget", dict(thinking_token_budget=8)),
 ]
@@ -1797,7 +1820,6 @@ INAPPLICABLE = {
     "no_tokens": _no_tokens,
     "features_without_tokens": _features_without_tokens,
     "embeddings": _with_embeddings,
-    "structured_outputs": _with_structured_outputs,
 }
 
 
@@ -1843,16 +1865,35 @@ def test_feature_input_with_placeholder_tokens_is_applied(monkeypatch):
     assert core.output_queue.published == []
 
 
-# @spec PSTATE-TURN-019 PSTATE-ADMIT-022
-def test_admit_stream_refuses_structured_outputs(monkeypatch):
+# @spec PSTATE-TURN-020 PSTATE-ADMIT-018
+def test_opener_with_structured_outputs_opens_the_stream(monkeypatch):
     core, _ = _live_core(monkeypatch)
-    admission = _admission()
-    admission.sampling_params = STRUCTURED
 
-    assert core.admit_stream(admission) == "validation_error"
+    _add(core, _with_structured_outputs())
 
-    assert not core.scheduler.has_request("s")
+    held = core.scheduler.requests["s"]
+    assert held.use_structured_output
+    assert held in core.scheduler.resumed_streaming_sessions
     assert core.output_queue.published == []
+
+
+# @spec PSTATE-TURN-019 PSTATE-TURN-020
+@pytest.mark.parametrize("same", [True, False], ids=["same", "changed"])
+def test_continuation_must_keep_the_streams_structured_outputs(monkeypatch, same):
+    core, free_pages = _live_core(monkeypatch)
+    request = _with_structured_outputs()
+    core.scheduler.add_request(request)
+
+    if same:
+        _add(core, _with_structured_outputs(continuation=True))
+        assert core.output_queue.published == []
+        assert core.scheduler.has_request("s")
+    else:
+        _add(core, _update("s", 2))
+        assert request.status == RequestStatus.FINISHED_ERROR
+        _assert_ended_after_free(
+            core, free_pages, FinishReason.ERROR, "validation_error"
+        )
 
 
 # @spec PSTATE-TURN-006
@@ -2016,7 +2057,7 @@ def test_held_id_outranks_an_inapplicable_input_pause_and_capacity(monkeypatch):
     held = _hold_kind(core, "parked")
     _paused_and_full(core)
 
-    _add(core, _with_structured_outputs())
+    _add(core, _no_tokens())
 
     assert held.status == RequestStatus.FINISHED_ERROR
     client_index, output, still_held, _ = _only_output(core)
@@ -2054,28 +2095,18 @@ def test_pause_outranks_capacity_for_an_opener(monkeypatch):
 
 # @spec PSTATE-ADMIT-022
 @pytest.mark.parametrize(
-    ("held", "structured", "reason"),
-    [
-        (True, True, "duplicate_request_id"),
-        (False, True, "validation_error"),
-        (False, False, "engine_paused"),
-    ],
-    ids=["held_id_first", "structured_outputs_next", "pause_before_capacity"],
+    ("held", "reason"),
+    [(True, "duplicate_request_id"), (False, "engine_paused")],
+    ids=["held_id_first", "pause_before_capacity"],
 )
-def test_admit_stream_returns_the_first_refusal_in_order(
-    monkeypatch, held, structured, reason
-):
+def test_admit_stream_returns_the_first_refusal_in_order(monkeypatch, held, reason):
     # Full either way: the held stream takes one of two rows, or nothing is
     # held and the single row is taken.
     core, _ = _live_core(monkeypatch, max_num_seqs=2 if held else 1)
     if held:
         _hold_kind(core, "parked")
     _paused_and_full(core)
-    admission = _admission()
-    if structured:
-        admission.sampling_params = STRUCTURED
-
-    assert core.admit_stream(admission) == reason
+    assert core.admit_stream(_admission()) == reason
 
 
 def _reject(core: EngineCoreProc, request: EngineCoreRequest) -> None:

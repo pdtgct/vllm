@@ -130,15 +130,12 @@ _R = TypeVar("_R")  # Return type for collective_rpc
 
 def _unappliable_state_input(request: Request) -> str | None:
     """Why the scheduler cannot fold `request`, a non-close input of a state
-    stream, or None: it has no tokens to schedule, embeddings the fold drops,
-    or a grammar the fold path never waits for."""
+    stream, or None: it has no tokens to schedule, or embeddings the fold
+    drops."""
     if request.prompt_embeds is not None:
         return "prompt_embeds is not supported for this model"
     if not request.prompt_token_ids:
         return "An input of this stream carries no prompt tokens"
-    params = request.sampling_params
-    if params is not None and params.structured_outputs is not None:
-        return "structured_outputs is not supported for this model"
     return None
 
 
@@ -637,13 +634,10 @@ class EngineCore:
     def admit_stream(self, request: EngineCoreRequest) -> str | None:
         """Admit a persistent-state stream before any input, or return the
         refusal reason."""
-        # @spec PSTATE-ADMIT-021 PSTATE-TURN-019 PSTATE-ADMIT-022
+        # @spec PSTATE-ADMIT-021 PSTATE-ADMIT-022 PSTATE-TURN-020
         if self.scheduler.has_request(request.request_id):
             self._end_held_stream(request.request_id, RequestStatus.FINISHED_ERROR)
             return "duplicate_request_id"
-        params = request.sampling_params
-        if params is not None and params.structured_outputs is not None:
-            return "validation_error"
         if request.prompt_token_ids is None:
             # A utility call carries no packed prompt; the first input brings one.
             request.prompt_token_ids = []
@@ -2156,7 +2150,14 @@ class EngineCoreProc(EngineCore):
             return True
         if not request.resumable:
             return False
-        if (problem := _unappliable_state_input(request)) is not None:
+        problem = _unappliable_state_input(request)
+        if (
+            problem is None
+            and request.continuation
+            and scheduler.changes_structured_outputs(request)
+        ):
+            problem = "structured_outputs cannot change within a stream"
+        if problem is not None:
             error = RequestError(code="validation_error", message=problem)
             if request.continuation:
                 self._end_held_stream(req_id, RequestStatus.FINISHED_ERROR, error)

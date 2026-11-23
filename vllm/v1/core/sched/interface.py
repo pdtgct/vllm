@@ -168,6 +168,11 @@ class SchedulerInterface(ABC):
         reason having changed nothing."""
         raise NotImplementedError
 
+    def changes_structured_outputs(self, request: "Request") -> bool:
+        """Whether a continuation of a held persistent-state stream carries
+        other structured outputs than the stream opened with."""
+        raise NotImplementedError
+
     def holds_stream(self, request_id: str) -> bool:
         """Whether `request_id` names a held persistent-state stream."""
         raise NotImplementedError

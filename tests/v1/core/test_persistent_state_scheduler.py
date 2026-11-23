@@ -16,6 +16,7 @@ from vllm.sampling_params import (
     RepetitionDetectionParams,
     RequestOutputKind,
     SamplingParams,
+    StructuredOutputsParams,
 )
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
@@ -23,6 +24,7 @@ from vllm.v1.engine import FinishReason
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig, MambaSpec
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
+from vllm.v1.structured_output.request import StructuredOutputRequest
 
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, full_layer
 
@@ -842,6 +844,50 @@ def test_close_after_max_tokens_stop_takes_its_status_from_where_it_waits(
 
     assert request.status == status
     assert "s" not in scheduler.requests
+
+
+class _ReadyGrammar:
+    """Stands for a compiled grammar that accepts every token."""
+
+    def accept_tokens(self, request_id, tokens):
+        return True
+
+    def is_terminated(self):
+        return False
+
+
+# @spec PSTATE-TURN-020
+@pytest.mark.parametrize("compiled", ["ready", "failed"])
+def test_first_input_of_an_admitted_stream_waits_for_its_grammar(monkeypatch, compiled):
+    scheduler = make_scheduler(monkeypatch)
+    admission = stream_input("s", 0)
+    admission.sampling_params = SamplingParams(
+        max_tokens=100,
+        output_kind=RequestOutputKind.DELTA,
+        structured_outputs=StructuredOutputsParams(regex="a+"),
+    )
+    admission.structured_output_request = StructuredOutputRequest.from_sampling_params(
+        admission.sampling_params
+    )
+    scheduler.admit_stream(admission)
+    first = update("s", 4)
+    first.sampling_params = admission.sampling_params
+
+    scheduler.add_request(first)
+
+    assert admission.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
+    assert "s" not in scheduler.schedule().num_scheduled_tokens
+
+    if compiled == "ready":
+        admission.structured_output_request.grammar = _ReadyGrammar()
+        assert "s" in scheduler.schedule().num_scheduled_tokens
+    else:
+        admission.structured_output_request.grammar = ValueError("bad schema")
+        _, outputs = step(scheduler)
+        output = finished_output(outputs, "s")
+        assert (output.finish_reason, output.terminal) == (FinishReason.ERROR, True)
+        assert output.error is not None and output.error.code == "validation_error"
+        assert "s" not in scheduler.requests
 
 
 # @spec PSTATE-TURN-014

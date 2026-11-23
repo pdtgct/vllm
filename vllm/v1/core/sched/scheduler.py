@@ -2071,6 +2071,12 @@ class Scheduler(SchedulerInterface):
             if session.num_computed_tokens > 0 or self.has_unrecomputable_state:
                 self.resumed_streaming_sessions.add(session)
         session.status = RequestStatus.WAITING
+        if self.has_unrecomputable_state and session.use_structured_output:
+            # @spec PSTATE-TURN-020: an admitted stream's grammar may still be
+            # compiling when its first input folds in.
+            grammar = session.structured_output_request.grammar  # type: ignore[union-attr]
+            if grammar is None or isinstance(grammar, Exception):
+                session.status = RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
 
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
@@ -3358,6 +3364,16 @@ class Scheduler(SchedulerInterface):
         if num_active >= self.max_num_active_reqs:
             return "active_limit"
         return None
+
+    def changes_structured_outputs(self, request: Request) -> bool:
+        """Whether `request`, a continuation of a held stream, carries other
+        structured outputs than the stream opened with."""
+        held = self.requests[request.request_id]
+        assert held.sampling_params is not None and request.sampling_params is not None
+        return (
+            request.sampling_params.structured_outputs
+            != held.sampling_params.structured_outputs
+        )
 
     def holds_stream(self, request_id: str) -> bool:
         """Whether `request_id` names a held state stream, not a single request."""
