@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, cast
 import numpy as np
 import torch
 
+from vllm.exceptions import GenerationError, VLLMValidationError
 from vllm.lora.request import LoRARequest
 from vllm.outputs import (
     STREAM_FINISHED,
@@ -33,6 +34,7 @@ from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.gc_utils import gc_untrack
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
+from vllm.v1.engine.exceptions import StreamAdmissionError
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import (
@@ -108,6 +110,10 @@ class RequestOutputCollector:
             self._input_stream_task.cancel()
         self._input_stream_task = None
 
+    def num_pending_turns(self) -> int:
+        """Completed streaming-input turns the consumer has not taken yet."""
+        return 0
+
     def __del__(self):
         if (task := self._input_stream_task) is not None:
             task.get_loop().call_soon_threadsafe(task.cancel)
@@ -160,6 +166,9 @@ class StreamingInputOutputCollector(RequestOutputCollector):
             self.ready.set()
         return output
 
+    def num_pending_turns(self) -> int:
+        return len(self._backlog) + (1 if _is_chunk_boundary(self.output) else 0)
+
 
 @dataclass(slots=True)
 class OutputProcessorOutput:
@@ -205,6 +214,8 @@ class RequestState:
         temperature: float | None = None,
         stream_input: bool = False,
         remote_prefill_cached_tokens: int | None = None,
+        persistent_state: bool = False,
+        stream_admission: bool = False,
     ):
         self.request_id = request_id
         self.external_req_id = external_req_id
@@ -253,25 +264,47 @@ class RequestState:
         self.input_chunk_queue: deque[StreamingUpdate] | None = (
             deque() if stream_input else None
         )
+        # A persistent-state request's history is replaced on each update.
+        self.persistent_state = persistent_state
+        # Opened by a stream admission; True until its first input arrives.
+        self.stream_admission = stream_admission
 
     def apply_streaming_update(self, update: StreamingUpdate) -> None:
         # Apply the update to the request state.
         self.streaming_input = not update.final
-        # TODO also include relevant output tokens in new prompt here
-        #     (match scheduler behavior).
-        if update.prompt:
-            self.prompt = (
-                (self.prompt + update.prompt) if self.prompt else update.prompt
-            )
-        if self.prompt_token_ids:
-            self.prompt_token_ids.extend(update.prompt_token_ids or ())
+        if self.persistent_state:
+            self._start_turn(update)
         else:
-            self.prompt_token_ids = gc_untrack(update.prompt_token_ids or [])
+            # TODO also include relevant output tokens in new prompt here
+            #     (match scheduler behavior).
+            if update.prompt:
+                self.prompt = (
+                    (self.prompt + update.prompt) if self.prompt else update.prompt
+                )
+            if self.prompt_token_ids:
+                self.prompt_token_ids.extend(update.prompt_token_ids or ())
+            else:
+                self.prompt_token_ids = gc_untrack(update.prompt_token_ids or [])
         assert self.prompt_token_ids is not None
         self.prompt_len = len(self.prompt_token_ids)
         if self.stats is not None:
             self.stats.arrival_time = update.arrival_time
         self.is_prefilling = True
+
+    def _start_turn(self, update: StreamingUpdate) -> None:
+        """The model's state carries the history: the new input replaces the
+        prompt, and the per-turn output state starts over."""
+        # @spec PSTATE-HIST-005
+        self.prompt = update.prompt
+        self.prompt_token_ids = gc_untrack(update.prompt_token_ids or [])
+        if self.detokenizer is not None:
+            self.detokenizer.start_turn(update.prompt_token_ids)
+        if self.logprobs_processor is not None:
+            self.logprobs_processor.start_turn()
+        self.routed_experts_chunks.clear()
+        self.sampling_mask_chunks.clear()
+        self.weight_version_starts.clear()
+        self.sent_tokens_offset = 0
 
     @classmethod
     def from_new_request(
@@ -284,6 +317,7 @@ class RequestState:
         queue: RequestOutputCollector | None,
         log_stats: bool,
         stream_interval: int,
+        persistent_state: bool = False,
     ) -> "RequestState":
         remote_prefill_cached_tokens = None
         if sampling_params := request.sampling_params:
@@ -348,6 +382,8 @@ class RequestState:
             stream_interval=stream_interval,
             stream_input=request.resumable,
             remote_prefill_cached_tokens=remote_prefill_cached_tokens,
+            persistent_state=persistent_state,
+            stream_admission=request.stream_admission,
         )
         if state.stats is not None and sampling_params is not None:
             state.stats.is_watermarked = bool(sampling_params.watermarking)
@@ -562,10 +598,17 @@ class OutputProcessor:
         stream_interval: int = 1,
         tracing_enabled: bool = False,
         admission_stats: "SharedAdmissionStats | None" = None,
+        persistent_state: bool = False,
+        max_pending_stream_inputs: int = 8,
     ):
         self.log_stats = log_stats
         self.tokenizer = tokenizer
         self.stream_interval = stream_interval
+        # Whether the model keeps its history in persistent state: streaming
+        # updates then replace a request's history, and its pending inputs and
+        # undelivered turns are bounded by max_pending_stream_inputs.
+        self.persistent_state = persistent_state
+        self.max_pending_stream_inputs = max_pending_stream_inputs
         self.request_states: dict[str, RequestState] = {}
         self.parent_requests: dict[str, ParentRequest] = {}
         self.external_req_ids: defaultdict[str, list[str]] = defaultdict(list)
@@ -686,6 +729,7 @@ class OutputProcessor:
             queue=queue,
             log_stats=self.log_stats,
             stream_interval=self.stream_interval,
+            persistent_state=self.persistent_state,
         )
         self.request_states[request_id] = req_state
         if parent_req:
@@ -720,13 +764,37 @@ class OutputProcessor:
             arrival_time=request.arrival_time,
         )
 
-        # Apply request updates now if the last input already completed.
-        if req_state.input_chunk_queue is None:
+        if req_state.stream_admission:
+            # The admission opened the state without an input: this is the
+            # first turn's input, not a queued update.
+            req_state.stream_admission = False
+            req_state.apply_streaming_update(update)
+        elif req_state.input_chunk_queue is None:
+            # Apply request updates now if the last input already completed.
             req_state.apply_streaming_update(update)
             req_state.input_chunk_queue = deque()
+        elif (
+            req_state.persistent_state
+            and len(req_state.input_chunk_queue) >= self.max_pending_stream_inputs
+        ):
+            # @spec PSTATE-HIST-006
+            self._end_stream(req_state, "pending_input_limit")
         else:
             # Queue the streaming update otherwise.
             req_state.input_chunk_queue.append(update)
+
+    def _end_stream(self, req_state: RequestState, code: str) -> None:
+        """End a persistent-state stream that exceeded a bound; its pending
+        inputs and undelivered turns are dropped."""
+        self._finish_request(req_state)
+        self.lora_states.request_finished(req_state.request_id, req_state.lora_name)
+        if req_state.queue is not None:
+            req_state.queue.put(
+                GenerationError(
+                    f"Stream {req_state.external_req_id} ended: {code} "
+                    f"({self.max_pending_stream_inputs} allowed)"
+                )
+            )
 
     def process_outputs(
         self,
@@ -767,7 +835,13 @@ class OutputProcessor:
             error = engine_core_output.error
             if error is not None and req_state.queue is not None:
                 # Rejected on arrival, e.g. by a paused engine; nothing was run.
-                req_state.queue.put(error.to_exception())
+                exception = error.to_exception()
+                if req_state.stream_admission and not isinstance(
+                    exception, VLLMValidationError
+                ):
+                    # @spec PSTATE-ADMIT-001: a refused admission names its reason.
+                    exception = StreamAdmissionError(error.code)
+                req_state.queue.put(exception)
                 self._finish_request(req_state)
                 if req_state.streaming_input:
                     # Input chunks sent since may re-create the session.
@@ -844,9 +918,26 @@ class OutputProcessor:
                 # if required.
                 req_state.logprobs_processor.update_from_output(engine_core_output)
 
-            streaming_chunk_boundary = req_state.streaming_input and (
-                finish_reason not in (FinishReason.ABORT, FinishReason.ERROR)
+            # @spec PSTATE-TURN-003: a terminal finish ends the stream.
+            streaming_chunk_boundary = (
+                req_state.streaming_input
+                and finish_reason not in (FinishReason.ABORT, FinishReason.ERROR)
+                and not engine_core_output.terminal
             )
+            if (
+                streaming_chunk_boundary
+                and req_state.persistent_state
+                and req_state.queue is not None
+                and req_state.queue.num_pending_turns()
+                >= self.max_pending_stream_inputs
+            ):
+                # @spec PSTATE-HIST-010: the client stopped reading turns.
+                self._end_stream(req_state, "output_backlog_limit")
+                reqs_to_abort.append(req_id)
+                self._update_stats_from_finished(
+                    req_state, FinishReason.ERROR, iteration_stats
+                )
+                continue
 
             # 4) Create and handle RequestOutput objects.
             if request_output := req_state.make_request_output(

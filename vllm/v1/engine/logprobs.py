@@ -213,6 +213,14 @@ class LogprobsProcessor:
         self.prompt_token_id_logprobs = None
         return scores
 
+    def start_turn(self) -> None:
+        """Forget the previous turn's sample logprobs of a persistent-state
+        request; the next turn starts from none."""
+        if self.logprobs is not None:
+            # [:0] keeps the list or FlatLogprobs representation.
+            self.logprobs = self.logprobs[:0]
+            self.cumulative_logprob = 0.0
+
     @staticmethod
     def _get_sampled_context_ids(
         logprobs_source: SampleLogprobs | PromptLogprobs | None,

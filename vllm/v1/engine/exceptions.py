@@ -1,12 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from vllm.exceptions import VLLMServerError
+from vllm.exceptions import GenerationError, VLLMServerError
 
 
 class EngineGenerateError(VLLMServerError):
     """Raised when a AsyncLLM.generate() fails. Recoverable."""
 
     pass
+
+
+class StreamAdmissionError(GenerationError):
+    """The engine refused to admit a persistent-state stream.
+
+    Attributes:
+        reason: `request_id_in_use`, `engine_paused` or `active_limit`.
+
+    """
+
+    def __init__(self, reason: str):
+        super().__init__(f"Stream admission refused: {reason}")
+        self.reason = reason
 
 
 class EngineDeadError(VLLMServerError):

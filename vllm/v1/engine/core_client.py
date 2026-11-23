@@ -9,7 +9,7 @@ import weakref
 from abc import ABC, abstractmethod
 from array import array
 from collections import Counter, defaultdict
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass
 from multiprocessing.queues import Queue
@@ -305,6 +305,19 @@ class EngineCoreClient(ABC):
         raise NotImplementedError
 
     async def add_request_async(self, request: EngineCoreRequest) -> None:
+        raise NotImplementedError
+
+    async def admit_stream_async(self, request: EngineCoreRequest) -> str | None:
+        """Admit a persistent-state stream before any input; returns None or
+        the refusal reason."""
+        raise NotImplementedError
+
+    async def has_request_async(self, request_id: str) -> bool:
+        raise NotImplementedError
+
+    async def wait_stream_retired_async(self, request_id: str) -> None:
+        """Return once the engine no longer holds the persistent-state stream
+        `request_id`, at once if it never did or already retired."""
         raise NotImplementedError
 
     async def profile_async(
@@ -963,6 +976,25 @@ class MPClient(EngineCoreClient):
         return dict(self._kv_event_sources)
 
 
+def _resolve_retirement_waiters(
+    waiters: dict[str, asyncio.Future[None]], request_ids: Iterable[str]
+) -> None:
+    """The engine has freed `request_ids`: wake their retirement waits."""
+    for request_id in request_ids:
+        waiter = waiters.pop(request_id, None)
+        if waiter is not None and not waiter.done():
+            waiter.set_result(None)
+
+
+def _fail_retirement_waiters(
+    waiters: dict[str, asyncio.Future[None]], error: Exception
+) -> None:
+    for waiter in waiters.values():
+        if not waiter.done():
+            waiter.set_exception(error)
+    waiters.clear()
+
+
 def _process_utility_output(
     output: UtilityOutput, utility_results: dict[int, AnyFuture]
 ):
@@ -1207,6 +1239,8 @@ class AsyncMPClient(MPClient):
         self.client_count = client_count
         self.client_index = client_index
         self.outputs_queue = asyncio.Queue[EngineCoreOutputs | Exception]()
+        # Waits for a persistent-state stream's retirement, by request id.
+        self._retirement_waiters: dict[str, asyncio.Future[None]] = {}
 
         # locally-cached engine status
         self._engine_status: dict[int, dict] = {}
@@ -1235,6 +1269,7 @@ class AsyncMPClient(MPClient):
         decoder = self.decoder
         utility_results = self.utility_results
         outputs_queue = self.outputs_queue
+        retirement_waiters = self._retirement_waiters
         output_handler: (
             Callable[[AsyncMPClient, EngineCoreOutputs], Awaitable[None]] | None
         ) = getattr(self.__class__, "process_engine_outputs", None)
@@ -1291,12 +1326,18 @@ class AsyncMPClient(MPClient):
                             return
                         await output_handler(_self, outputs)
 
+                    if retirement_waiters and outputs.finished_requests:
+                        _resolve_retirement_waiters(
+                            retirement_waiters, outputs.finished_requests
+                        )
                     if outputs.outputs or outputs.scheduler_stats:
                         outputs_queue.put_nowait(outputs)
             except Exception as e:
                 outputs_queue.put_nowait(e)
+                _fail_retirement_waiters(retirement_waiters, e)
             except asyncio.CancelledError:
                 outputs_queue.put_nowait(EngineDeadError())
+                _fail_retirement_waiters(retirement_waiters, EngineDeadError())
 
         resources.output_queue_task = asyncio.create_task(
             process_outputs_socket(), name="EngineCoreOutputQueueTask"
@@ -1375,6 +1416,29 @@ class AsyncMPClient(MPClient):
         request.client_index = self.client_index
         await self._send_input(EngineCoreRequestType.ADD, _with_packed_prompt(request))
         self._ensure_output_queue_task()
+
+    async def admit_stream_async(self, request: EngineCoreRequest) -> str | None:
+        # The admitted stream's outputs return to this client, as for an ADD.
+        request.client_index = self.client_index
+        # A utility argument is decoded generically, where the empty prompt
+        # list would not convert to the ndarray field; the engine restores it.
+        admission = msgspec.structs.replace(request, prompt_token_ids=None)
+        return await self.call_utility_async("admit_stream", admission)
+
+    async def has_request_async(self, request_id: str) -> bool:
+        return await self.call_utility_async("has_request", request_id)
+
+    async def wait_stream_retired_async(self, request_id: str) -> None:
+        # @spec PSTATE-ADMIT-005
+        waiter = self._retirement_waiters.get(request_id)
+        if waiter is None:
+            # Registered before the query, so a retirement that arrives while
+            # the query is in flight resolves it.
+            waiter = asyncio.get_running_loop().create_future()
+            self._retirement_waiters[request_id] = waiter
+            if not await self.has_request_async(request_id):
+                _resolve_retirement_waiters(self._retirement_waiters, (request_id,))
+        await waiter
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         if request_ids and not self.resources.engine_dead:

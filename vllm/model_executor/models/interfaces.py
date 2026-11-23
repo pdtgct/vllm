@@ -1026,6 +1026,44 @@ def is_attention_free(
 
 
 @runtime_checkable
+class SupportsPersistentState(Protocol):
+    """The interface for models that keep per-request state their tokens
+    cannot rebuild, in a `MambaSpec` group whose manager config is not
+    recomputable. Core derives its behaviour from these facts."""
+
+    supports_persistent_state: ClassVar[Literal[True]] = True
+
+    persistent_state_reads_positions: ClassVar[bool] = True
+    """The forward reads `positions`, so compaction applies a position offset."""
+
+    persistent_state_parks_on_eos: ClassVar[bool] = True
+    """An EOS stop ends a turn resumably instead of finishing the request."""
+
+    persistent_state_accepts_synthetic_warmup: ClassVar[bool] = True
+    """Startup may run warmup and sizing requests through the model state."""
+
+    persistent_state_ignores_stopped_row_echoes: ClassVar[bool] = False
+    """Every state write of an uncommitted stopped-row echo is a no-op, which
+    lifts the per-request barrier under async scheduling."""
+
+
+@overload
+def supports_persistent_state(
+    model: type[object],
+) -> TypeIs[type[SupportsPersistentState]]: ...
+
+
+@overload
+def supports_persistent_state(model: object) -> TypeIs[SupportsPersistentState]: ...
+
+
+def supports_persistent_state(
+    model: type[object] | object,
+) -> TypeIs[type[SupportsPersistentState]] | TypeIs[SupportsPersistentState]:
+    return getattr(model, "supports_persistent_state", False)
+
+
+@runtime_checkable
 class IsHybrid(Protocol):
     """The interface required for all models like Jamba that have both
     attention and mamba blocks, indicates that

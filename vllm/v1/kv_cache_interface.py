@@ -174,8 +174,9 @@ class ManagerConfig:
     manager_cls: type[SingleTypeKVCacheManager]
     params: SingleTypeKVCacheManager.Params
     recomputable: bool = True
-    """Whether a request's inputs can rebuild this cache. When false, the
-    scheduler never preempts a request and admits only what the pool can hold."""
+    """Whether a request's retained inputs can rebuild this cache, so it is
+    reconstructible after preemption or eviction. When false, the scheduler
+    never preempts a request and admits only what the pool can hold."""
 
     def __post_init__(self):
         assert isinstance(self.params, self.manager_cls.Params), (
@@ -562,6 +563,9 @@ class MambaSpec(KVCacheSpec):
     # False: the state is sharded across TP ranks (e.g. GDN). True: every TP
     # rank holds the full state (e.g. the replicated PLE conv state).
     tp_replicated: bool = False
+    initial_values: tuple[float | int, ...] | None = None
+    """One scalar per entry of `shapes`, written into a newly allocated page
+    of a non-recomputable group before its first read; `None` means zeros."""
 
     def __post_init__(self):
         super().__post_init__()

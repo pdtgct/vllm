@@ -400,6 +400,11 @@ class Worker(WorkerBase):
 
         self.synchronize_device()
 
+    def recapture_model_state_graphs(self) -> None:
+        """Recapture the model state's graphs once memory is resident again."""
+        with self._get_cudagraph_capture_context():
+            self.model_runner.recapture_model_state_graphs()
+
     def discard(self, tags: tuple[str, ...]) -> None:
         if has_kv_transfer_group() and "kv_cache" in tags:
             get_kv_transfer_group().unregister_kv_caches()
@@ -1127,15 +1132,22 @@ class Worker(WorkerBase):
         # cuda graph capture.
         kernel_warmup(self)
 
+        # @spec PSTATE-PREP-001, PSTATE-PREP-002
+        # A model may decline the steps that run requests through its state;
+        # an extensible KV cache then keeps the profiled peak as its headroom.
+        synthetic_warmup = (
+            not self.model_config.has_persistent_state
+            or self.model_config.persistent_state_accepts_synthetic_warmup
+        )
         # An extensible KV cache is sized from the peak of these full-batch
         # steps, so they also run when JIT warmup is off (enforce_eager).
-        if (
+        if synthetic_warmup and (
             self.vllm_config.kernel_config.enable_jit_warmup
             or self.cache_config.enable_extensible_kv_cache
         ):
             # A workspace resize after capture frees what the graphs point at.
             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
-        if self.cache_config.enable_extensible_kv_cache:
+        if synthetic_warmup and self.cache_config.enable_extensible_kv_cache:
             kv_cache = self.model_runner.extensible_kv_cache
             assert kv_cache is not None
             # The blocks warmup_kernels committed hold garbage and can take

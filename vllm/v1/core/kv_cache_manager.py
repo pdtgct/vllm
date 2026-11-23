@@ -850,6 +850,14 @@ class KVCacheManager:
             ids.extend(mgr.take_new_block_ids())
         return ids
 
+    def take_new_state_page_req_ids(self) -> set[str]:
+        """Drain and return the requests given a page of a non-recomputable
+        group, which the worker initializes, since the last call."""
+        req_ids: set[str] = set()
+        for mgr in self.coordinator.single_type_managers:
+            req_ids |= mgr.take_new_page_req_ids()
+        return req_ids
+
     def record_blocks_for_zeroing(self, request_id: str, start_token: int) -> None:
         """Re-record the request's blocks from start_token onwards for
         zeroing, e.g. blocks a failed async KV load left unwritten.

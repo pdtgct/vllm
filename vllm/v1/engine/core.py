@@ -616,6 +616,46 @@ class EngineCore:
         # (i.e. client-aborted vs stop criteria met).
         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
 
+    def has_request(self, request_id: str) -> bool:
+        """Whether the scheduler holds the request."""
+        return self.scheduler.has_request(request_id)
+
+    def admit_stream(self, request: EngineCoreRequest) -> str | None:
+        """Admit a persistent-state stream before any input, as a parked
+        request with an empty prompt, or refuse it without changing anything.
+
+        Returns:
+            None when admitted; otherwise `request_id_in_use`, `engine_paused`
+            or `active_limit`.
+
+        """
+        # @spec PSTATE-ADMIT-001 PSTATE-ADMIT-011
+        if not self.scheduler.has_unrecomputable_state:
+            raise VLLMValidationError(
+                "stream admission is not supported for this model"
+            )
+        if request.prompt_token_ids is None:
+            # The admission is sent without a prompt (a utility call carries
+            # no packed prompt); the stream's first input brings one.
+            request.prompt_token_ids = []
+        req, _ = self.preprocess_add_request(request)
+        return self.scheduler.admit_stream(req)
+
+    def _held_state_streams(self) -> list[str]:
+        """Ids of the persistent-state streams held; empty for an ordinary
+        model."""
+        if not self.scheduler.has_unrecomputable_state:
+            return []
+        return sorted(self.scheduler.held_state_streams())
+
+    def _refuse_while_state_streams_held(self, operation: str) -> None:
+        # @spec PSTATE-PRES-004
+        if held := self._held_state_streams():
+            raise RuntimeError(
+                f"Cannot {operation} while persistent-state streams are held: "
+                f"{', '.join(held)}"
+            )
+
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):
         """Execute the model and log detailed info on failure."""
@@ -724,6 +764,7 @@ class EngineCore:
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
         if scheduler_output.total_num_scheduled_tokens > 0:
             self.num_executed_steps += 1
+        # @spec PSTATE-FAIL-004: an exception from the forward stays fatal.
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with self.log_error_detail(scheduler_output):
@@ -996,6 +1037,7 @@ class EngineCore:
         reset_running_requests: bool = True,
         reset_connector: bool = True,
     ) -> None:
+        self._refuse_while_state_streams_held("reset the caches")
         # reset_connector=True so external connectors clear alongside
         # local caches, matching the pause_generation(clear_cache=True)
         # contract. No-op when no connector is configured.
@@ -1054,8 +1096,11 @@ class EngineCore:
             raise ValueError(f"Invalid pause mode: {mode}")
         if mode == "wait":
             raise ValueError("'wait' mode can't be used in inproc-engine mode")
+        if clear_cache and mode != "abort":
+            self._refuse_while_state_streams_held("clear the cache")
 
         if mode == "abort":
+            # @spec PSTATE-PRES-006: every request ends before the caches clear.
             self.scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
 
         pause_state = PauseState.PAUSED_ALL if mode == "keep" else PauseState.PAUSED_NEW
@@ -1171,7 +1216,8 @@ class EngineCore:
             # Remove "scheduling" from tags if there are other tags to process.
             tags = [t for t in tags if t != "scheduling"]
 
-        if tags is None or tags:
+        woke_executor = tags is None or bool(tags)
+        if woke_executor:
             self.model_executor.wake_up(tags)
             if tags is None or "kv_cache" in tags:
                 # Peers must load the re-registered KV cache.
@@ -1181,6 +1227,10 @@ class EngineCore:
         # Resume scheduling only once all executor memory is resident again.
         fully_awake = not self.model_executor.is_sleeping
         if fully_awake:
+            if woke_executor and self.scheduler.has_unrecomputable_state:
+                # @spec PSTATE-PREP-006: remapped memory invalidates the graphs
+                # the model state captured; recapture once, before scheduling.
+                self.collective_rpc("recapture_model_state_graphs")
             self.resume_scheduler()
         return fully_awake
 
@@ -1414,7 +1464,9 @@ class EngineCoreProc(EngineCore):
                 executor_class,
                 log_stats,
                 executor_fail_callback,
-                internal_dp_balancing,
+                # A client waits for a persistent-state stream's retirement
+                # through the finished set (see wait_stream_retired_async).
+                internal_dp_balancing or vllm_config.model_config.has_persistent_state,
             )
 
             # Initialize fault tolerance settings.
@@ -1844,7 +1896,16 @@ class EngineCoreProc(EngineCore):
             self._handle_client_request(*self._deferred_inputs.popleft())
 
         waited = False
-        while not self.has_work() and self.is_running():
+        while True:
+            # Handle any more client requests.
+            while not self.input_queue.empty():
+                req = self.input_queue.get_nowait()
+                self._handle_client_request(*req)
+            # @spec PSTATE-ADMIT-008: after the drain, so an input that has
+            # arrived defeats its stream's deadline; before the work check.
+            self._sweep_stream_deadlines()
+            if self.has_work() or not self.is_running():
+                break
             # Notify callbacks waiting for engine to become idle.
             self._notify_idle_state_callbacks()
             if self.input_queue.empty():
@@ -1857,7 +1918,10 @@ class EngineCoreProc(EngineCore):
             block = self.process_input_queue_block
             try:
                 with get_watch_dog().disable():
-                    req = self.input_queue.get(block=block)
+                    # The idle wait ends at the nearest stream deadline.
+                    req = self.input_queue.get(
+                        block=block, timeout=self._idle_wait_timeout(block)
+                    )
                 self._handle_client_request(*req)
             except queue.Empty:
                 break
@@ -1867,10 +1931,16 @@ class EngineCoreProc(EngineCore):
         if waited:
             logger.debug("EngineCore loop active.")
 
-        # Handle any more client requests.
-        while not self.input_queue.empty():
-            req = self.input_queue.get_nowait()
-            self._handle_client_request(*req)
+    def _idle_wait_timeout(self, block: bool) -> float | None:
+        if not block or not self.scheduler.has_unrecomputable_state:
+            return None
+        return self.scheduler.next_stream_deadline()
+
+    def _sweep_stream_deadlines(self) -> None:
+        """Abort the persistent-state streams whose deadline has passed."""
+        # @spec PSTATE-ADMIT-007
+        if self.scheduler.has_unrecomputable_state:
+            self._send_abort_outputs(self.scheduler.sweep_stream_deadlines())
 
     def execute_dummy_batch(self) -> None:
         records = self.model_executor.execute_dummy_batch()
@@ -1989,7 +2059,11 @@ class EngineCoreProc(EngineCore):
             return
         elif request_type == EngineCoreRequestType.ADD:
             req, request_wave = request
-            if self._reject_add_in_shutdown(req) or self._reject_add_while_paused(req):
+            if (
+                self._reject_add_in_shutdown(req)
+                or self._reject_add_while_paused(req)
+                or self._reject_unknown_continuation(req)
+            ):
                 return
             self.add_request(req, request_wave)
         elif request_type == EngineCoreRequestType.ABORT:
@@ -2046,6 +2120,26 @@ class EngineCoreProc(EngineCore):
             # Let the KV connector free any remote blocks held for it.
             request.abort_immediately = True
             self.add_request(request)
+        return True
+
+    def _reject_unknown_continuation(self, request: Request) -> bool:
+        """A persistent-state stream's input must not open a new request once
+        the stream is gone: an input is refused, a close signal is dropped."""
+        # @spec PSTATE-TURN-006 PSTATE-TURN-013
+        if (
+            not self.scheduler.has_unrecomputable_state
+            or not request.continuation
+            or self.scheduler.has_request(request.request_id)
+        ):
+            return False
+        if request.resumable:
+            error = RequestError(
+                code="stream_not_found",
+                message=f"Stream {request.request_id} is not held by the engine.",
+            )
+            self._send_finish_outputs_to_client(
+                [request.request_id], request.client_index, FinishReason.ERROR, error
+            )
         return True
 
     def _reject_utility_in_shutdown(
@@ -2462,6 +2556,10 @@ class EngineCoreProc(EngineCore):
         """
         if mode not in get_args(PauseMode):
             raise ValueError(f"Invalid pause mode: {mode}")
+        if clear_cache and mode != "abort":
+            # Checked again once the drain completes (PSTATE-PRES-005): a
+            # stream held then still fails the pause, in _reset_caches.
+            self._refuse_while_state_streams_held("clear the cache")
 
         def engine_idle_callback(engine: "EngineCoreProc", future: Future[Any]) -> None:
             try:
@@ -2521,6 +2619,12 @@ class EngineCoreProc(EngineCore):
             return "Preparing for a checkpoint requires --enable-sleep-mode"
         if self.model_executor.is_sleeping:
             return "Preparing for a checkpoint requires an awake engine"
+        if mode != "abort" and (held := self._held_state_streams()):
+            # @spec PSTATE-PRES-004
+            return (
+                "Preparing for a checkpoint requires no held persistent-state "
+                f"streams: {', '.join(held)}"
+            )
         self._checkpoint_state = CheckpointState.PREPARING
         try:
             self.pause_generation(mode=mode, clear_cache=False)

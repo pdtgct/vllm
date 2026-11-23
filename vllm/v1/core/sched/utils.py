@@ -3,7 +3,11 @@
 import contextlib
 from collections.abc import Sequence
 
-from vllm.sampling_params import RepetitionDetectionParams
+from vllm.sampling_params import (
+    RepetitionDetectionParams,
+    RequestOutputKind,
+    SamplingParams,
+)
 from vllm.v1.request import Request, RequestStatus
 
 
@@ -95,11 +99,34 @@ def remove_all(lst: list, items_to_remove: set) -> list:
     return [item for item in lst if item not in items_to_remove]
 
 
-def check_stop(request: Request, max_model_len: int) -> bool:
+def check_stop(
+    request: Request,
+    max_model_len: int,
+    position_offset: int = 0,
+    length_before_eos: bool = False,
+) -> bool:
+    """Set the request's finished status if its last output token stops it.
+
+    Args:
+        request: The request whose last output token is checked.
+        max_model_len: The position limit.
+        position_offset: Positions the request's tokens dropped by
+            compaction occupy; counted against `max_model_len`.
+        length_before_eos: Check the position limit before EOS, so an EOS
+            sampled at the limit ends a persistent-state stream instead of
+            parking it. The per-turn `max_tokens` check stays after EOS.
+
+    """
     assert not request.pooling_params
 
     sampling_params = request.sampling_params
     assert sampling_params is not None
+
+    num_positions = request.num_tokens + position_offset
+    if length_before_eos and num_positions >= max_model_len:
+        # @spec PSTATE-TURN-011
+        request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        return True
 
     last_token_id = request.output_token_ids[-1]
     if last_token_id == sampling_params.eos_token_id:
@@ -112,7 +139,7 @@ def check_stop(request: Request, max_model_len: int) -> bool:
         return True
 
     if (
-        request.num_tokens >= max_model_len
+        num_positions >= max_model_len
         or request.num_output_tokens >= request.max_tokens
     ):
         request.status = RequestStatus.FINISHED_LENGTH_CAPPED
@@ -138,3 +165,36 @@ def check_stop(request: Request, max_model_len: int) -> bool:
         return True
 
     return False
+
+
+def unsupported_stream_sampling_parameter(
+    sampling_params: SamplingParams | None, stream: bool = True
+) -> str | None:
+    """The name of the first sampling parameter a persistent-state request
+    cannot carry, or None.
+
+    Refused parameters read past output or accumulate across turns, which
+    compaction of the request's history would change. `FINAL_ONLY` output is
+    allowed for a single request (`stream=False`).
+    """
+    if sampling_params is None:
+        return None
+    if sampling_params.presence_penalty != 0:
+        return "presence_penalty"
+    if sampling_params.frequency_penalty != 0:
+        return "frequency_penalty"
+    if sampling_params.repetition_penalty != 1:
+        return "repetition_penalty"
+    if sampling_params.bad_words:
+        return "bad_words"
+    if sampling_params.structured_outputs is not None:
+        return "structured_outputs"
+    if sampling_params.prompt_logprobs is not None:
+        return "prompt_logprobs"
+    if sampling_params.thinking_token_budget is not None:
+        return "thinking_token_budget"
+    if sampling_params.n > 1:
+        return "n"
+    if stream and sampling_params.output_kind != RequestOutputKind.DELTA:
+        return "output_kind"
+    return None

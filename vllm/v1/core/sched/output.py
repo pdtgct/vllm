@@ -53,6 +53,9 @@ class NewRequestData:
     prompt_is_token_ids: list[bool] | None = None
     # DeepSeek-V4.1 only: SWA bounded replay; see Request.replay_start.
     replay_start: int = 0
+    # Tokens a persistent-state request dropped by compaction; the worker adds
+    # it to each position it computes. 0 for every other request.
+    position_offset: int = 0
 
     @classmethod
     def from_request(
@@ -79,6 +82,7 @@ class NewRequestData:
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
             replay_start=request.replay_start,
+            position_offset=request.position_offset,
         )
 
     def __setstate__(self, state: dict) -> None:
@@ -328,6 +332,11 @@ class SchedulerOutput:
     # (non-final prefill chunks, or requests sure to reach max_tokens), so the
     # drafter can skip proposing them.
     skip_drafts: bool = False
+
+    # Requests whose persistent-state page was allocated, and so initialized,
+    # in this step; the model state reads page freshness from this set alone.
+    # Empty for a model without persistent state.
+    new_state_page_req_ids: set[str] = field(default_factory=set)
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

@@ -236,6 +236,14 @@ class EngineCoreRequest(
     # PrefixHashConfig, including any extra keys (LoRA, multimodal, cache salt).
     block_hashes: list[bytes] | None = None
 
+    # Set on every input of a persistent-state stream after the request that
+    # opened it, including the close signal, so that an input for a stream
+    # the engine no longer holds cannot open a new one.
+    continuation: bool = False
+    # The request that admits a persistent-state stream before any input; it
+    # carries the stream's parameters and no prompt.
+    stream_admission: bool = False
+
     @property
     def params(self) -> SamplingParams | PoolingParams:
         """Return the processed params (sampling or pooling)."""
@@ -322,6 +330,10 @@ class EngineCoreOutput(
     # Sent once, on the first output, when watermark_config is set. Appended last
     # for array_like compatibility.
     watermarking: bool | None = None
+
+    # The finish ends a persistent-state stream; the output processor must not
+    # treat it as a turn boundary. Appended last for array_like compatibility.
+    terminal: bool = False
 
     @property
     def finished(self) -> bool:

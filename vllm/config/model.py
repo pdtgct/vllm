@@ -2259,6 +2259,27 @@ class ModelConfig:
         return self._model_info.has_inner_state
 
     @property
+    def has_persistent_state(self) -> bool:
+        """Whether the model class declares `SupportsPersistentState`."""
+        return self._model_info.has_persistent_state
+
+    @property
+    def persistent_state_reads_positions(self) -> bool:
+        return self._model_info.persistent_state_reads_positions
+
+    @property
+    def persistent_state_parks_on_eos(self) -> bool:
+        return self._model_info.persistent_state_parks_on_eos
+
+    @property
+    def persistent_state_accepts_synthetic_warmup(self) -> bool:
+        return self._model_info.persistent_state_accepts_synthetic_warmup
+
+    @property
+    def persistent_state_ignores_stopped_row_echoes(self) -> bool:
+        return self._model_info.persistent_state_ignores_stopped_row_echoes
+
+    @property
     def speculator_config_class(self) -> str | None:
         """For a speculative decoding draft model, the config class of the
         speculator it's for, if it declares one (see `SpeculativeDraftModel`)."""
@@ -2456,6 +2477,11 @@ class ModelConfig:
     @property
     def is_prefix_caching_supported(self) -> bool:
         attn_type = self.attn_type
+
+        # @spec PSTATE-DECL-011
+        if self.has_persistent_state:
+            logger.debug("Persistent state does not support prefix caching.")
+            return False
 
         if pooler_config := self.pooler_config:
             # for pooling models

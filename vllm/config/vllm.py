@@ -1642,6 +1642,7 @@ class VllmConfig:
         if self.performance_mode != "balanced":
             logger.info_once("Performance mode set to '%s'.", self.performance_mode)
 
+        self._verify_persistent_state_config()
         # Model hooks derive values from max_model_len, so apply the draft's
         # limit first.
         self._limit_max_model_len_to_draft()
@@ -3308,6 +3309,47 @@ class VllmConfig:
             return
 
         mm_config.validate_mm_processor_device(self.ec_transfer_config)
+
+    def _verify_persistent_state_config(self) -> None:
+        """Refuse the options that would recompute, share or move a page of
+        state the model's tokens cannot rebuild."""
+        # @spec PSTATE-DECL-005
+        model_config = self.model_config
+        if model_config is None or not model_config.has_persistent_state:
+            return
+        unsupported = "is not supported for this model"
+        if self.cache_config.enable_prefix_caching:
+            raise ValueError(f"enable_prefix_caching {unsupported}")
+        if (
+            self.kv_transfer_config is not None
+            and self.kv_transfer_config.kv_connector is not None
+        ):
+            raise ValueError(f"kv_transfer_config {unsupported}")
+        if (
+            self.ec_transfer_config is not None
+            and self.ec_transfer_config.ec_connector is not None
+        ):
+            raise ValueError(f"ec_transfer_config {unsupported}")
+        if self.speculative_config is not None:
+            raise ValueError(f"speculative_config {unsupported}")
+        for field_name in (
+            "pipeline_parallel_size",
+            "data_parallel_size",
+            "tensor_parallel_size",
+        ):
+            if getattr(self.parallel_config, field_name) > 1:
+                raise ValueError(f"{field_name} above 1 {unsupported}")
+        if model_config.uses_mrope:
+            raise ValueError(
+                f"multi-dimensional rotary positions (M-RoPE) {unsupported}"
+            )
+        if not model_config.persistent_state_accepts_synthetic_warmup:
+            for field_name in ("enable_fault_tolerance", "enable_elastic_ep"):
+                if getattr(self.parallel_config, field_name):
+                    raise ValueError(
+                        f"{field_name} {unsupported}: it reruns synthetic "
+                        "warmup, which the model declines"
+                    )
 
     def _limit_max_model_len_to_draft(self) -> None:
         """Lower max_model_len to the draft model's when the model runner

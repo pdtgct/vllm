@@ -258,6 +258,44 @@ class KVBlockZeroer:
             self.zero_block_ids([0])
 
 
+class StatePageInitializer:
+    """Writes a state group's declared initial values into newly allocated
+    pages, so a request reads valid state on its first forward."""
+
+    def __init__(self, device: torch.device, pages: list[tuple[torch.Tensor, Any]]):
+        self.device = device
+        self._pages = pages
+
+    @classmethod
+    def from_kv_cache_config(
+        cls,
+        device: torch.device,
+        kv_cache_config: KVCacheConfig,
+        static_forward_context: dict[str, Any],
+    ) -> "StatePageInitializer | None":
+        """The initializer of every non-recomputable `MambaSpec` layer, or
+        `None` when the model has no such layer."""
+        pages: list[tuple[torch.Tensor, Any]] = []
+        for group in kv_cache_config.kv_cache_groups:
+            if group.manager_config.recomputable:
+                continue
+            for layer_name, spec in group.kv_cache_specs.items():
+                assert isinstance(spec, MambaSpec)
+                states = static_forward_context[layer_name].kv_cache
+                values = spec.initial_values or (0,) * len(spec.shapes)
+                assert len(states) == len(values)
+                pages.extend(zip(states, values))
+        return cls(device, pages) if pages else None
+
+    def initialize(self, block_ids: list[int]) -> None:
+        """Write the initial values into the pages of `block_ids`."""
+        if not block_ids:
+            return
+        idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
+        for state, value in self._pages:
+            state.index_fill_(0, idx, value)
+
+
 @dataclass(eq=False, slots=True)
 class AttentionGroup:
     backend: type[AttentionBackend]

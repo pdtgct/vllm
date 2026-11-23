@@ -63,6 +63,11 @@ class RequestState:
         )
         # Optimistic CPU mirror of num_computed_tokens (upper bound on GPU value).
         self.num_computed_tokens_np = np.zeros(self.max_num_reqs, dtype=np.int32)
+        # Tokens the scheduler dropped from a compacted streaming request;
+        # added to its positions, never to its lengths.
+        self.position_offset = StagedWriteTensor(
+            self.max_num_reqs, dtype=torch.int32, device=device
+        )
 
         # Last sampled tokens.
         self.last_sampled_tokens = torch.zeros(
@@ -95,6 +100,7 @@ class RequestState:
         all_token_ids: list[int],
         num_computed_tokens: int,
         max_tokens: int,
+        position_offset: int = 0,
     ) -> None:
         assert len(self.free_indices) > 0, "No free indices"
         req_idx = self.free_indices.pop()
@@ -113,6 +119,7 @@ class RequestState:
         self.num_computed_prefill_tokens[req_idx] = num_computed_tokens
         self.num_computed_tokens_np[req_idx] = num_computed_tokens
         self.num_computed_tokens.stage_write_elem(req_idx, num_computed_tokens)
+        self.position_offset.stage_write_elem(req_idx, position_offset)
 
         if self.num_speculative_steps > 0:
             self.draft_tokens[req_idx].zero_()
@@ -123,6 +130,7 @@ class RequestState:
         self.total_len.apply_write()
         self.all_token_ids.apply_write()
         self.num_computed_tokens.apply_write()
+        self.position_offset.apply_write()
 
     def remove_request(self, req_id: str) -> int | None:
         """Return the freed slot index, or None if the request was not found."""

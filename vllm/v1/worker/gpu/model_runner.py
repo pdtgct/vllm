@@ -198,6 +198,7 @@ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.replayssm_utils import get_replayssm_block_copy_tensors
 from vllm.v1.worker.utils import (
     KVBlockZeroer,
+    StatePageInitializer,
     clear_layer_kv_caches,
     copy_kv_cache_blocks_inplace,
     get_uniform_decode_token_count,
@@ -239,6 +240,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Lazily initialized in _init_kv_zero_meta() when the KV cache needs
         # zeroing (e.g. hybrid models with fp8 KV cache).
         self.kv_block_zeroer: KVBlockZeroer | None = None
+        # Set with the zeroer when a KV cache group holds non-recomputable state.
+        self.state_page_initializer: StatePageInitializer | None = None
+        self.applies_position_offset = (
+            self.model_config.has_persistent_state
+            and self.model_config.persistent_state_reads_positions
+        )
 
         self.vocab_size = self.model_config.get_vocab_size()
         masked = self.model_config.masked_token_ids
@@ -911,6 +918,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             static_forward_context=self.compilation_config.static_forward_context,
             num_blocks=self.kv_cache_config.num_blocks,
         )
+        self.state_page_initializer = StatePageInitializer.from_kv_cache_config(
+            self.device,
+            self.kv_cache_config,
+            self.compilation_config.static_forward_context,
+        )
 
     @torch.inference_mode()
     @step_eplb_after(is_dummy=True)
@@ -1194,6 +1206,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and self.model_state.needs_cudagraph_capture()
         )
 
+    @torch.inference_mode()
+    def recapture_model_state_graphs(self) -> None:
+        """Clear and recapture the model state's graphs after a wake that
+        remapped the memory they address."""
+        # @spec PSTATE-PREP-006, PSTATE-PREP-007
+        if not self.model_state_needs_cudagraph_capture():
+            return
+        self.model_state.clear_cudagraphs()
+        self._capture_model_state_cudagraphs(profile_only=False)
+
     def _capture_model_state_cudagraphs(self, profile_only: bool) -> None:
         with graph_capture(self.device) as context:
             self.model_state.capture_cudagraphs(
@@ -1367,6 +1389,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 all_token_ids=new_req_data.prefill_token_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
+                position_offset=new_req_data.position_offset,
             )
             req_index = self.req_states.req_id_to_index[req_id]
             if self.adaptive_verification is not None:
@@ -1437,6 +1460,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if scheduler_output.new_block_ids_to_zero:
             assert self.kv_block_zeroer is not None
             self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
+            # @spec PSTATE-PAGE-001, PSTATE-PAGE-002
+            if self.state_page_initializer is not None:
+                self.state_page_initializer.initialize(
+                    scheduler_output.new_block_ids_to_zero
+                )
 
         # Apply copy-on-write block copies for partial prefix-cache hits, after
         # zeroing new blocks and before the forward pass reads them.
@@ -1640,12 +1668,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         # Prepare positions and seq_lens.
+        # @spec PSTATE-HIST-004
         prepare_pos_seq_lens(
             idx_mapping,
             query_start_loc,
             self.req_states.num_computed_tokens.gpu,
             self.input_buffers.positions,
             self.input_buffers.seq_lens,
+            position_offset=(
+                self.req_states.position_offset.gpu
+                if self.applies_position_offset
+                else None
+            ),
         )
         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
 
@@ -2460,6 +2494,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_rejected,
             input_batch.query_start_loc,
         )
+        # @spec PSTATE-FAIL-001
+        if failed_req_ids := self.model_state.take_failed_requests():
+            model_runner_output.failed_req_ids = failed_req_ids
 
         if self.speculator is not None:
             assert self.sampler is not None

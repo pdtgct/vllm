@@ -3,7 +3,7 @@
 import itertools
 import time
 from collections import defaultdict, deque
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import replace
 from typing import Any
 
@@ -59,7 +59,11 @@ from vllm.v1.core.sched.request_queue import (
     SchedulingPolicy,
     create_request_queue,
 )
-from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.core.sched.utils import (
+    check_stop,
+    remove_all,
+    unsupported_stream_sampling_parameter,
+)
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.engine import (
     EngineCoreEventType,
@@ -162,6 +166,23 @@ class Scheduler(SchedulerInterface):
                     f"can't be recomputed, fewer than the {self.max_num_active_reqs} "
                     "that can be active. Lower max_num_seqs or enlarge the cache."
                 )
+        # Every other group is rebuilt from the request's tokens, so a request
+        # with one keeps its full history instead of compacting it.
+        self.compacts_state_history = self.has_unrecomputable_state and all(
+            not group.manager_config.recomputable
+            for group in kv_cache_config.kv_cache_groups
+        )
+        # @spec PSTATE-DECL-004
+        self.state_reads_positions = False
+        self.state_parks_on_eos = False
+        self.state_ignores_stopped_row_echoes = False
+        if self.has_unrecomputable_state:
+            model_config = vllm_config.model_config
+            self.state_reads_positions = model_config.persistent_state_reads_positions
+            self.state_parks_on_eos = model_config.persistent_state_parks_on_eos
+            self.state_ignores_stopped_row_echoes = (
+                model_config.persistent_state_ignores_stopped_row_echoes
+            )
         self.max_num_scheduled_tokens = (
             self.scheduler_config.max_num_scheduled_tokens
             if self.scheduler_config.max_num_scheduled_tokens is not None
@@ -288,6 +309,15 @@ class Scheduler(SchedulerInterface):
         self.resumed_streaming_sessions: set[Request] = set()
         # Sessions whose streaming update was dropped for exceeding max_model_len.
         self.dropped_streaming_updates: list[Request] = []
+        # Outputs reporting state streams finished between steps, by an input
+        # the stream could not take; sent with the next step's outputs.
+        self.stream_finish_outputs: list[tuple[int, EngineCoreOutput]] = []
+        # Deadline and its name per admitted, parked or draining state stream,
+        # on a clock that stands still while the scheduler is paused.
+        self._stream_deadlines: dict[str, tuple[float, str]] = {}
+        self._paused_since: float | None = None
+        self._paused_total = 0.0
+        self.clock: Callable[[], float] = time.monotonic
 
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
@@ -819,6 +849,11 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            if self._state_step_in_flight(request):
+                # @spec PSTATE-ASYNC-001
+                req_index += 1
+                continue
+
             if self.current_step < request.next_decode_eligible_step:
                 # PP+async: enforce `pp_size` steps between same-req decodes
                 # to match worker-side sampled-tokens broadcast slot ring cadence.
@@ -858,6 +893,7 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = min(
                 num_new_tokens,
                 self.max_model_len
+                - self._position_offset(request)
                 - request.num_computed_tokens
                 - self.num_sampled_tokens_per_step,
             )
@@ -931,6 +967,12 @@ class Scheduler(SchedulerInterface):
                         self.connector is not None
                         and self.connector.has_pending_block_frees()
                     ):
+                        break
+
+                    if self.has_unrecomputable_state:
+                        # @spec PSTATE-PRES-001
+                        # No request's state can be rebuilt after preemption;
+                        # the startup check keeps allocation from failing.
                         break
 
                     # The request cannot be scheduled.
@@ -1128,6 +1170,10 @@ class Scheduler(SchedulerInterface):
                     # Deliverable stale output still in flight: resuming now
                     # could resample a position that output later delivers.
                     # It drains within the pipeline depth.
+                    skip_request(request_queue)
+                    continue
+
+                if self._state_step_in_flight(request):
                     skip_request(request_queue)
                     continue
 
@@ -1812,6 +1858,10 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens, new_reqs_data, scheduled_encoder_inputs
             ),
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
+            # @spec PSTATE-PAGE-007
+            new_state_page_req_ids=(
+                self.kv_cache_manager.take_new_state_page_req_ids()
+            ),
             has_sync_kv_loads=has_sync_kv_loads,
             kv_cache_block_copies=pending_kv_cache_block_copies,
             kv_connector_block_state=kv_connector_block_state,
@@ -1865,6 +1915,22 @@ class Scheduler(SchedulerInterface):
         if not self.needs_kv_cache_zeroing:
             return None
         return new_block_ids_to_zero or None
+
+    def _state_step_in_flight(self, request: Request) -> bool:
+        """Whether the per-request barrier holds a state request back: a step
+        of it is in flight and the model does not ignore stopped-row echoes."""
+        return (
+            self.has_unrecomputable_state
+            and not self.state_ignores_stopped_row_echoes
+            and request.num_in_flight_tokens > 0
+        )
+
+    def _position_offset(self, request: Request) -> int:
+        """Positions of `request` dropped by compaction, when they count."""
+        return request.position_offset if self.state_reads_positions else 0
+
+    def _is_state_stream(self, request: Request) -> bool:
+        return self.has_unrecomputable_state and request.resumable
 
     def _preempt_request(
         self, request: Request, timestamp: float, drop_stale_output: bool = False
@@ -1963,33 +2029,44 @@ class Scheduler(SchedulerInterface):
         """Updates the waiting session with the next streaming update.
 
         Discards the last sampled output token from the prior input chunk.
-        Returns False if the update was dropped for exceeding max_model_len.
+        Returns False if the update was dropped for exceeding max_model_len,
+        or if it ended a session holding state its tokens cannot rebuild.
         """
-        new_num_tokens = session.num_tokens - 1 + len(update.prompt_token_ids or ())
-        if new_num_tokens + self.num_sampled_tokens_per_step > self.max_model_len:
-            logger.warning(
-                "Dropping streaming update for request %s: session would "
-                "exceed max_model_len=%d.",
-                session.request_id,
-                self.max_model_len,
-            )
-            self.dropped_streaming_updates.append(session)
-            return False
+        new_input = update.prompt_token_ids or ()
+        if self.has_unrecomputable_state:
+            if not self._accepts_state_update(session, len(new_input)):
+                return False
+        else:
+            new_num_tokens = session.num_tokens - 1 + len(new_input)
+            if new_num_tokens + self.num_sampled_tokens_per_step > self.max_model_len:
+                logger.warning(
+                    "Dropping streaming update for request %s: session would "
+                    "exceed max_model_len=%d.",
+                    session.request_id,
+                    self.max_model_len,
+                )
+                self.dropped_streaming_updates.append(session)
+                return False
 
-        # Keep all output tokens but the final sampled one.
-        keep_end = session.num_tokens - 1
-        assert keep_end >= session.num_computed_tokens
-        del session._all_token_ids[keep_end:]
-        del session.block_hashes[keep_end // self.hash_block_size :]
-        session._output_token_ids.clear()
-        assert session.prompt_token_ids is not None
-        # Extend prompt with kept output tokens.
-        extend_from_slice(
-            session.prompt_token_ids,
-            session._all_token_ids,
-            session.num_prompt_tokens,
-            keep_end,
-        )
+        # An admitted session has no prompt yet: its first input becomes it.
+        if session.num_tokens > 0:
+            # Keep all output tokens but the final sampled one.
+            keep_end = session.num_tokens - 1
+            assert keep_end >= session.num_computed_tokens
+            del session._all_token_ids[keep_end:]
+            del session.block_hashes[keep_end // self.hash_block_size :]
+            session._output_token_ids.clear()
+            assert session.prompt_token_ids is not None
+            # Extend prompt with kept output tokens.
+            extend_from_slice(
+                session.prompt_token_ids,
+                session._all_token_ids,
+                session.num_prompt_tokens,
+                keep_end,
+            )
+            if self.compacts_state_history:
+                # @spec PSTATE-HIST-001
+                self._compact_session(session, keep_end)
 
         if update.mm_features:
             base = session.num_tokens
@@ -1999,8 +2076,9 @@ class Scheduler(SchedulerInterface):
                 )
             session.mm_features.extend(update.mm_features)
 
-        session._all_token_ids.extend(update.prompt_token_ids or ())
-        session.prompt_token_ids.extend(update.prompt_token_ids or ())
+        assert session.prompt_token_ids is not None
+        session._all_token_ids.extend(new_input)
+        session.prompt_token_ids.extend(new_input)
         # Update block hashes for the new tokens.
         session.update_block_hashes()
         session.num_prompt_tokens = len(session.prompt_token_ids)
@@ -2010,10 +2088,14 @@ class Scheduler(SchedulerInterface):
         session.max_tokens = update.max_tokens
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
             self.num_waiting_for_streaming_input -= 1
-            # A session preempted before it parked has no slot.
-            if session.num_computed_tokens > 0:
+            # A session preempted before it parked has no slot. A state
+            # session is never preempted and holds its slot from admission.
+            if session.num_computed_tokens > 0 or self.has_unrecomputable_state:
+                # @spec PSTATE-ADMIT-003
                 self.resumed_streaming_sessions.add(session)
         session.status = RequestStatus.WAITING
+        if self.has_unrecomputable_state:
+            self._clear_stream_deadline(session)
 
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
@@ -2028,6 +2110,94 @@ class Scheduler(SchedulerInterface):
                 EngineCoreOutput(req.request_id, [], finish_reason=FinishReason.LENGTH)
             )
         self.dropped_streaming_updates.clear()
+
+    def _accepts_state_update(self, session: Request, num_new_tokens: int) -> bool:
+        """Whether a state session can fold `num_new_tokens` of input; when it
+        cannot, the session is ended before anything changes."""
+        if session.num_tokens > 0 and session.num_computed_tokens == 0:
+            # @spec PSTATE-TURN-014
+            # Continuing would re-prefill history the state already consumed.
+            self._end_state_stream(
+                session,
+                RequestStatus.FINISHED_ERROR,
+                RequestError(
+                    code="unrecomputable_state",
+                    message=f"Request {session.request_id} would recompute "
+                    "history that its state cannot rebuild.",
+                ),
+            )
+            return False
+        # @spec PSTATE-TURN-008 PSTATE-HIST-003
+        position_length = self._state_position_length(session, num_new_tokens)
+        if position_length + self.num_sampled_tokens_per_step > self.max_model_len:
+            self._end_state_stream(session, RequestStatus.FINISHED_LENGTH_CAPPED)
+            return False
+        return True
+
+    def _state_position_length(self, session: Request, num_new_tokens: int) -> int:
+        """The position length of `session` once `num_new_tokens` of input are
+        folded in and its last sampled token discarded (PSTATE-TURN-009)."""
+        if session.num_tokens == 0:
+            return num_new_tokens
+        num_kept = session.num_tokens - 1
+        if not self.compacts_state_history:
+            return num_kept + num_new_tokens
+        # Compaction keeps one frontier token of the kept history.
+        compacted_length = 1 + num_new_tokens
+        if self.state_reads_positions:
+            return session.position_offset + num_kept - 1 + compacted_length
+        return compacted_length
+
+    def _compact_session(self, session: Request, keep_end: int) -> None:
+        """Drop the kept history before its last computed token, so the
+        session holds that frontier token and then only the new input."""
+        num_dropped = keep_end - 1
+        assert session.prompt_token_ids is not None
+        del session._all_token_ids[:num_dropped]
+        del session.prompt_token_ids[:num_dropped]
+        session.block_hashes.clear()
+        session.position_offset += num_dropped
+        session.num_computed_tokens = 1
+        # @spec PSTATE-HIST-002
+        if session.mm_features:
+            self.encoder_cache_manager.free(session)
+            session.mm_features = []
+
+    def _end_state_stream(
+        self,
+        request: Request,
+        status: RequestStatus,
+        error: RequestError | None = None,
+    ) -> None:
+        """End a held state stream that cannot take its next input.
+
+        A stream that stopped in the step being processed only takes the
+        terminal status: update_from_output frees it and reports the finish.
+        Any other stream is freed now and its finish reported with the next
+        step's outputs.
+        """
+        if request.is_finished():
+            request.status = status
+            return
+        self.finish_requests(request.request_id, status)
+        output = EngineCoreOutput(
+            request_id=request.request_id,
+            new_token_ids=[],
+            finish_reason=request.get_finished_reason(),
+            stop_reason=request.stop_reason,
+            events=request.take_events(),
+            trace_headers=request.trace_headers,
+            error=error,
+            terminal=True,
+        )
+        self.stream_finish_outputs.append((request.client_index, output))
+
+    def _emit_stream_finish_outputs(
+        self, outputs: dict[int, list[EngineCoreOutput]]
+    ) -> None:
+        for client_index, output in self.stream_finish_outputs:
+            outputs[client_index].append(output)
+        self.stream_finish_outputs.clear()
 
     def _make_cached_request_data(
         self,
@@ -2410,7 +2580,14 @@ class Scheduler(SchedulerInterface):
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         # Updates dropped on arrival precede outputs of any later update.
         self._emit_dropped_streaming_updates(outputs)
+        if self.stream_finish_outputs:
+            self._emit_stream_finish_outputs(outputs)
         spec_decoding_stats: SpecDecodingStats | None = None
+
+        # @spec PSTATE-FAIL-002
+        failed_req_ids: set[str] | None = None
+        if self.has_unrecomputable_state:
+            failed_req_ids = model_runner_output.failed_req_ids
 
         failed_kv_load_req_ids: set[str] = set()
         if kv_connector_output and kv_connector_output.failed_recving:
@@ -2456,6 +2633,10 @@ class Scheduler(SchedulerInterface):
                     assert request.num_stale_output_tokens >= 0
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                 # skip failed or rescheduled requests from KV load failure
+                continue
+            if failed_req_ids and req_id in failed_req_ids:
+                # The model could not advance this row's state: finished as an
+                # error below, without this step's tokens and stop.
                 continue
             if request is None or request.is_finished():
                 # The request is already finished. This can happen if the
@@ -2534,6 +2715,7 @@ class Scheduler(SchedulerInterface):
             ec_transfer_params = None
             prefill_stats = None
             watermarking = None
+            terminal = False
             status_before_stop = request.status
 
             # Check for stop and update request status.
@@ -2629,6 +2811,11 @@ class Scheduler(SchedulerInterface):
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
                 if finished:
+                    if self.has_unrecomputable_state:
+                        # @spec PSTATE-TURN-003
+                        # A queued update may have ended the stream otherwise.
+                        finish_reason = request.get_finished_reason()
+                        terminal = request.resumable
                     kv_transfer_params, ec_transfer_params = self._free_request(request)
                     if (
                         prefill_stats is not None
@@ -2691,6 +2878,7 @@ class Scheduler(SchedulerInterface):
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
                         watermarking=watermarking,
+                        terminal=terminal,
                     )
                 )
             else:
@@ -2721,6 +2909,10 @@ class Scheduler(SchedulerInterface):
             # An encoder input the connector can no longer obtain. Failing is
             # retryable: re-issuing the request re-runs the encode.
             error_req_ids.update(self.ec_connector.take_unavailable_requests())
+        if failed_req_ids:
+            # @spec PSTATE-FAIL-003
+            # finish_requests ignores an id the scheduler no longer holds.
+            error_req_ids.update(failed_req_ids)
 
         if error_req_ids:
             error_reqs = self.finish_requests(
@@ -2735,6 +2927,7 @@ class Scheduler(SchedulerInterface):
                         events=request.take_events(),
                         trace_headers=request.trace_headers,
                         error=request_errors.get(request.request_id),
+                        terminal=self._is_state_stream(request),
                     )
                 )
 
@@ -2954,6 +3147,16 @@ class Scheduler(SchedulerInterface):
         """Return True if finished (can be False for resumable requests)."""
         if not request.resumable:
             return True
+        if self.has_unrecomputable_state and not (
+            # @spec PSTATE-TURN-001
+            request.status == RequestStatus.FINISHED_STOPPED
+            and request.stop_reason is None
+            and self.state_parks_on_eos
+        ):
+            # @spec PSTATE-TURN-002
+            # Only an EOS the model declares resumable ends a turn; every
+            # other stop ends the stream.
+            return True
 
         # Drop the finished turn's in-flight work and resume from the
         # materialized frontier.
@@ -2973,9 +3176,14 @@ class Scheduler(SchedulerInterface):
                 return True
             if self._update_request_as_session(request, update):
                 return False
+            if self.has_unrecomputable_state:
+                # The update ended the state stream instead (PSTATE-TURN-008).
+                return True
 
         request.status = RequestStatus.WAITING_FOR_STREAMING_REQ
         self.num_waiting_for_streaming_input += 1
+        if self.has_unrecomputable_state:
+            self._set_stream_deadline(request, "parked_idle_timeout")
         return False
 
     def _update_request_with_output(
@@ -2986,12 +3194,20 @@ class Scheduler(SchedulerInterface):
         # a request is still being prefilled, we expect the model runner
         # to return empty token ids for the request.
         stopped = False
+        # @spec PSTATE-TURN-010
+        position_offset = self._position_offset(request)
+        length_before_eos = self._is_state_stream(request)
         for num_new, output_token_id in enumerate(new_token_ids, 1):
             request.append_output_token_ids(output_token_id)
 
             # Check for stop and update request state.
             # This must be called before we make the EngineCoreOutput.
-            stopped = check_stop(request, self.max_model_len)
+            stopped = check_stop(
+                request,
+                self.max_model_len,
+                position_offset=position_offset,
+                length_before_eos=length_before_eos,
+            )
             if stopped:
                 # num_computed_tokens covers all new tokens but the last one.
                 # Keep that true after trimming: resumable requests resume from it.
@@ -3161,6 +3377,10 @@ class Scheduler(SchedulerInterface):
         existing = self.requests.get(request.request_id)
         if existing is not None:
             update = StreamingUpdate.from_request(request)
+            if self.has_unrecomputable_state and not self._accepts_stream_input(
+                existing, update
+            ):
+                return
             if existing.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
                 assert existing.streaming_queue is not None, "duplicate request id"
                 # Queue next input chunk (or finished sentinel).
@@ -3194,6 +3414,156 @@ class Scheduler(SchedulerInterface):
 
             if self.ec_connector is not None:
                 self.ec_connector.on_new_request(request)
+
+    def _accepts_stream_input(
+        self, existing: Request, update: StreamingUpdate | None
+    ) -> bool:
+        """Whether a held state stream takes `update` (None is the close
+        signal). An input the stream cannot take ends it with a named error
+        before anything changes; a repeated close is dropped."""
+        queue = existing.streaming_queue
+        assert queue is not None
+        if queue and queue[-1] is None:
+            # @spec PSTATE-TURN-015 PSTATE-TURN-016
+            if update is not None:
+                self._end_state_stream(
+                    existing,
+                    RequestStatus.FINISHED_ERROR,
+                    RequestError(
+                        code="input_after_close",
+                        message=f"Request {existing.request_id} received an "
+                        "input after its close signal.",
+                    ),
+                )
+            return False
+        if update is None:
+            if existing.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
+                self._set_stream_deadline(existing, "draining_timeout")
+            return True
+        # @spec PSTATE-DECL-014
+        parameter = unsupported_stream_sampling_parameter(update.sampling_params)
+        if parameter is not None:
+            self._end_state_stream(
+                existing,
+                RequestStatus.FINISHED_ERROR,
+                RequestError(
+                    code="unsupported_sampling_parameter",
+                    message=f"{parameter} is not supported for this model",
+                ),
+            )
+            return False
+        # @spec PSTATE-HIST-007
+        if len(queue) >= self.scheduler_config.max_pending_stream_inputs:
+            self._end_state_stream(
+                existing,
+                RequestStatus.FINISHED_ERROR,
+                RequestError(
+                    code="pending_input_limit",
+                    message=f"Request {existing.request_id} has "
+                    f"{len(queue)} inputs pending, the most allowed.",
+                ),
+            )
+            return False
+        return True
+
+    def admit_stream(self, request: Request) -> str | None:
+        """Admit `request` as a parked state stream with an empty prompt, or
+        refuse it without changing anything.
+
+        Returns:
+            None when admitted; otherwise the reason: `request_id_in_use`,
+            `engine_paused` or `active_limit`.
+
+        """
+        # @spec PSTATE-ADMIT-002
+        request_id = request.request_id
+        if request_id in self.requests or (
+            request.external_req_id is not None
+            and any(
+                held.external_req_id == request.external_req_id
+                for held in self.requests.values()
+                if held.resumable
+            )
+        ):
+            return "request_id_in_use"
+        if self._pause_state != PauseState.UNPAUSED:
+            return "engine_paused"
+        # @spec PSTATE-ADMIT-004
+        num_active = (
+            len(self.running)
+            + self.num_waiting_for_streaming_input
+            + len(self.resumed_streaming_sessions)
+        )
+        if num_active >= self.max_num_active_reqs:
+            return "active_limit"
+        request.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+        request.streaming_queue = deque()
+        self._enqueue_waiting_request(request)
+        self.requests[request_id] = request
+        self.num_waiting_for_streaming_input += 1
+        self._set_stream_deadline(request, "never_fed_timeout")
+        if self.log_stats:
+            request.record_event(EngineCoreEventType.QUEUED)
+        return None
+
+    def held_state_streams(self) -> list[str]:
+        """Ids of the state streams held: admitted, running or parked."""
+        if not self.has_unrecomputable_state:
+            return []
+        return [r.request_id for r in self.requests.values() if r.resumable]
+
+    def _stream_clock(self) -> float:
+        """The clock deadlines run on; it stands still while paused."""
+        now = self._paused_since if self._paused_since is not None else self.clock()
+        return now - self._paused_total
+
+    def _set_stream_deadline(self, request: Request, name: str) -> None:
+        timeout = self.scheduler_config.stream_admission_timeouts[name]
+        self._stream_deadlines[request.request_id] = (
+            self._stream_clock() + timeout,
+            name,
+        )
+
+    def _clear_stream_deadline(self, request: Request) -> None:
+        """An input clears a never-fed or parked-idle deadline; a draining
+        deadline runs until the stream finishes."""
+        deadline = self._stream_deadlines.get(request.request_id)
+        if deadline is not None and deadline[1] != "draining_timeout":
+            del self._stream_deadlines[request.request_id]
+
+    def sweep_stream_deadlines(self) -> list[Request]:
+        """Finish every state stream whose deadline has passed.
+
+        Returns:
+            The finished requests, each `FINISHED_ABORTED` with the deadline's
+            name as its `stop_reason`.
+
+        """
+        # @spec PSTATE-ADMIT-007
+        if not self._stream_deadlines or self._pause_state != PauseState.UNPAUSED:
+            return []
+        now = self._stream_clock()
+        expired = [
+            (request_id, name)
+            for request_id, (deadline, name) in self._stream_deadlines.items()
+            if deadline <= now
+        ]
+        finished: list[Request] = []
+        for request_id, name in expired:
+            for request in self.finish_requests(
+                request_id, RequestStatus.FINISHED_ABORTED
+            ):
+                request.stop_reason = name
+                finished.append(request)
+        return finished
+
+    def next_stream_deadline(self) -> float | None:
+        """Seconds until the nearest state-stream deadline, or None when no
+        deadline can expire."""
+        if not self._stream_deadlines or self._pause_state != PauseState.UNPAUSED:
+            return None
+        nearest = min(deadline for deadline, _ in self._stream_deadlines.values())
+        return max(0.0, nearest - self._stream_clock())
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
@@ -3274,6 +3644,7 @@ class Scheduler(SchedulerInterface):
             self.aux_output_connector.request_finished(request)
         self._inflight_prefills.discard(request)
         self.resumed_streaming_sessions.discard(request)
+        self._stream_deadlines.pop(request.request_id, None)
         self._unreserve_parked(request)
         self._set_kv_fetch_stage(request, None)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
@@ -3311,6 +3682,15 @@ class Scheduler(SchedulerInterface):
 
     def set_pause_state(self, pause_state: PauseState) -> None:
         logger.info("setting pause state to %s", pause_state.name)
+        if self.has_unrecomputable_state:
+            # @spec PSTATE-ADMIT-009
+            now = self.clock()
+            if pause_state == PauseState.UNPAUSED:
+                if self._paused_since is not None:
+                    self._paused_total += now - self._paused_since
+                    self._paused_since = None
+            elif self._paused_since is None:
+                self._paused_since = now
         self._pause_state = pause_state
 
     def _request_blocks_can_be_freed(self, request: Request) -> bool:
@@ -3414,6 +3794,7 @@ class Scheduler(SchedulerInterface):
             self.has_unfinished_requests()
             or self.has_finished_requests()
             or bool(self.dropped_streaming_updates)
+            or bool(self.stream_finish_outputs)
             or (self.connector is not None and self.connector.has_pending_push_work())
             or (
                 self.ec_connector is not None
@@ -3431,7 +3812,14 @@ class Scheduler(SchedulerInterface):
         Otherwise, this method will only reset the KV prefix cache when there
         is no running requests taking KV cache.
         """
-        if self.has_unrecomputable_state:
+        if reset_running_requests and self.has_unrecomputable_state:
+            if held := self.held_state_streams():
+                # @spec PSTATE-PRES-003
+                raise RuntimeError(
+                    "Cannot reset running requests while state streams are "
+                    f"held: {', '.join(held)}"
+                )
+            # Single state requests cannot be preempted either; they drain.
             reset_running_requests = False
         if reset_running_requests:
             # For logging.

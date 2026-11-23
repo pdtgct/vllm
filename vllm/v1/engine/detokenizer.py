@@ -92,6 +92,12 @@ class IncrementalDetokenizer:
     def get_next_output_text(self, finished: bool, delta: bool) -> str:
         return ""
 
+    def start_turn(self, prompt_token_ids: list[int] | None) -> None:
+        """Begin a turn of a persistent-state request on a new prompt: forget
+        the previous turn's output, keeping only what incremental decoding of
+        the next token needs."""
+        self.token_ids.clear()
+
     @classmethod
     def from_new_request(
         cls,
@@ -204,6 +210,11 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
     def decode_next(self, next_token_id: int) -> str:
         raise NotImplementedError
 
+    def start_turn(self, prompt_token_ids: list[int] | None) -> None:
+        super().start_turn(prompt_token_ids)
+        self.output_text = ""
+        self._last_output_text_offset = 0
+
     def get_next_output_text(self, finished: bool, delta: bool) -> str:
         """If delta is True, only new text since the last call to
         this method is returned"""
@@ -234,16 +245,7 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
 
         self.tokenizer: Tokenizer = tokenizer._tokenizer
 
-        # Use native prefill to prime the decode stream with the prompt tail.
-        # Look up DecodeStream on the module so backend patches (e.g. the
-        # fastokens shim that replaces ``tokenizers.decoders.DecodeStream``)
-        # are honored regardless of import order.
-        self.stream = tokenizers.decoders.DecodeStream(
-            ids=get_decode_stream_seed(
-                self.tokenizer, request.prompt_token_ids, self.skip_special_tokens
-            ),
-            skip_special_tokens=self.skip_special_tokens,
-        )
+        self._seed_stream(request.prompt_token_ids)
 
         self.spaces_between_special_tokens = (
             sampling_params.skip_special_tokens
@@ -266,6 +268,26 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
             else:
                 # No added tokens.
                 self.spaces_between_special_tokens = True
+
+    def _seed_stream(self, prompt_token_ids: list[int] | None) -> None:
+        # Use native prefill to prime the decode stream with the prompt tail.
+        # Look up DecodeStream on the module so backend patches (e.g. the
+        # fastokens shim that replaces ``tokenizers.decoders.DecodeStream``)
+        # are honored regardless of import order.
+        self.stream = tokenizers.decoders.DecodeStream(
+            ids=get_decode_stream_seed(
+                self.tokenizer, prompt_token_ids, self.skip_special_tokens
+            ),
+            skip_special_tokens=self.skip_special_tokens,
+        )
+
+    def start_turn(self, prompt_token_ids: list[int] | None) -> None:
+        super().start_turn(prompt_token_ids)
+        # A fresh stream primed with the new prompt's tail; the old stream
+        # held every id it ever stepped.
+        self._seed_stream(prompt_token_ids)
+        if not self.spaces_between_special_tokens:
+            self.last_special = False
 
     def decode_next(self, next_token_id: int) -> str:
         token = self._protected_step(next_token_id)
@@ -349,6 +371,23 @@ class SlowIncrementalDetokenizer(BaseIncrementalDetokenizer):
 
     def num_output_tokens(self) -> int:
         return len(self.token_ids) - self.prompt_len
+
+    def start_turn(self, prompt_token_ids: list[int] | None) -> None:
+        super().start_turn(prompt_token_ids)
+        # Keep the prompt window convert_prompt_ids_to_tokens reads, so the
+        # offsets index it and the retained history stays a few tokens.
+        num_kept = INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET + 2
+        window = (prompt_token_ids or [])[-num_kept:]
+        self.tokens, self.prefix_offset, self.read_offset = (
+            convert_prompt_ids_to_tokens(
+                tokenizer=self.tokenizer,
+                prompt_ids=window,
+                skip_special_tokens=self.skip_special_tokens,
+            )
+        )
+        gc_untrack(self.tokens)
+        self.prompt_len = len(window)
+        self.token_ids.extend(window)
 
     def decode_next(self, next_token_id: int) -> str:
         new_tokens, decoded_text, prefix_offset, read_offset = detokenize_incrementally(

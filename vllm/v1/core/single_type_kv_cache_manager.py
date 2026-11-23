@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from vllm.distributed.kv_events import MEDIUM_CPU
 from vllm.utils.gc_utils import untracked_list
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
@@ -224,10 +225,17 @@ class SingleTypeKVCacheManager(ABC):
         self.enable_caching = enable_caching
         self.retention_interval = retention_interval
         self.max_admission_blocks_per_request = max_admission_blocks_per_request
+        # A non-recomputable group's pages are initialized by the worker on
+        # allocation, through the same channel as zeroing.
+        self.initializes_new_pages = not self.manager_config.recomputable
         # Record newly allocated block ids only when worker-side zeroing will
         # consume them and this manager's blocks get zeroed.
-        self._record_new_block_ids = needs_kv_cache_zeroing and self.zeroes_new_blocks
+        self._record_new_block_ids = (
+            needs_kv_cache_zeroing and self.zeroes_new_blocks
+        ) or self.initializes_new_pages
         self.new_block_ids: list[int] = []
+        # Requests given a page to initialize since the last drain.
+        self.new_page_req_ids: set[str] = set()
 
         # Mapping from request ID to blocks to track the blocks allocated
         # for each request, so that we can free the blocks when the request
@@ -535,6 +543,8 @@ class SingleTypeKVCacheManager(ABC):
             req_blocks.extend(new_blocks)
             if self._record_new_block_ids:
                 self.new_block_ids.extend(b.block_id for b in new_blocks)
+            if self.initializes_new_pages:
+                self.new_page_req_ids.add(request_id)
             return null_blocks + cow_blocks + new_blocks
 
     def _num_unbacked_leading_blocks(self, num_tokens_main_model: int) -> int:
@@ -552,6 +562,13 @@ class SingleTypeKVCacheManager(ABC):
         ids = self.new_block_ids
         self.new_block_ids = []
         return ids
+
+    def take_new_page_req_ids(self) -> set[str]:
+        """Drain and return the requests given a page to initialize since the
+        last call; empty for a recomputable group."""
+        req_ids = self.new_page_req_ids
+        self.new_page_req_ids = set()
+        return req_ids
 
     def take_pending_cow_copies(
         self,
@@ -1868,6 +1885,35 @@ class MambaManager(SingleTypeKVCacheManager):
         prefill_checkpoint_alignment: int | None = None
 
     block_table_token_alignment: ClassVar[int | None] = None
+
+    @classmethod
+    def layer_config(
+        cls, spec: KVCacheSpec, *, recomputable: bool = True, **params: Any
+    ) -> KVCacheLayerConfig:
+        config = cls.config(recomputable=recomputable, **params)
+        if recomputable:
+            return KVCacheLayerConfig(config, spec)
+        # @spec PSTATE-DECL-003, PSTATE-DECL-009
+        assert isinstance(spec, MambaSpec)
+        if spec.mamba_type != MambaAttentionBackendEnum.PERSISTENT_STATE:
+            raise ValueError(
+                "A non-recomputable state group needs mamba_type "
+                f"PERSISTENT_STATE, got {spec.mamba_type.name}"
+            )
+        if spec.initial_values is not None and len(spec.initial_values) != len(
+            spec.shapes
+        ):
+            raise ValueError(
+                f"initial_values has {len(spec.initial_values)} entries for "
+                f"{len(spec.shapes)} state shapes"
+            )
+        assert isinstance(config.params, MambaManager.Params)
+        if config.params.enable_prefix_caching:
+            raise ValueError(
+                "enable_prefix_caching is not supported for a non-recomputable "
+                "state group"
+            )
+        return KVCacheLayerConfig(config, spec)
 
     @classmethod
     def can_share_block_table(cls, specs: Sequence[KVCacheSpec]) -> bool:

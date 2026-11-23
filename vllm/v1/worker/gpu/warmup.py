@@ -301,7 +301,11 @@ def run_mixed_prefill_decode_warmup(
         decode_req_id: decode_prompt_len,
     }
     decode_prefill_output.total_num_scheduled_tokens = decode_prompt_len
+    _initialize_state_pages(
+        model_runner, decode_prefill_output, range(1, next_block_id)
+    )
 
+    first_mixed_block_id = next_block_id
     decode_new_blocks = tuple(_alloc_blocks(n) for n in decode_block_deltas)
     cached_decode_req = CachedRequestData.make_empty()
     cached_decode_req.req_ids = [decode_req_id]
@@ -350,6 +354,9 @@ def run_mixed_prefill_decode_warmup(
         )
         mixed_output.num_scheduled_tokens[req_id] = prefill_len
     mixed_output.total_num_scheduled_tokens = num_tokens
+    _initialize_state_pages(
+        model_runner, mixed_output, range(first_mixed_block_id, next_block_id)
+    )
 
     cleanup_output = SchedulerOutput.make_empty()
     cleanup_output.finished_req_ids = {*decode_req_ids, *prefill_req_ids}
@@ -371,6 +378,16 @@ def run_mixed_prefill_decode_warmup(
     finally:
         model_runner.kv_connector.set_disabled(False)
     return True
+
+
+def _initialize_state_pages(
+    model_runner: GPUModelRunner, output: SchedulerOutput, block_ids: range
+) -> None:
+    """Have the step initialize the state pages its requests were given, as
+    the scheduler does for pages it allocates."""
+    # @spec PSTATE-PREP-005
+    if model_runner.state_page_initializer is not None and block_ids:
+        output.new_block_ids_to_zero = list(block_ids)
 
 
 def run_context_prefill_warmup(
@@ -434,6 +451,7 @@ def run_context_prefill_warmup(
     ]
     prefill_output.num_scheduled_tokens = dict.fromkeys(req_ids, query_len)
     prefill_output.total_num_scheduled_tokens = num_reqs * query_len
+    _initialize_state_pages(model_runner, prefill_output, range(1, next_block_id))
 
     cleanup_output = SchedulerOutput.make_empty()
     cleanup_output.finished_req_ids = set(req_ids)
@@ -687,6 +705,7 @@ def _warmup_kernels(
     prefill_output.scheduled_new_reqs = new_reqs
     prefill_output.num_scheduled_tokens = {rid: prompt_len for rid in req_ids}
     prefill_output.total_num_scheduled_tokens = prompt_len * num_reqs
+    _initialize_state_pages(model_runner, prefill_output, range(1, next_block_id))
 
     # Disable KV connector for warmup run.
     model_runner.kv_connector.set_disabled(True)
@@ -718,6 +737,7 @@ def _warmup_kernels(
 
         def _run_decode_step(indices: list[int], spec_flags: list[bool]) -> None:
             """Decode `indices`, spec-decoding the ones flagged in `spec_flags`."""
+            first_step_block_id = next_block_id
             cached_req_data = CachedRequestData.make_empty()
             cached_req_data.req_ids = [req_ids[i] for i in indices]
             cached_req_data.num_computed_tokens = [req_computed[i] for i in indices]
@@ -750,6 +770,9 @@ def _warmup_kernels(
             decode_output.scheduled_spec_decode_tokens = step_spec_tokens
             decode_output.total_num_scheduled_tokens = sum(
                 step_num_scheduled_tokens.values()
+            )
+            _initialize_state_pages(
+                model_runner, decode_output, range(first_step_block_id, next_block_id)
             )
 
             worker_execute_model(decode_output)

@@ -181,8 +181,9 @@ class ModelState(ABC):
 
     def clear_cudagraphs(self) -> None:
         """Release the graphs captured with `profile_only=True` and whatever
-        else was kept from the profiling KV cache. Must tolerate a state that
-        captured nothing."""
+        else was kept from the profiling KV cache, and the serving graphs when
+        the runner recaptures them after a wake that remapped memory. Must
+        tolerate a state that captured nothing."""
         return None
 
     def post_warmup(self) -> None:
@@ -237,6 +238,11 @@ class ModelState(ABC):
         num_computed_tokens: torch.Tensor | None = None,
     ) -> None:
         return None
+
+    def take_failed_requests(self) -> set[str]:
+        """Ids of the requests whose state this step could not advance,
+        reported once; the runner asks after `postprocess_state`."""
+        return set()
 
     @abstractmethod
     def prepare_inputs_embeds(

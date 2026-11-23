@@ -360,8 +360,10 @@ def _prepare_pos_seq_lens_kernel(
     idx_mapping_ptr,
     query_start_loc_ptr,
     num_computed_tokens_ptr,
+    position_offset_ptr,
     max_num_reqs,
     BLOCK_SIZE: tl.constexpr,
+    HAS_POSITION_OFFSET: tl.constexpr,
 ):
     req_id = tl.program_id(0)
     num_reqs = tl.num_programs(0) - 1
@@ -383,10 +385,15 @@ def _prepare_pos_seq_lens_kernel(
     seq_len = num_computed_tokens + query_len
     tl.store(seq_lens_ptr + req_id, seq_len)
 
+    # Tokens dropped by compaction shift positions, not seq_lens.
+    pos_start = num_computed_tokens
+    if HAS_POSITION_OFFSET:
+        pos_start += tl.load(position_offset_ptr + req_state_idx)
+
     for i in tl.range(0, query_len, BLOCK_SIZE):
         block = i + tl.arange(0, BLOCK_SIZE)
         mask = block < query_len
-        pos = num_computed_tokens + block
+        pos = pos_start + block
         tl.store(pos_ptr + start + block, pos, mask=mask)
 
 
@@ -396,6 +403,7 @@ def prepare_pos_seq_lens(
     num_computed_tokens: torch.Tensor,
     pos: torch.Tensor,
     seq_lens: torch.Tensor,
+    position_offset: torch.Tensor | None = None,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
     # NOTE(woosuk): We do +1 because the last thread block is used
@@ -406,8 +414,10 @@ def prepare_pos_seq_lens(
         idx_mapping,
         query_start_loc,
         num_computed_tokens,
+        num_computed_tokens if position_offset is None else position_offset,
         seq_lens.shape[0],
         BLOCK_SIZE=1024,
+        HAS_POSITION_OFFSET=position_offset is not None,
     )
 
 

@@ -56,6 +56,7 @@ from .interfaces import (
     supports_multimodal,
     supports_multimodal_encoder_tp_data,
     supports_multimodal_raw_input_only,
+    supports_persistent_state,
     supports_pp,
     supports_replayssm,
     supports_transcription,
@@ -1001,6 +1002,11 @@ class _ModelInfo:
     has_inner_state: bool
     is_attention_free: bool
     is_hybrid: bool
+    has_persistent_state: bool
+    persistent_state_reads_positions: bool
+    persistent_state_parks_on_eos: bool
+    persistent_state_accepts_synthetic_warmup: bool
+    persistent_state_ignores_stopped_row_echoes: bool
     has_noops: bool
     supports_replayssm: bool
     supports_transcription: bool
@@ -1037,6 +1043,19 @@ class _ModelInfo:
             has_inner_state=has_inner_state(model),
             is_attention_free=is_attention_free(model),
             is_hybrid=is_hybrid(model),
+            has_persistent_state=supports_persistent_state(model),
+            persistent_state_reads_positions=getattr(
+                model, "persistent_state_reads_positions", True
+            ),
+            persistent_state_parks_on_eos=getattr(
+                model, "persistent_state_parks_on_eos", True
+            ),
+            persistent_state_accepts_synthetic_warmup=getattr(
+                model, "persistent_state_accepts_synthetic_warmup", True
+            ),
+            persistent_state_ignores_stopped_row_echoes=getattr(
+                model, "persistent_state_ignores_stopped_row_echoes", False
+            ),
             supports_replayssm=supports_replayssm(model),
             supports_transcription=supports_transcription(model),
             supports_transcription_only=(

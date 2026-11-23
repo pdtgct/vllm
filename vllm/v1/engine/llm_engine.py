@@ -108,6 +108,10 @@ class LLMEngine:
             log_stats=self.log_stats,
             stream_interval=self.vllm_config.scheduler_config.stream_interval,
             tracing_enabled=tracing_endpoint is not None,
+            persistent_state=self.model_config.has_persistent_state,
+            max_pending_stream_inputs=(
+                self.vllm_config.scheduler_config.max_pending_stream_inputs
+            ),
         )
 
         # EngineCore (gets EngineCoreRequests and gives EngineCoreOutputs)
