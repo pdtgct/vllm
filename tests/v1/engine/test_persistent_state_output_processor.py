@@ -11,6 +11,7 @@ import pytest
 
 from vllm.exceptions import GenerationError
 from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.tokenizers import get_tokenizer
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.output_processor import (
     OutputProcessor,
@@ -114,13 +115,22 @@ def test_update_replaces_the_prompt_text_and_ids():
     assert state.prompt_len == 2
 
 
-def _turn_texts(vectors, persistent_state: bool) -> tuple[list[str], list[int]]:
+_TURN_TEXT = (
+    "The quick brown fox jumps over the lazy dog, and then it runs into the "
+    "forest where the trees are tall and the river is cold and clear."
+)
+
+
+def _turn_texts(tokenizer, persistent_state: bool) -> tuple[list[str], list[int]]:
     """Stream six turns, each queued before the previous one ends, and return
     each turn's text and the tokens the detokenizer retains after it."""
-    processor = _processor(vectors.tokenizer, persistent_state=persistent_state)
+    processor = _processor(tokenizer, persistent_state=persistent_state)
     queue = StreamingInputOutputCollector(RequestOutputKind.DELTA, "s")
-    prompts = vectors.prompt_tokens
-    generated = list(vectors.generation_tokens[0]) * 8
+    prompts = [
+        tokenizer.encode(text, add_special_tokens=False)
+        for text in ("Hello there.", "Next part:", "And then")
+    ]
+    generated = tokenizer.encode(_TURN_TEXT, add_special_tokens=False) * 2
     assert len(generated) >= 48
     turns = [generated[i : i + 8] for i in range(0, 48, 8)]
     processor.add_request(_input("s", prompts[0], detokenize=True), None, queue=queue)
@@ -140,12 +150,11 @@ def _turn_texts(vectors, persistent_state: bool) -> tuple[list[str], list[int]]:
 
 
 # @spec PSTATE-HIST-005
-def test_detokenizer_tail_decodes_each_turn_as_full_history_does(
-    dummy_test_vectors,
-):
-    expected, _ = _turn_texts(dummy_test_vectors, persistent_state=False)
+def test_detokenizer_tail_decodes_each_turn_as_full_history_does():
+    tokenizer = get_tokenizer("facebook/opt-125m")
+    expected, _ = _turn_texts(tokenizer, persistent_state=False)
 
-    texts, retained = _turn_texts(dummy_test_vectors, persistent_state=True)
+    texts, retained = _turn_texts(tokenizer, persistent_state=True)
 
     assert texts == expected
     assert all(text for text in texts)
