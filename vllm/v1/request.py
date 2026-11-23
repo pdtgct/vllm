@@ -258,8 +258,7 @@ class Request:
         self.streaming_queue: deque[StreamingUpdate | None] | None = None
         # An input of a persistent-state stream after the one that opened it.
         self.continuation = continuation
-        # Tokens a persistent-state request dropped by compaction; the worker
-        # adds it to each position it computes.
+        # Tokens compaction dropped; the worker adds it to each position.
         self.position_offset = 0
 
         # If True, request should be aborted immediately after being added to

@@ -36,6 +36,8 @@ class PauseState(enum.IntEnum):
 
 
 class SchedulerInterface(ABC):
+    has_unrecomputable_state: bool = False
+
     @abstractmethod
     def __init__(
         self,

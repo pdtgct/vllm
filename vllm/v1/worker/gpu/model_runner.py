@@ -240,7 +240,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Lazily initialized in _init_kv_zero_meta() when the KV cache needs
         # zeroing (e.g. hybrid models with fp8 KV cache).
         self.kv_block_zeroer: KVBlockZeroer | None = None
-        # Set with the zeroer when a KV cache group holds non-recomputable state.
+        # Set with the zeroer for a model with non-recomputable state.
         self.state_page_initializer: StatePageInitializer | None = None
         self.applies_position_offset = (
             self.model_config.has_persistent_state
@@ -1209,8 +1209,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     def recapture_model_state_graphs(self) -> None:
-        """Clear and recapture the model state's graphs after a wake that
-        remapped the memory they address."""
+        """Recapture the model state's graphs after a wake remapped memory."""
         # @spec PSTATE-PREP-006, PSTATE-PREP-007
         if not self.model_state_needs_cudagraph_capture():
             return

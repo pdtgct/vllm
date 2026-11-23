@@ -10,14 +10,9 @@ class EngineGenerateError(VLLMServerError):
 
 
 class StreamError(GenerationError):
-    """A persistent-state stream ended with a named, non-retryable code.
-
-    Attributes:
-        code: The engine's code, such as `pending_input_limit`,
-            `output_backlog_limit`, `stream_not_found`, `input_after_close`
-            or `unsupported_sampling_parameter`.
-
-    """
+    """A persistent-state stream ended with the non-retryable `code`, e.g.
+    `pending_input_limit`, `output_backlog_limit`, `stream_not_found`,
+    `input_after_close` or `unsupported_sampling_parameter`."""
 
     def __init__(self, code: str, message: str):
         super().__init__(message)
@@ -25,12 +20,8 @@ class StreamError(GenerationError):
 
 
 class StreamAdmissionError(GenerationError):
-    """The engine refused to admit a persistent-state stream.
-
-    Attributes:
-        reason: `request_id_in_use`, `engine_paused` or `active_limit`.
-
-    """
+    """The engine refused to admit a persistent-state stream, with `reason`
+    `request_id_in_use`, `engine_paused` or `active_limit`."""
 
     def __init__(self, reason: str):
         super().__init__(f"Stream admission refused: {reason}")

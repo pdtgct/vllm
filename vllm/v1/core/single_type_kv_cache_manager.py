@@ -228,8 +228,8 @@ class SingleTypeKVCacheManager(ABC):
         # consume them and this manager's blocks get zeroed.
         self._record_new_block_ids = needs_kv_cache_zeroing and self.zeroes_new_blocks
         self.new_block_ids: list[int] = []
-        # A non-recomputable group's pages are initialized by the worker on
-        # allocation: the pages and their requests since the last drain.
+        # Pages of a non-recomputable group, and the requests given them,
+        # since the scheduler last drained them for the worker to initialize.
         self.initializes_new_pages = not self.manager_config.recomputable
         self.new_page_block_ids: list[int] = []
         self.new_page_req_ids: set[str] = set()
@@ -560,22 +560,6 @@ class SingleTypeKVCacheManager(ABC):
         ids = self.new_block_ids
         self.new_block_ids = []
         return ids
-
-    def take_new_page_req_ids(self) -> set[str]:
-        """Drain the requests given a page to initialize since the last call;
-        empty, and not replaced, for a recomputable group or an idle step."""
-        req_ids = self.new_page_req_ids
-        if req_ids:
-            self.new_page_req_ids = set()
-        return req_ids
-
-    def take_new_page_block_ids(self) -> list[int]:
-        """Drain the pages allocated since the last call that the worker
-        initializes; empty, and not replaced, when there is none."""
-        block_ids = self.new_page_block_ids
-        if block_ids:
-            self.new_page_block_ids = []
-        return block_ids
 
     def take_pending_cow_copies(
         self,
@@ -1892,19 +1876,6 @@ class MambaManager(SingleTypeKVCacheManager):
         prefill_checkpoint_alignment: int | None = None
 
     block_table_token_alignment: ClassVar[int | None] = None
-
-    @classmethod
-    def layer_config(
-        cls, spec: KVCacheSpec, *, recomputable: bool = True, **params: Any
-    ) -> KVCacheLayerConfig:
-        config = cls.config(recomputable=recomputable, **params)
-        assert isinstance(config.params, MambaManager.Params)
-        if not recomputable and config.params.enable_prefix_caching:
-            raise ValueError(
-                "enable_prefix_caching is not supported for a non-recomputable "
-                "state group"
-            )
-        return KVCacheLayerConfig(config, spec)
 
     @classmethod
     def can_share_block_table(cls, specs: Sequence[KVCacheSpec]) -> bool:

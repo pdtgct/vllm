@@ -106,12 +106,9 @@ def check_stop(
     length_before_eos: bool = False,
 ) -> bool:
     """Set the request's finished status if its last output token stops it.
-
-    `position_offset` counts the positions compaction dropped against
-    `max_model_len`. `length_before_eos` checks that limit before EOS, so an
-    EOS sampled at the limit ends a persistent-state stream instead of
-    parking it; the per-turn `max_tokens` check stays after EOS.
-    """
+    `position_offset` counts positions compaction dropped; `length_before_eos`
+    checks the length limit before EOS, so an EOS at the limit ends a
+    persistent-state stream instead of parking it."""
     assert not request.pooling_params
 
     sampling_params = request.sampling_params
@@ -165,31 +162,21 @@ def check_stop(
 def unsupported_stream_sampling_parameter(
     sampling_params: SamplingParams | None, stream: bool = True
 ) -> str | None:
-    """The name of the first sampling parameter a persistent-state request
-    cannot carry, or None.
-
-    Refused parameters read past output or accumulate across turns, which
-    compaction of the request's history would change. `FINAL_ONLY` output is
-    allowed for a single request (`stream=False`).
-    """
-    if sampling_params is None:
+    """The first sampling parameter a persistent-state request cannot carry,
+    or None: those read past output or accumulate across turns, which
+    compaction changes. A single request (`stream=False`) may use any
+    output kind."""
+    if (sp := sampling_params) is None:
         return None
-    if sampling_params.presence_penalty != 0:
-        return "presence_penalty"
-    if sampling_params.frequency_penalty != 0:
-        return "frequency_penalty"
-    if sampling_params.repetition_penalty != 1:
-        return "repetition_penalty"
-    if sampling_params.bad_words:
-        return "bad_words"
-    if sampling_params.structured_outputs is not None:
-        return "structured_outputs"
-    if sampling_params.prompt_logprobs is not None:
-        return "prompt_logprobs"
-    if sampling_params.thinking_token_budget is not None:
-        return "thinking_token_budget"
-    if sampling_params.n > 1:
-        return "n"
-    if stream and sampling_params.output_kind != RequestOutputKind.DELTA:
-        return "output_kind"
-    return None
+    refused = (
+        ("presence_penalty", sp.presence_penalty != 0),
+        ("frequency_penalty", sp.frequency_penalty != 0),
+        ("repetition_penalty", sp.repetition_penalty != 1),
+        ("bad_words", bool(sp.bad_words)),
+        ("structured_outputs", sp.structured_outputs is not None),
+        ("prompt_logprobs", sp.prompt_logprobs is not None),
+        ("thinking_token_budget", sp.thinking_token_budget is not None),
+        ("n", sp.n > 1),
+        ("output_kind", stream and sp.output_kind != RequestOutputKind.DELTA),
+    )
+    return next((name for name, unsupported in refused if unsupported), None)

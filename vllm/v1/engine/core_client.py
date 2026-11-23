@@ -308,16 +308,11 @@ class EngineCoreClient(ABC):
         raise NotImplementedError
 
     async def admit_stream_async(self, request: EngineCoreRequest) -> str | None:
-        """Admit a persistent-state stream before any input; returns None or
-        the refusal reason."""
-        raise NotImplementedError
-
-    async def has_request_async(self, request_id: str) -> bool:
+        """Admit a persistent-state stream; None or the refusal reason."""
         raise NotImplementedError
 
     async def wait_stream_retired_async(self, request_id: str) -> None:
-        """Return once the engine no longer holds the persistent-state stream
-        `request_id`, at once if it never did or already retired."""
+        """Return once the engine no longer holds the stream `request_id`."""
         raise NotImplementedError
 
     async def profile_async(
@@ -979,7 +974,6 @@ class MPClient(EngineCoreClient):
 def _resolve_retirement_waiters(
     waiters: dict[str, asyncio.Future[None]], request_ids: Iterable[str]
 ) -> None:
-    """The engine has freed `request_ids`: wake their retirement waits."""
     for request_id in request_ids:
         waiter = waiters.pop(request_id, None)
         if waiter is not None and not waiter.done():
@@ -1239,8 +1233,8 @@ class AsyncMPClient(MPClient):
         self.client_count = client_count
         self.client_index = client_index
         self.outputs_queue = asyncio.Queue[EngineCoreOutputs | Exception]()
-        # Waits for a persistent-state stream's retirement, by request id, and
-        # the frontend's callback for every retired request id.
+        # Persistent-state stream retirement: waits by request id, and the
+        # frontend's callback for every retired id.
         self._retirement_waiters: dict[str, asyncio.Future[None]] = {}
         self.stream_retired_callback: Callable[[Iterable[str]], None] | None = None
 
@@ -1333,8 +1327,7 @@ class AsyncMPClient(MPClient):
                             _resolve_retirement_waiters(
                                 retirement_waiters, outputs.finished_requests
                             )
-                        # Here, not in the frontend's output handler: a batch
-                        # that carries only finished ids is dropped below.
+                        # A batch carrying only finished ids is dropped below.
                         _self = _self_ref()
                         if _self is not None and _self.stream_retired_callback:
                             _self.stream_retired_callback(outputs.finished_requests)
@@ -1426,25 +1419,20 @@ class AsyncMPClient(MPClient):
         self._ensure_output_queue_task()
 
     async def admit_stream_async(self, request: EngineCoreRequest) -> str | None:
-        # The admitted stream's outputs return to this client, as for an ADD.
         request.client_index = self.client_index
         # A utility argument is decoded generically, where the empty prompt
-        # list would not convert to the ndarray field; the engine restores it.
+        # would not convert to the ndarray field; the engine restores it.
         admission = msgspec.structs.replace(request, prompt_token_ids=None)
         return await self.call_utility_async("admit_stream", admission)
-
-    async def has_request_async(self, request_id: str) -> bool:
-        return await self.call_utility_async("has_request", request_id)
 
     async def wait_stream_retired_async(self, request_id: str) -> None:
         # @spec PSTATE-ADMIT-005
         waiter = self._retirement_waiters.get(request_id)
         if waiter is None:
-            # Registered before the query, so a retirement that arrives while
-            # the query is in flight resolves it.
+            # Registered before the query, so a retirement in flight resolves it.
             waiter = asyncio.get_running_loop().create_future()
             self._retirement_waiters[request_id] = waiter
-            if not await self.has_request_async(request_id):
+            if not await self.call_utility_async("has_request", request_id):
                 _resolve_retirement_waiters(self._retirement_waiters, (request_id,))
         await waiter
 

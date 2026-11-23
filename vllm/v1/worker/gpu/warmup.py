@@ -383,8 +383,7 @@ def run_mixed_prefill_decode_warmup(
 def _initialize_state_pages(
     model_runner: GPUModelRunner, output: SchedulerOutput, block_ids: range
 ) -> None:
-    """Have the step initialize the state pages its requests were given, as
-    the scheduler does for pages it allocates."""
+    """Initialize the state pages the step's requests were given."""
     # @spec PSTATE-PREP-005
     initializer = model_runner.state_page_initializer
     if initializer is not None and block_ids:

@@ -1081,26 +1081,21 @@ def get_max_concurrency_for_kv_cache_config(
 def verify_persistent_state_groups(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> None:
-    """Refuse a configuration in which the model's `SupportsPersistentState`
-    declaration and the KV cache's state groups (those whose manager config
-    is not recomputable) disagree, or in which a state group's spec is not a
-    `PERSISTENT_STATE` `MambaSpec` with one initial value per shape."""
+    """Refuse a configuration whose `SupportsPersistentState` declaration and
+    state groups (manager config not recomputable) disagree, or whose state
+    group spec is not a `PERSISTENT_STATE` `MambaSpec` with one initial value
+    per shape."""
     # @spec PSTATE-DECL-003 PSTATE-DECL-009
     state_groups = [
         group
         for group in kv_cache_config.kv_cache_groups
         if not group.manager_config.recomputable
     ]
-    declared = vllm_config.model_config.has_persistent_state
-    if declared and not state_groups:
+    if vllm_config.model_config.has_persistent_state != bool(state_groups):
         raise ValueError(
-            "The model declares SupportsPersistentState but no KV cache group "
-            "is a state group (ManagerConfig.recomputable=False)."
-        )
-    if state_groups and not declared:
-        raise ValueError(
-            "A KV cache group holds state that cannot be recomputed, but the "
-            "model does not declare SupportsPersistentState."
+            "A model declares SupportsPersistentState if and only if a KV cache "
+            "group holds state that cannot be recomputed "
+            "(ManagerConfig.recomputable=False)."
         )
     for group in state_groups:
         for layer_name, spec in group.kv_cache_specs.items():
@@ -1110,20 +1105,14 @@ def verify_persistent_state_groups(
             ):
                 raise ValueError(
                     f"State layer {layer_name} needs a MambaSpec with mamba_type "
-                    f"PERSISTENT_STATE, got {type(spec).__name__}"
-                    + (
-                        f" with {spec.mamba_type.name}"
-                        if isinstance(spec, MambaSpec)
-                        else ""
-                    )
+                    f"PERSISTENT_STATE, got {spec}"
                 )
             if spec.initial_values is not None and len(spec.initial_values) != len(
                 spec.shapes
             ):
                 raise ValueError(
-                    f"State layer {layer_name}: initial_values has "
-                    f"{len(spec.initial_values)} entries for {len(spec.shapes)} "
-                    "state shapes"
+                    f"State layer {layer_name}: {len(spec.initial_values)} "
+                    f"initial_values for {len(spec.shapes)} state shapes"
                 )
 
 

@@ -3311,45 +3311,32 @@ class VllmConfig:
         mm_config.validate_mm_processor_device(self.ec_transfer_config)
 
     def _verify_persistent_state_config(self) -> None:
-        """Refuse the options that would recompute, share or move a page of
-        state the model's tokens cannot rebuild."""
-        # @spec PSTATE-DECL-005
+        # @spec PSTATE-DECL-005: the options that would recompute, share or
+        # move a page of state the model's tokens cannot rebuild.
         model_config = self.model_config
         if model_config is None or not model_config.has_persistent_state:
             return
-        unsupported = "is not supported for this model"
-        if self.cache_config.enable_prefix_caching:
-            raise ValueError(f"enable_prefix_caching {unsupported}")
-        if (
-            self.kv_transfer_config is not None
-            and self.kv_transfer_config.kv_connector is not None
-        ):
-            raise ValueError(f"kv_transfer_config {unsupported}")
-        if (
-            self.ec_transfer_config is not None
-            and self.ec_transfer_config.ec_connector is not None
-        ):
-            raise ValueError(f"ec_transfer_config {unsupported}")
-        if self.speculative_config is not None:
-            raise ValueError(f"speculative_config {unsupported}")
-        for field_name in (
-            "pipeline_parallel_size",
-            "data_parallel_size",
-            "tensor_parallel_size",
-        ):
-            if getattr(self.parallel_config, field_name) > 1:
-                raise ValueError(f"{field_name} above 1 {unsupported}")
-        if model_config.uses_mrope:
-            raise ValueError(
-                f"multi-dimensional rotary positions (M-RoPE) {unsupported}"
-            )
-        if not model_config.persistent_state_accepts_synthetic_warmup:
-            for field_name in ("enable_fault_tolerance", "enable_elastic_ep"):
-                if getattr(self.parallel_config, field_name):
-                    raise ValueError(
-                        f"{field_name} {unsupported}: it reruns synthetic "
-                        "warmup, which the model declines"
-                    )
+        parallel, kv, ec = (
+            self.parallel_config,
+            self.kv_transfer_config,
+            self.ec_transfer_config,
+        )
+        no_warmup = not model_config.persistent_state_accepts_synthetic_warmup
+        unsupported = (
+            ("enable_prefix_caching", self.cache_config.enable_prefix_caching),
+            ("kv_transfer_config", kv is not None and kv.kv_connector is not None),
+            ("ec_transfer_config", ec is not None and ec.ec_connector is not None),
+            ("speculative_config", self.speculative_config is not None),
+            ("pipeline_parallel_size above 1", parallel.pipeline_parallel_size > 1),
+            ("data_parallel_size above 1", parallel.data_parallel_size > 1),
+            ("tensor_parallel_size above 1", parallel.tensor_parallel_size > 1),
+            ("multi-dimensional rotary positions (M-RoPE)", model_config.uses_mrope),
+            ("enable_fault_tolerance", no_warmup and parallel.enable_fault_tolerance),
+            ("enable_elastic_ep", no_warmup and parallel.enable_elastic_ep),
+        )
+        for option, requested in unsupported:
+            if requested:
+                raise ValueError(f"{option} is not supported for this model")
 
     def _limit_max_model_len_to_draft(self) -> None:
         """Lower max_model_len to the draft model's when the model runner

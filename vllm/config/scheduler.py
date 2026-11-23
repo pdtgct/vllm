@@ -303,17 +303,13 @@ class SchedulerConfig:
     ] = Field(
         default_factory=lambda: dict(SchedulerConfig.DEFAULT_STREAM_ADMISSION_TIMEOUTS)
     )
-    """Seconds a stream of a model with persistent state may stay in a state
-    before the engine ends it. A key sets that timeout and an absent key keeps
-    its default:
-
-    - `never_fed_timeout` (15.0): admitted, waiting for its first input.
-    - `parked_idle_timeout` (60.0): parked, waiting for its next input.
-    - `draining_timeout` (40.0): unfinished after its input closed.
-
-    A model without persistent state makes no use of this option. On the
-    command line this is a JSON object, e.g.
-    `--stream-admission-timeouts '{"never_fed_timeout": 30}'`."""
+    """Seconds a stream of a model with persistent state may stay admitted
+    without input (`never_fed_timeout`, 15.0), parked between inputs
+    (`parked_idle_timeout`, 60.0) or unfinished after its input closed
+    (`draining_timeout`, 40.0) before the engine ends it. An absent key keeps
+    its default. On the command line this is a JSON object, e.g.
+    `--stream-admission-timeouts '{"never_fed_timeout": 30}'`. A model
+    without persistent state makes no use of this option."""
 
     @staticmethod
     def default_factory(**kwargs):

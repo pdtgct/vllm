@@ -236,12 +236,10 @@ class EngineCoreRequest(
     # PrefixHashConfig, including any extra keys (LoRA, multimodal, cache salt).
     block_hashes: list[bytes] | None = None
 
-    # Set on every input of a persistent-state stream after the request that
-    # opened it, including the close signal, so that an input for a stream
-    # the engine no longer holds cannot open a new one.
+    # Set on every input of a persistent-state stream after its opener,
+    # including the close signal, so a late input cannot open a new stream.
     continuation: bool = False
-    # The request that admits a persistent-state stream before any input; it
-    # carries the stream's parameters and no prompt.
+    # Admits a persistent-state stream before any input; carries no prompt.
     stream_admission: bool = False
 
     @property
@@ -331,8 +329,8 @@ class EngineCoreOutput(
     # for array_like compatibility.
     watermarking: bool | None = None
 
-    # The finish ends a persistent-state stream; the output processor must not
-    # treat it as a turn boundary. Appended last for array_like compatibility.
+    # The finish ends a persistent-state stream rather than a turn.
+    # Appended last for array_like compatibility.
     terminal: bool = False
 
     @property

@@ -240,8 +240,8 @@ class ModelState(ABC):
         return None
 
     def take_failed_requests(self) -> set[str] | None:
-        """Ids of the requests whose state this step could not advance,
-        reported once; the runner asks after `postprocess_state`."""
+        """Ids of the requests whose state this step could not advance; the
+        runner asks once, after `postprocess_state`."""
         return None
 
     @abstractmethod

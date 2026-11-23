@@ -851,24 +851,20 @@ class KVCacheManager:
             ids.extend(mgr.take_new_block_ids())
         return ids
 
-    def take_new_state_page_req_ids(self) -> AbstractSet[str]:
-        """Drain the requests given a page of a non-recomputable group, which
-        the worker initializes, since the last call."""
-        req_ids: set[str] | None = None
-        for mgr in self.coordinator.single_type_managers:
-            if mgr_req_ids := mgr.take_new_page_req_ids():
-                req_ids = mgr_req_ids if req_ids is None else req_ids | mgr_req_ids
-        return req_ids if req_ids is not None else frozenset()
-
-    def take_new_state_block_ids(self) -> dict[int, list[int]] | None:
+    def take_new_state_pages(
+        self,
+    ) -> tuple[AbstractSet[str], dict[int, list[int]] | None]:
         """Drain the pages of non-recomputable groups allocated since the last
-        call, by KV cache group id; None when there is none."""
-        block_ids = {
-            mgr.kv_cache_group_id: ids
-            for mgr in self.coordinator.single_type_managers
-            if (ids := mgr.take_new_page_block_ids())
-        }
-        return block_ids or None
+        call, which the worker initializes: the requests given one, and the
+        pages by KV cache group id (None when there is none)."""
+        req_ids: set[str] = set()
+        block_ids: dict[int, list[int]] = {}
+        for mgr in self.coordinator.single_type_managers:
+            if mgr.new_page_block_ids:
+                req_ids |= mgr.new_page_req_ids
+                block_ids[mgr.kv_cache_group_id] = mgr.new_page_block_ids
+                mgr.new_page_req_ids, mgr.new_page_block_ids = set(), []
+        return req_ids, block_ids or None
 
     def record_blocks_for_zeroing(self, request_id: str, start_token: int) -> None:
         """Re-record the request's blocks from start_token onwards for

@@ -109,10 +109,6 @@ class RequestOutputCollector:
             self._input_stream_task.cancel()
         self._input_stream_task = None
 
-    def num_pending_turns(self) -> int:
-        """Completed streaming-input turns the consumer has not taken yet."""
-        return 0
-
     def __del__(self):
         if (task := self._input_stream_task) is not None:
             task.get_loop().call_soon_threadsafe(task.cancel)
@@ -166,6 +162,7 @@ class StreamingInputOutputCollector(RequestOutputCollector):
         return output
 
     def num_pending_turns(self) -> int:
+        """Completed turns the consumer has not taken yet."""
         return len(self._backlog) + (1 if _is_chunk_boundary(self.output) else 0)
 
 
@@ -262,7 +259,7 @@ class RequestState:
         self.input_chunk_queue: deque[StreamingUpdate] | None = (
             deque() if stream_input else None
         )
-        # A persistent-state request's history is replaced on each update.
+        # Each update replaces a persistent-state request's history.
         self.persistent_state = persistent_state
 
     def apply_streaming_update(self, update: StreamingUpdate) -> None:
@@ -288,8 +285,7 @@ class RequestState:
         self.is_prefilling = True
 
     def _start_turn(self, update: StreamingUpdate) -> None:
-        """The model's state carries the history: the new input replaces the
-        prompt, and the per-turn output state starts over."""
+        """The new input replaces the prompt; per-turn output state restarts."""
         # @spec PSTATE-HIST-005
         self.prompt = update.prompt
         self.prompt_token_ids = gc_untrack(update.prompt_token_ids or [])
@@ -376,8 +372,7 @@ class RequestState:
             queue=queue,
             log_stats=log_stats,
             stream_interval=stream_interval,
-            # An admission opens no input of its own: it parks, as a request
-            # whose last input completed, until the stream's first input.
+            # An admission parks, as a request whose last input completed.
             stream_input=request.resumable and not request.stream_admission,
             remote_prefill_cached_tokens=remote_prefill_cached_tokens,
             persistent_state=persistent_state,
@@ -601,9 +596,8 @@ class OutputProcessor:
         self.log_stats = log_stats
         self.tokenizer = tokenizer
         self.stream_interval = stream_interval
-        # Whether the model keeps its history in persistent state: streaming
-        # updates then replace a request's history, and its pending inputs and
-        # undelivered turns are bounded by max_pending_stream_inputs.
+        # For a model with persistent state, updates replace a request's
+        # history and max_pending_stream_inputs bounds its queues.
         self.persistent_state = persistent_state
         self.max_pending_stream_inputs = max_pending_stream_inputs
         self.request_states: dict[str, RequestState] = {}
@@ -776,8 +770,8 @@ class OutputProcessor:
             req_state.input_chunk_queue.append(update)
 
     def _end_stream(self, req_state: RequestState, code: str) -> None:
-        """End a persistent-state stream that exceeded a bound; its pending
-        inputs and undelivered turns are dropped."""
+        """End a stream that exceeded a bound, dropping its pending inputs
+        and undelivered turns."""
         self._finish_request(req_state)
         self.lora_states.request_finished(req_state.request_id, req_state.lora_name)
         if req_state.queue is not None:
@@ -834,7 +828,6 @@ class OutputProcessor:
                     and not error.retryable
                     and error.code != "validation_error"
                 ):
-                    # The stream ended with a code the client can act on.
                     exception = StreamError(error.code, error.message)
                 req_state.queue.put(exception)
                 self._finish_request(req_state)
@@ -922,11 +915,10 @@ class OutputProcessor:
             if (
                 streaming_chunk_boundary
                 and req_state.persistent_state
-                and req_state.queue is not None
+                and isinstance(req_state.queue, StreamingInputOutputCollector)
                 and req_state.queue.num_pending_turns()
                 >= self.max_pending_stream_inputs
             ):
-                # The client stopped reading turns.
                 self._end_stream(req_state, "output_backlog_limit")
                 reqs_to_abort.append(req_id)
                 self._update_stats_from_finished(

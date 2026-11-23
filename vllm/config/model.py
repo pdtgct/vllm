@@ -2260,7 +2260,6 @@ class ModelConfig:
 
     @property
     def has_persistent_state(self) -> bool:
-        """Whether the model class declares `SupportsPersistentState`."""
         return self._model_info.has_persistent_state
 
     @property

@@ -64,9 +64,8 @@ class RequestState:
         )
         # Optimistic CPU mirror of num_computed_tokens (upper bound on GPU value).
         self.num_computed_tokens_np = np.zeros(self.max_num_reqs, dtype=np.int32)
-        # Tokens the scheduler dropped from a compacted streaming request;
-        # added to its positions, never to its lengths. Staged only for a
-        # model that reads positions through it.
+        # Tokens compaction dropped from a persistent-state request; added to
+        # its positions, never its lengths. Staged only if the model reads it.
         self.tracks_position_offset = tracks_position_offset
         self.position_offset = StagedWriteTensor(
             self.max_num_reqs, dtype=torch.int32, device=device

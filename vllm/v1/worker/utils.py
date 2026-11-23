@@ -259,10 +259,9 @@ class KVBlockZeroer:
 
 
 class StatePageInitializer:
-    """Writes each state group's declared initial values into the pages newly
-    allocated to that group, so a request reads valid state on its first
-    forward. Groups may overlay one memory, so a group's values go only into
-    its own pages."""
+    """Writes each state group's initial values into the pages newly
+    allocated to it. Groups may overlay one memory, so a group's values go
+    only into its own pages."""
 
     def __init__(
         self,
@@ -271,6 +270,7 @@ class StatePageInitializer:
     ):
         self.device = device
         self._pages_by_group = pages_by_group
+        self.group_ids = list(pages_by_group)
 
     @classmethod
     def from_kv_cache_config(
@@ -279,8 +279,7 @@ class StatePageInitializer:
         kv_cache_config: KVCacheConfig,
         static_forward_context: dict[str, Any],
     ) -> "StatePageInitializer | None":
-        """The initializer of every non-recomputable `MambaSpec` group, or
-        `None` when the model has no such group."""
+        """None when the model has no non-recomputable group."""
         pages_by_group: dict[int, list[tuple[torch.Tensor, Any]]] = {}
         for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
             if group.manager_config.recomputable:
@@ -294,12 +293,7 @@ class StatePageInitializer:
                 pages.extend(zip(states, values))
         return cls(device, pages_by_group) if pages_by_group else None
 
-    @property
-    def group_ids(self) -> list[int]:
-        return list(self._pages_by_group)
-
     def initialize(self, block_ids_by_group: dict[int, list[int]]) -> None:
-        """Write each group's initial values into its pages `block_ids`."""
         for group_id, block_ids in block_ids_by_group.items():
             if not block_ids:
                 continue

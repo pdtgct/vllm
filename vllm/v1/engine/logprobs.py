@@ -214,8 +214,7 @@ class LogprobsProcessor:
         return scores
 
     def start_turn(self) -> None:
-        """Forget the previous turn's sample logprobs of a persistent-state
-        request; the next turn starts from none."""
+        """Forget the previous turn's sample logprobs."""
         if self.logprobs is not None:
             # [:0] keeps the list or FlatLogprobs representation.
             self.logprobs = self.logprobs[:0]

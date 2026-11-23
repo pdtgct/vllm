@@ -7,7 +7,7 @@ import signal
 import threading
 import time
 from collections import defaultdict, deque
-from collections.abc import Callable, Generator, Sequence, Sized
+from collections.abc import Callable, Generator, Iterable, Sequence, Sized
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
 from enum import IntEnum
@@ -619,31 +619,26 @@ class EngineCore:
         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
 
     def has_request(self, request_id: str) -> bool:
-        """Whether the scheduler holds the request."""
         return self.scheduler.has_request(request_id)
 
     def admit_stream(self, request: EngineCoreRequest) -> str | None:
-        """Admit a persistent-state stream before any input, as a parked
-        request with an empty prompt, and return None; or return the refusal
-        reason (`request_id_in_use`, `engine_paused` or `active_limit`)."""
+        """Admit a persistent-state stream before any input, or return the
+        refusal reason."""
         # @spec PSTATE-ADMIT-001 PSTATE-ADMIT-011
         if not self.scheduler.has_unrecomputable_state:
             raise VLLMValidationError(
                 "stream admission is not supported for this model"
             )
         if request.prompt_token_ids is None:
-            # The admission is sent without a prompt (a utility call carries
-            # no packed prompt); the stream's first input brings one.
+            # A utility call carries no packed prompt; the first input brings one.
             request.prompt_token_ids = []
         req, _ = self.preprocess_add_request(request)
         return self.scheduler.admit_stream(req)
 
     def _held_state_streams(self) -> list[str]:
-        """Ids of the persistent-state streams held; empty for an ordinary
-        model."""
         if not self.scheduler.has_unrecomputable_state:
             return []
-        return sorted(self.scheduler.held_state_streams())
+        return self.scheduler.held_state_streams()
 
     def _refuse_while_state_streams_held(self, operation: str) -> None:
         # @spec PSTATE-PRES-004
@@ -1051,7 +1046,7 @@ class EngineCore:
         preparing = self._checkpoint_state == CheckpointState.PREPARING
         if clear_cache and self._held_state_streams():
             # @spec PSTATE-PRES-005: a stream opened during the drain fails the
-            # call, which leaves the engine as before the pause.
+            # call and leaves the engine as before the pause.
             self.resume_scheduler()
             self._refuse_while_state_streams_held("clear the cache")
         try:
@@ -1217,7 +1212,7 @@ class EngineCore:
             tags = [t for t in tags if t != "scheduling"]
 
         was_sleeping = self.model_executor.is_sleeping
-        if tags is None or bool(tags):
+        if tags is None or tags:
             self.model_executor.wake_up(tags)
             if tags is None or "kv_cache" in tags:
                 # Peers must load the re-registered KV cache.
@@ -1229,8 +1224,7 @@ class EngineCore:
         if fully_awake:
             if was_sleeping and self.scheduler.has_unrecomputable_state:
                 # @spec PSTATE-PREP-006 PSTATE-PREP-009: a wake that remapped
-                # memory invalidates the model state's graphs; recapture once,
-                # before scheduling. A level-0 sleep remapped nothing.
+                # memory invalidates the model state's graphs.
                 self.collective_rpc("recapture_model_state_graphs")
             self.resume_scheduler()
         return fully_awake
@@ -1465,8 +1459,7 @@ class EngineCoreProc(EngineCore):
                 executor_class,
                 log_stats,
                 executor_fail_callback,
-                # A client waits for a persistent-state stream's retirement
-                # through the finished set (see wait_stream_retired_async).
+                # The finished set tells a client when a state stream retired.
                 internal_dp_balancing or vllm_config.model_config.has_persistent_state,
             )
 
@@ -1909,10 +1902,12 @@ class EngineCoreProc(EngineCore):
                     waited = True
             block = self.process_input_queue_block
             try:
+                timeout = None
+                if block and self.scheduler.has_unrecomputable_state:
+                    # The idle wait ends at the nearest state-stream deadline.
+                    timeout = self.scheduler.next_stream_deadline()
                 with get_watch_dog().disable():
-                    req = self.input_queue.get(
-                        block=block, timeout=self._idle_wait_timeout(block)
-                    )
+                    req = self.input_queue.get(block=block, timeout=timeout)
                 self._handle_client_request(*req)
             except queue.Empty:
                 break
@@ -1930,14 +1925,7 @@ class EngineCoreProc(EngineCore):
         # defeats its stream's deadline, and before the step.
         self._sweep_stream_deadlines()
 
-    def _idle_wait_timeout(self, block: bool) -> float | None:
-        """The idle wait ends at the nearest persistent-state stream deadline."""
-        if not block or not self.scheduler.has_unrecomputable_state:
-            return None
-        return self.scheduler.next_stream_deadline()
-
     def _sweep_stream_deadlines(self) -> None:
-        """Abort the persistent-state streams whose deadline has passed."""
         # @spec PSTATE-ADMIT-007
         if self.scheduler.has_unrecomputable_state:
             self._send_abort_outputs(self.scheduler.sweep_stream_deadlines())
@@ -2070,9 +2058,9 @@ class EngineCoreProc(EngineCore):
                 self.scheduler.has_unrecomputable_state
                 and self.scheduler.stream_finish_outputs
             ):
-                # The input ended its stream: report that before any later
-                # input's outcome.
-                self._send_stream_finish_outputs()
+                # The input ended its stream: report that before a later input.
+                self._send_finish_outputs(self.scheduler.stream_finish_outputs)
+                self.scheduler.stream_finish_outputs.clear()
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
         elif request_type == EngineCoreRequestType.UTILITY:
@@ -2130,10 +2118,9 @@ class EngineCoreProc(EngineCore):
         return True
 
     def _reject_unknown_stream_input(self, request: Request) -> bool:
-        """Refuse a persistent-state stream input that must not open a
-        request: a continuation of a stream the engine no longer holds (its
-        close signal is dropped without an output), or an opener whose
-        internal or external id a held stream has."""
+        """Refuse a stream input that must not open a request: a continuation
+        of a stream no longer held (a close is dropped silently), or an
+        opener whose id or external id a held stream has."""
         # @spec PSTATE-TURN-006 PSTATE-TURN-013 PSTATE-ADMIT-012
         if not self.scheduler.has_unrecomputable_state:
             return False
@@ -2142,33 +2129,16 @@ class EngineCoreProc(EngineCore):
                 return False
             if not request.resumable:
                 return True
-            error = RequestError(
-                code="stream_not_found",
-                message=f"Stream {request.request_id} is not held by the engine.",
-            )
+            code, why = "stream_not_found", "is not held by the engine"
         elif request.resumable and self.scheduler.stream_id_in_use(request):
-            error = RequestError(
-                code="request_id_in_use",
-                message=f"Stream {request.request_id}: its id or external id "
-                "belongs to a held stream.",
-            )
+            code, why = "request_id_in_use", "has the id of a held stream"
         else:
             return False
+        error = RequestError(code=code, message=f"Stream {request.request_id} {why}.")
         self._send_finish_outputs_to_client(
             [request.request_id], request.client_index, FinishReason.ERROR, error
         )
         return True
-
-    def _send_stream_finish_outputs(self) -> None:
-        """Send the outputs of the streams an input ended between steps."""
-        by_client = defaultdict[int, list[EngineCoreOutput]](list)
-        for client_index, output in self.scheduler.stream_finish_outputs:
-            by_client[client_index].append(output)
-        self.scheduler.stream_finish_outputs.clear()
-        for client_index, outputs in by_client.items():
-            req_ids = [output.request_id for output in outputs]
-            eco = EngineCoreOutputs(finished_requests=req_ids, outputs=outputs)
-            self.output_queue.put_nowait((client_index, eco))
 
     def _reject_utility_in_shutdown(
         self, client_idx: int, call_id: int, method_name: str
@@ -2585,8 +2555,7 @@ class EngineCoreProc(EngineCore):
         if mode not in get_args(PauseMode):
             raise ValueError(f"Invalid pause mode: {mode}")
         if clear_cache and mode != "abort":
-            # Checked again once the drain completes (PSTATE-PRES-005): a
-            # stream held then still fails the pause, in _reset_caches.
+            # Checked again once the drain completes (PSTATE-PRES-005).
             self._refuse_while_state_streams_held("clear the cache")
 
         def engine_idle_callback(engine: "EngineCoreProc", future: Future[Any]) -> None:
@@ -2712,22 +2681,31 @@ class EngineCoreProc(EngineCore):
     def _send_abort_outputs(self, aborted_reqs: list[Request]) -> None:
         # TODO(nick) this will be moved inside the scheduler
         if aborted_reqs:
-            # Map client_index to the abort outputs of that client's requests.
             # A stop_reason names the deadline that aborted a state stream.
-            by_client = defaultdict[int, list[EngineCoreOutput]](list)
-            for request in aborted_reqs:
-                by_client[request.client_index].append(
+            self._send_finish_outputs(
+                (
+                    request.client_index,
                     EngineCoreOutput(
                         request.request_id,
                         [],
                         finish_reason=FinishReason.ABORT,
                         stop_reason=request.stop_reason,
-                    )
+                    ),
                 )
-            for client_index, outputs in by_client.items():
-                req_ids = [output.request_id for output in outputs]
-                eco = EngineCoreOutputs(finished_requests=req_ids, outputs=outputs)
-                self.output_queue.put_nowait((client_index, eco))
+                for request in aborted_reqs
+            )
+
+    def _send_finish_outputs(
+        self, outputs: Iterable[tuple[int, EngineCoreOutput]]
+    ) -> None:
+        # Map client_index to the finish outputs of that client's requests.
+        by_client = defaultdict[int, list[EngineCoreOutput]](list)
+        for client_index, output in outputs:
+            by_client[client_index].append(output)
+        for client_index, client_outputs in by_client.items():
+            req_ids = [output.request_id for output in client_outputs]
+            eco = EngineCoreOutputs(finished_requests=req_ids, outputs=client_outputs)
+            self.output_queue.put_nowait((client_index, eco))
 
 
 class DPEngineCoreProc(EngineCoreProc):

@@ -93,9 +93,8 @@ class IncrementalDetokenizer:
         return ""
 
     def start_turn(self, prompt_token_ids: list[int] | None) -> None:
-        """Begin a turn of a persistent-state request on a new prompt: forget
-        the previous turn's output, keeping only what incremental decoding of
-        the next token needs."""
+        """Begin a turn of a persistent-state request on a new prompt, keeping
+        only what incremental decoding of the next token needs."""
         self.token_ids.clear()
 
     @classmethod
@@ -283,8 +282,7 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
 
     def start_turn(self, prompt_token_ids: list[int] | None) -> None:
         super().start_turn(prompt_token_ids)
-        # A fresh stream primed with the new prompt's tail; the old stream
-        # held every id it ever stepped.
+        # The old stream held every id it ever stepped.
         self._seed_stream(prompt_token_ids)
         if not self.spaces_between_special_tokens:
             self.last_special = False
@@ -374,8 +372,7 @@ class SlowIncrementalDetokenizer(BaseIncrementalDetokenizer):
 
     def start_turn(self, prompt_token_ids: list[int] | None) -> None:
         super().start_turn(prompt_token_ids)
-        # Keep the prompt window convert_prompt_ids_to_tokens reads, so the
-        # offsets index it and the retained history stays a few tokens.
+        # Keep the prompt window convert_prompt_ids_to_tokens reads.
         num_kept = INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET + 2
         window = (prompt_token_ids or [])[-num_kept:]
         self.tokens, self.prefix_offset, self.read_offset = (

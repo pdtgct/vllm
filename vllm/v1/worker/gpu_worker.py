@@ -1132,9 +1132,8 @@ class Worker(WorkerBase):
         # cuda graph capture.
         kernel_warmup(self)
 
-        # @spec PSTATE-PREP-001, PSTATE-PREP-002
-        # A model may decline the steps that run requests through its state;
-        # an extensible KV cache then keeps the profiled peak as its headroom.
+        # @spec PSTATE-PREP-001, PSTATE-PREP-002: a model may decline the
+        # steps that run requests through its state.
         synthetic_warmup = (
             not self.model_config.has_persistent_state
             or self.model_config.persistent_state_accepts_synthetic_warmup

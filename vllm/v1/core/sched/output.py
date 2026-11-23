@@ -54,8 +54,8 @@ class NewRequestData:
     prompt_is_token_ids: list[bool] | None = None
     # DeepSeek-V4.1 only: SWA bounded replay; see Request.replay_start.
     replay_start: int = 0
-    # Tokens a persistent-state request dropped by compaction; the worker adds
-    # it to each position it computes. 0 for every other request.
+    # Tokens compaction dropped from a persistent-state request; added to its
+    # positions. 0 for every other request.
     position_offset: int = 0
 
     @classmethod
@@ -335,12 +335,9 @@ class SchedulerOutput:
     skip_drafts: bool = False
 
     # Requests whose persistent-state page was allocated, and so initialized,
-    # in this step; the model state reads page freshness from this set alone.
-    # Empty for a model without persistent state.
+    # in this step: the model state's only source of page freshness.
     new_state_page_req_ids: AbstractSet[str] = frozenset()
-    # The pages to initialize, by KV cache group id, for the state groups
-    # that allocated them in this step. None for a model without persistent
-    # state, and for a step that allocated no state page.
+    # The pages to initialize this step, by KV cache group id; None if none.
     new_state_block_ids: dict[int, list[int]] | None = None
 
     @classmethod

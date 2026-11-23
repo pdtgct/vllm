@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Metadata for per-request state that a request's tokens cannot rebuild.
-
-The state lives in a `MambaSpec` page of a non-recomputable group, which the
-worker initializes on allocation, so every row holds valid initial state.
-"""
+"""Metadata for per-request state a request's tokens cannot rebuild; the
+worker initializes its page on allocation, so every row has initial state."""
 
 from dataclasses import replace
 from typing import Any
