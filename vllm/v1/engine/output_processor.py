@@ -33,7 +33,6 @@ from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.gc_utils import gc_untrack
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
-from vllm.v1.engine.exceptions import StreamError
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import (
@@ -134,6 +133,9 @@ class StreamingInputOutputCollector(RequestOutputCollector):
     def __init__(self, output_kind: RequestOutputKind, request_id: str):
         super().__init__(output_kind, request_id)
         self._backlog: deque[RequestOutput] = deque()
+        # A persistent-state stream's input credits: one returns when the
+        # consumer takes the output that ends a turn (PSTATE-HIST-006).
+        self.credits: asyncio.Semaphore | None = None
 
     def put(self, output: RequestOutput | PoolingRequestOutput | Exception) -> None:
         if isinstance(output, Exception):
@@ -152,6 +154,7 @@ class StreamingInputOutputCollector(RequestOutputCollector):
         if self._backlog:
             self.output = self._backlog.popleft()
             self.ready.set()
+        self._return_credit(output)
         return output
 
     def get_nowait(self) -> RequestOutput | PoolingRequestOutput | None:
@@ -159,11 +162,14 @@ class StreamingInputOutputCollector(RequestOutputCollector):
         if self._backlog:
             self.output = self._backlog.popleft()
             self.ready.set()
+        self._return_credit(output)
         return output
 
-    def num_pending_turns(self) -> int:
-        """Completed turns the consumer has not taken yet."""
-        return len(self._backlog) + (1 if _is_chunk_boundary(self.output) else 0)
+    def _return_credit(
+        self, output: RequestOutput | PoolingRequestOutput | None
+    ) -> None:
+        if self.credits is not None and _is_chunk_boundary(output):
+            self.credits.release()
 
 
 @dataclass(slots=True)
@@ -210,7 +216,7 @@ class RequestState:
         temperature: float | None = None,
         stream_input: bool = False,
         remote_prefill_cached_tokens: int | None = None,
-        persistent_state: bool = False,
+        state_stream: bool = False,
     ):
         self.request_id = request_id
         self.external_req_id = external_req_id
@@ -259,13 +265,14 @@ class RequestState:
         self.input_chunk_queue: deque[StreamingUpdate] | None = (
             deque() if stream_input else None
         )
-        # Each update replaces a persistent-state request's history.
-        self.persistent_state = persistent_state
+        # A persistent-state stream: each input replaces its history, and only
+        # the engine core's terminal output ends it.
+        self.state_stream = state_stream
 
     def apply_streaming_update(self, update: StreamingUpdate) -> None:
         # Apply the update to the request state.
         self.streaming_input = not update.final
-        if self.persistent_state:
+        if self.state_stream:
             self._start_turn(update)
         else:
             # TODO also include relevant output tokens in new prompt here
@@ -352,6 +359,7 @@ class RequestState:
             output_kind = request.pooling_params.output_kind
 
         assert request.external_req_id is not None
+        state_stream = persistent_state and request.resumable
         state = cls(
             request_id=request.request_id,
             external_req_id=request.external_req_id,
@@ -372,10 +380,12 @@ class RequestState:
             queue=queue,
             log_stats=log_stats,
             stream_interval=stream_interval,
-            # An admission parks, as a request whose last input completed.
-            stream_input=request.resumable and not request.stream_admission,
+            # An admitted state stream has no prompt yet; it waits for its
+            # first input as a parked stream does (PSTATE-ADMIT-002).
+            stream_input=request.resumable
+            and not (state_stream and not request.prompt_token_ids),
             remote_prefill_cached_tokens=remote_prefill_cached_tokens,
-            persistent_state=persistent_state,
+            state_stream=state_stream,
         )
         if state.stats is not None and sampling_params is not None:
             state.stats.is_watermarked = bool(sampling_params.watermarking)
@@ -591,21 +601,17 @@ class OutputProcessor:
         tracing_enabled: bool = False,
         admission_stats: "SharedAdmissionStats | None" = None,
         persistent_state: bool = False,
-        max_pending_stream_inputs: int = 8,
     ):
         self.log_stats = log_stats
         self.tokenizer = tokenizer
         self.stream_interval = stream_interval
-        # For a model with persistent state, updates replace a request's
-        # history and max_pending_stream_inputs bounds its queues.
-        self.persistent_state = persistent_state
-        self.max_pending_stream_inputs = max_pending_stream_inputs
         self.request_states: dict[str, RequestState] = {}
         self.parent_requests: dict[str, ParentRequest] = {}
         self.external_req_ids: defaultdict[str, list[str]] = defaultdict(list)
         self.lora_states = LoRARequestStates(log_stats)
         self.tracing_enabled = tracing_enabled
         self.admission_stats = admission_stats
+        self.persistent_state = persistent_state
 
     def get_num_unfinished_requests(self):
         return len(self.request_states)
@@ -734,6 +740,10 @@ class OutputProcessor:
         self, req_state: RequestState, request: EngineCoreRequest, prompt: str | None
     ) -> None:
         """Queue a streaming update instead of immediately applying it."""
+        if not request.resumable and req_state.state_stream:
+            # @spec PSTATE-TURN-003: the engine core's terminal output ends the
+            # stream, after any input it still runs.
+            return
         if not request.resumable:
             # Final request - just mark completion, don't add its dummy tokens.
             if req_state.input_chunk_queue is None:
@@ -755,32 +765,13 @@ class OutputProcessor:
             arrival_time=request.arrival_time,
         )
 
+        # Apply request updates now if the last input already completed.
         if req_state.input_chunk_queue is None:
-            # Apply request updates now if the last input already completed.
             req_state.apply_streaming_update(update)
             req_state.input_chunk_queue = deque()
-        elif (
-            req_state.persistent_state
-            and len(req_state.input_chunk_queue) >= self.max_pending_stream_inputs
-        ):
-            self._end_stream(req_state, "pending_input_limit")
         else:
             # Queue the streaming update otherwise.
             req_state.input_chunk_queue.append(update)
-
-    def _end_stream(self, req_state: RequestState, code: str) -> None:
-        """End a stream that exceeded a bound, dropping its pending inputs
-        and undelivered turns."""
-        self._finish_request(req_state)
-        self.lora_states.request_finished(req_state.request_id, req_state.lora_name)
-        if req_state.queue is not None:
-            req_state.queue.put(
-                StreamError(
-                    code,
-                    f"Stream {req_state.external_req_id} ended: {code} "
-                    f"({self.max_pending_stream_inputs} allowed)",
-                )
-            )
 
     def process_outputs(
         self,
@@ -821,14 +812,7 @@ class OutputProcessor:
             error = engine_core_output.error
             if error is not None and req_state.queue is not None:
                 # Rejected on arrival, e.g. by a paused engine; nothing was run.
-                exception: Exception = error.to_exception()
-                if (
-                    req_state.persistent_state
-                    and not error.retryable
-                    and error.code != "validation_error"
-                ):
-                    exception = StreamError(error.code, error.message)
-                req_state.queue.put(exception)
+                req_state.queue.put(error.to_exception())
                 self._finish_request(req_state)
                 if req_state.streaming_input:
                     # Input chunks sent since may re-create the session.
@@ -905,24 +889,12 @@ class OutputProcessor:
                 # if required.
                 req_state.logprobs_processor.update_from_output(engine_core_output)
 
-            streaming_chunk_boundary = (
-                req_state.streaming_input
-                and finish_reason not in (FinishReason.ABORT, FinishReason.ERROR)
-                and not engine_core_output.terminal
+            streaming_chunk_boundary = req_state.streaming_input and (
+                finish_reason not in (FinishReason.ABORT, FinishReason.ERROR)
             )
-            if (
-                streaming_chunk_boundary
-                and req_state.persistent_state
-                and isinstance(req_state.queue, StreamingInputOutputCollector)
-                and req_state.queue.num_pending_turns()
-                >= self.max_pending_stream_inputs
-            ):
-                self._end_stream(req_state, "output_backlog_limit")
-                reqs_to_abort.append(req_id)
-                self._update_stats_from_finished(
-                    req_state, FinishReason.ERROR, iteration_stats
-                )
-                continue
+            if req_state.state_stream:
+                # Only the engine core knows whether a finish ended the stream.
+                streaming_chunk_boundary = not engine_core_output.terminal
 
             # 4) Create and handle RequestOutput objects.
             if request_output := req_state.make_request_output(
@@ -954,7 +926,9 @@ class OutputProcessor:
                         req_state.input_chunk_queue = None
                 else:
                     self._finish_request(req_state)
-                    if req_state.streaming_input or not engine_core_output.finished:
+                    if (
+                        req_state.streaming_input and not engine_core_output.terminal
+                    ) or not engine_core_output.finished:
                         # EngineCore may still have the request: a stop string
                         # was detected here, or an in-flight streaming-input
                         # chunk may re-create the session.

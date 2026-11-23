@@ -3331,6 +3331,12 @@ class VllmConfig:
             ("data_parallel_size above 1", parallel.data_parallel_size > 1),
             ("tensor_parallel_size above 1", parallel.tensor_parallel_size > 1),
             ("multi-dimensional rotary positions (M-RoPE)", model_config.uses_mrope),
+            (
+                'request_failure_policy="recompute"',
+                parallel.enable_fault_tolerance
+                and parallel.fault_tolerance_config.request_failure_policy
+                == "recompute",
+            ),
             ("enable_fault_tolerance", no_warmup and parallel.enable_fault_tolerance),
             ("enable_elastic_ep", no_warmup and parallel.enable_elastic_ep),
         )

@@ -228,11 +228,10 @@ class SingleTypeKVCacheManager(ABC):
         # consume them and this manager's blocks get zeroed.
         self._record_new_block_ids = needs_kv_cache_zeroing and self.zeroes_new_blocks
         self.new_block_ids: list[int] = []
-        # Pages of a non-recomputable group, and the requests given them,
-        # since the scheduler last drained them for the worker to initialize.
+        # Pages of a non-recomputable group allocated since the scheduler
+        # last drained them for the worker to initialize.
         self.initializes_new_pages = not self.manager_config.recomputable
         self.new_page_block_ids: list[int] = []
-        self.new_page_req_ids: set[str] = set()
 
         # Mapping from request ID to blocks to track the blocks allocated
         # for each request, so that we can free the blocks when the request
@@ -542,7 +541,6 @@ class SingleTypeKVCacheManager(ABC):
                 self.new_block_ids.extend(b.block_id for b in new_blocks)
             if self.initializes_new_pages:
                 self.new_page_block_ids.extend(b.block_id for b in new_blocks)
-                self.new_page_req_ids.add(request_id)
             return null_blocks + cow_blocks + new_blocks
 
     def _num_unbacked_leading_blocks(self, num_tokens_main_model: int) -> int:

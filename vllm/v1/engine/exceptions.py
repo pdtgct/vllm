@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from vllm.exceptions import GenerationError, VLLMServerError
+from http import HTTPStatus
+
+from vllm.exceptions import GracefulHTTPError, VLLMServerError
 
 
 class EngineGenerateError(VLLMServerError):
@@ -9,22 +11,15 @@ class EngineGenerateError(VLLMServerError):
     pass
 
 
-class StreamError(GenerationError):
-    """A persistent-state stream ended with the non-retryable `code`, e.g.
-    `pending_input_limit`, `output_backlog_limit`, `stream_not_found`,
-    `input_after_close` or `unsupported_sampling_parameter`."""
-
-    def __init__(self, code: str, message: str):
-        super().__init__(message)
-        self.code = code
-
-
-class StreamAdmissionError(GenerationError):
+class StreamAdmissionError(GracefulHTTPError):
     """The engine refused to admit a persistent-state stream, with `reason`
-    `request_id_in_use`, `engine_paused` or `active_limit`."""
+    `engine_paused` or `active_limit`. Returns HTTP 503 (Service Unavailable)
+    so that clients retry, as for a full request queue."""
 
     def __init__(self, reason: str):
-        super().__init__(f"Stream admission refused: {reason}")
+        super().__init__(
+            f"Stream admission refused: {reason}", HTTPStatus.SERVICE_UNAVAILABLE
+        )
         self.reason = reason
 
 

@@ -1004,9 +1004,7 @@ class _ModelInfo:
     is_hybrid: bool
     has_persistent_state: bool
     persistent_state_reads_positions: bool
-    persistent_state_parks_on_eos: bool
     persistent_state_accepts_synthetic_warmup: bool
-    persistent_state_ignores_stopped_row_echoes: bool
     has_noops: bool
     supports_replayssm: bool
     supports_transcription: bool
@@ -1047,14 +1045,8 @@ class _ModelInfo:
             persistent_state_reads_positions=getattr(
                 model, "persistent_state_reads_positions", True
             ),
-            persistent_state_parks_on_eos=getattr(
-                model, "persistent_state_parks_on_eos", True
-            ),
             persistent_state_accepts_synthetic_warmup=getattr(
                 model, "persistent_state_accepts_synthetic_warmup", True
-            ),
-            persistent_state_ignores_stopped_row_echoes=getattr(
-                model, "persistent_state_ignores_stopped_row_echoes", False
             ),
             supports_replayssm=supports_replayssm(model),
             supports_transcription=supports_transcription(model),

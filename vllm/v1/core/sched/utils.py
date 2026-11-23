@@ -3,11 +3,7 @@
 import contextlib
 from collections.abc import Sequence
 
-from vllm.sampling_params import (
-    RepetitionDetectionParams,
-    RequestOutputKind,
-    SamplingParams,
-)
+from vllm.sampling_params import RepetitionDetectionParams
 from vllm.v1.request import Request, RequestStatus
 
 
@@ -99,25 +95,11 @@ def remove_all(lst: list, items_to_remove: set) -> list:
     return [item for item in lst if item not in items_to_remove]
 
 
-def check_stop(
-    request: Request,
-    max_model_len: int,
-    position_offset: int = 0,
-    length_before_eos: bool = False,
-) -> bool:
-    """Set the request's finished status if its last output token stops it.
-    `position_offset` counts positions compaction dropped; `length_before_eos`
-    checks the length limit before EOS, so an EOS at the limit ends a
-    persistent-state stream instead of parking it."""
+def check_stop(request: Request, max_model_len: int) -> bool:
     assert not request.pooling_params
 
     sampling_params = request.sampling_params
     assert sampling_params is not None
-
-    num_positions = request.num_tokens + position_offset
-    if length_before_eos and num_positions >= max_model_len:
-        request.status = RequestStatus.FINISHED_LENGTH_CAPPED
-        return True
 
     last_token_id = request.output_token_ids[-1]
     if last_token_id == sampling_params.eos_token_id:
@@ -129,8 +111,9 @@ def check_stop(
         request.stop_reason = last_token_id
         return True
 
+    # @spec PSTATE-TURN-010: compaction's dropped positions count too.
     if (
-        num_positions >= max_model_len
+        request.num_tokens + request.position_offset >= max_model_len
         or request.num_output_tokens >= request.max_tokens
     ):
         request.status = RequestStatus.FINISHED_LENGTH_CAPPED
@@ -156,26 +139,3 @@ def check_stop(
         return True
 
     return False
-
-
-def unsupported_stream_sampling_parameter(
-    sampling_params: SamplingParams | None, stream: bool = True
-) -> str | None:
-    """The first sampling parameter a persistent-state request cannot carry,
-    or None: those read past output or accumulate across turns, which
-    compaction changes. A single request (`stream=False`) may use any
-    output kind."""
-    if (sp := sampling_params) is None:
-        return None
-    refused = (
-        ("presence_penalty", sp.presence_penalty != 0),
-        ("frequency_penalty", sp.frequency_penalty != 0),
-        ("repetition_penalty", sp.repetition_penalty != 1),
-        ("bad_words", bool(sp.bad_words)),
-        ("structured_outputs", sp.structured_outputs is not None),
-        ("prompt_logprobs", sp.prompt_logprobs is not None),
-        ("thinking_token_budget", sp.thinking_token_budget is not None),
-        ("n", sp.n > 1),
-        ("output_kind", stream and sp.output_kind != RequestOutputKind.DELTA),
-    )
-    return next((name for name, unsupported in refused if unsupported), None)

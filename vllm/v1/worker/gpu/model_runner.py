@@ -1210,7 +1210,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     @torch.inference_mode()
     def recapture_model_state_graphs(self) -> None:
         """Recapture the model state's graphs after a wake remapped memory."""
-        # @spec PSTATE-PREP-006, PSTATE-PREP-007
+        # @spec PSTATE-PREP-006
         if not self.model_state_needs_cudagraph_capture():
             return
         self.model_state.clear_cudagraphs()

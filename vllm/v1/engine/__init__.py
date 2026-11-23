@@ -236,11 +236,9 @@ class EngineCoreRequest(
     # PrefixHashConfig, including any extra keys (LoRA, multimodal, cache salt).
     block_hashes: list[bytes] | None = None
 
-    # Set on every input of a persistent-state stream after its opener,
-    # including the close signal, so a late input cannot open a new stream.
+    # Set on every input of an admitted persistent-state stream, including
+    # the close signal, so a late input cannot open a new request.
     continuation: bool = False
-    # Admits a persistent-state stream before any input; carries no prompt.
-    stream_admission: bool = False
 
     @property
     def params(self) -> SamplingParams | PoolingParams:
@@ -329,8 +327,8 @@ class EngineCoreOutput(
     # for array_like compatibility.
     watermarking: bool | None = None
 
-    # The finish ends a persistent-state stream rather than a turn.
-    # Appended last for array_like compatibility.
+    # The finish ends a persistent-state stream rather than a turn; set by
+    # the engine core. Appended last for array_like compatibility.
     terminal: bool = False
 
     @property
@@ -397,6 +395,9 @@ class EngineCoreRequestType(enum.Enum):
     EXECUTOR_FAILED = b"\x04"
     # Sentinel to wake up input_queue.get() during shutdown.
     WAKEUP = b"\x05"
+    # Sentinel for a persistent-state stream input that preprocessing or
+    # validation rejected; the core loop ends the stream.
+    REJECTED_STREAM_INPUT = b"\x06"
 
 
 class ReconfigureDistributedRequest(msgspec.Struct):

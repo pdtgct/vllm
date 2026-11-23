@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
-from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
@@ -334,10 +333,8 @@ class SchedulerOutput:
     # drafter can skip proposing them.
     skip_drafts: bool = False
 
-    # Requests whose persistent-state page was allocated, and so initialized,
-    # in this step: the model state's only source of page freshness.
-    new_state_page_req_ids: AbstractSet[str] = frozenset()
-    # The pages to initialize this step, by KV cache group id; None if none.
+    # Persistent-state pages allocated, and so initialized, in this step, by
+    # KV cache group id; None if none.
     new_state_block_ids: dict[int, list[int]] | None = None
 
     @classmethod

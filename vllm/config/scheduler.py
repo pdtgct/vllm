@@ -3,7 +3,7 @@
 
 from collections.abc import Callable
 from dataclasses import InitVar
-from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal, Self, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self, cast
 
 from pydantic import Field, field_validator
 
@@ -40,11 +40,6 @@ class SchedulerConfig:
     DEFAULT_MAX_NUM_BATCHED_TOKENS: ClassVar[int] = 2048
     DEFAULT_MAX_NUM_BATCHED_TOKENS_FOR_BATCHED_DP: ClassVar[int] = 256
     DEFAULT_MAX_NUM_SEQS: ClassVar[int] = 128
-    DEFAULT_STREAM_ADMISSION_TIMEOUTS: ClassVar[dict[str, float]] = {
-        "never_fed_timeout": 15.0,
-        "parked_idle_timeout": 60.0,
-        "draining_timeout": 40.0,
-    }
 
     runner_type: RunnerType = "generate"
     """The runner type to launch for the model."""
@@ -293,22 +288,9 @@ class SchedulerConfig:
     by batching multiple tokens before sending."""
 
     max_pending_stream_inputs: int = Field(default=8, ge=1)
-    """Inputs a stream of a model with persistent state may hold unread, in
-    the scheduler and in the output processor, and undelivered turns its
-    output backlog may hold. An input or turn beyond the bound ends the
-    stream. A model without persistent state makes no use of this option."""
-
-    stream_admission_timeouts: dict[
-        str, Annotated[float, Field(gt=0, allow_inf_nan=False)]
-    ] = Field(
-        default_factory=lambda: dict(SchedulerConfig.DEFAULT_STREAM_ADMISSION_TIMEOUTS)
-    )
-    """Seconds a stream of a model with persistent state may stay admitted
-    without input (`never_fed_timeout`, 15.0), parked between inputs
-    (`parked_idle_timeout`, 60.0) or unfinished after its input closed
-    (`draining_timeout`, 40.0) before the engine ends it. An absent key keeps
-    its default. On the command line this is a JSON object, e.g.
-    `--stream-admission-timeouts '{"never_fed_timeout": 30}'`. A model
+    """Inputs of one stream of a model with persistent state that the frontend
+    reads ahead of the turns the consumer has received. At the bound it stops
+    reading the stream's input until a turn's output is delivered. A model
     without persistent state makes no use of this option."""
 
     @staticmethod
@@ -385,7 +367,6 @@ class SchedulerConfig:
             "async_scheduling",
             "stream_interval",
             "max_pending_stream_inputs",
-            "stream_admission_timeouts",
         }
         return get_compile_factors(self, ignored_factors)
 
@@ -394,19 +375,6 @@ class SchedulerConfig:
     def _skip_none_validation(cls, value: Any, handler: Callable) -> Any:
         """Skip validation if the value is `None` when initialisation is delayed."""
         return None if value is None else handler(value)
-
-    @field_validator("stream_admission_timeouts")
-    @classmethod
-    def _complete_stream_admission_timeouts(
-        cls, value: dict[str, float]
-    ) -> dict[str, float]:
-        defaults = cls.DEFAULT_STREAM_ADMISSION_TIMEOUTS
-        if unknown := value.keys() - defaults.keys():
-            raise ValueError(
-                f"Unknown stream admission timeouts {sorted(unknown)}; expected "
-                f"keys among {sorted(defaults)}"
-            )
-        return {**defaults, **value}
 
     def __post_init__(self, max_model_len: int, is_encoder_decoder: bool) -> None:
         if is_encoder_decoder:

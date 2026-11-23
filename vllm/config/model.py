@@ -2267,16 +2267,8 @@ class ModelConfig:
         return self._model_info.persistent_state_reads_positions
 
     @property
-    def persistent_state_parks_on_eos(self) -> bool:
-        return self._model_info.persistent_state_parks_on_eos
-
-    @property
     def persistent_state_accepts_synthetic_warmup(self) -> bool:
         return self._model_info.persistent_state_accepts_synthetic_warmup
-
-    @property
-    def persistent_state_ignores_stopped_row_echoes(self) -> bool:
-        return self._model_info.persistent_state_ignores_stopped_row_echoes
 
     @property
     def speculator_config_class(self) -> str | None:

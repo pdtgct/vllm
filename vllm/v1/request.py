@@ -85,11 +85,9 @@ class Request:
         kv_hints: KvHintsEnvelope | None = None,
         block_hashes: list["BlockHash"] | None = None,
         continuation: bool = False,
-        external_req_id: str | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
-        self.external_req_id = external_req_id
         self.priority = priority
         self.sampling_params = sampling_params
         self.pooling_params = pooling_params
@@ -256,7 +254,7 @@ class Request:
         self.resumable = resumable
         # None entry in the queue means finished.
         self.streaming_queue: deque[StreamingUpdate | None] | None = None
-        # An input of a persistent-state stream after the one that opened it.
+        # An input of an admitted persistent-state stream (PSTATE-TURN-005).
         self.continuation = continuation
         # Tokens compaction dropped; the worker adds it to each position.
         self.position_offset = 0
@@ -295,7 +293,6 @@ class Request:
             abort_immediately=request.abort_immediately,
             block_hashes=block_hashes,
             continuation=request.continuation,
-            external_req_id=request.external_req_id,
         )
 
     def append_output_token_ids(
