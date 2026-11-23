@@ -787,14 +787,16 @@ def retained_bytes(*roots, exclude=()) -> int:
 NUM_TURNS = 10_000
 """Turns each stream runs, as the design asks; a leak of one token a turn
 grows a structure by tens of kilobytes over them."""
-MEASURE_EVERY = 8
-"""Turns between two walks of the retained structures."""
-WARMUP_SAMPLES = 4
+MEASURE_EVERY = 1
+"""Turns between two walks of the retained structures: every turn, so a
+structure that holds more for a few turns is seen."""
+WARMUP_SAMPLES = 32
 """Walks skipped before the reference window, while queues and the detokenizer
 tail first fill."""
-WINDOW = 16
-"""Walks in the reference window: 128 turns, several full cycles of the input
-and output lengths (24 turns)."""
+WINDOW = 24
+"""Walks in the reference window: one full cycle of the input and output
+lengths, straight after the queues fill, so a structure that grows for a while
+and then levels off exceeds it."""
 SLACK = 1024
 """Bytes a structure may exceed its reference-window size by: the allocated
 capacity of a container holding the same content varies by up to one deque

@@ -1005,7 +1005,7 @@ class _ModelInfo:
     has_persistent_state: bool
     persistent_state_reads_positions: bool
     persistent_state_accepts_synthetic_warmup: bool
-    # Sorted, so the JSON cache round-trips it.
+    # A tuple, so the JSON cache round-trips it; sorted, so it is deterministic.
     persistent_state_resumable_stops: tuple[str, ...]
     has_noops: bool
     supports_replayssm: bool
@@ -1019,6 +1019,7 @@ class _ModelInfo:
     # Whether a draft model may reuse the target's input embedding under PP.
     may_use_target_embed: bool
 
+    # @spec PSTATE-DECL-004
     @staticmethod
     def from_model_cls(model: type[nn.Module]) -> "_ModelInfo":
         return _ModelInfo(
@@ -1074,7 +1075,6 @@ class _ModelInfo:
 
 
 def _resumable_stops(model: type[nn.Module]) -> tuple[str, ...]:
-    # @spec PSTATE-DECL-004
     stops = frozenset(getattr(model, "persistent_state_resumable_stops", {"eos"}))
     if unknown := stops - {"eos", "max_tokens"}:
         raise ValueError(

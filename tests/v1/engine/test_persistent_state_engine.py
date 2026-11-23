@@ -68,6 +68,7 @@ from vllm.v1.engine.core import (
     EngineCoreProc,
     EngineShutdownState,
 )
+from vllm.v1.engine.core_client import InprocClient
 from vllm.v1.engine.exceptions import EngineDeadError, StreamAdmissionError
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, MambaSpec
 from vllm.v1.outputs import ModelRunnerOutput
@@ -2063,7 +2064,9 @@ def test_pause_outranks_capacity_for_an_opener(monkeypatch):
 def test_admit_stream_returns_the_first_refusal_in_order(
     monkeypatch, held, structured, reason
 ):
-    core, _ = _live_core(monkeypatch, max_num_seqs=2)
+    # Full either way: the held stream takes one of two rows, or nothing is
+    # held and the single row is taken.
+    core, _ = _live_core(monkeypatch, max_num_seqs=2 if held else 1)
     if held:
         _hold_kind(core, "parked")
     _paused_and_full(core)
@@ -2072,3 +2075,81 @@ def test_admit_stream_returns_the_first_refusal_in_order(
         admission.sampling_params = STRUCTURED
 
     assert core.admit_stream(admission) == reason
+
+
+def _reject(core: EngineCoreProc, request: EngineCoreRequest) -> None:
+    """Reject `request` in preprocessing and let the core loop handle it."""
+    _reject_in_validation(core, request)
+    _drain_inputs(core)
+
+
+# @spec PSTATE-ADMIT-022 PSTATE-TURN-006
+def test_rejected_continuation_naming_a_held_single_request_is_dropped(
+    monkeypatch,
+):
+    core, _ = _live_core(monkeypatch)
+    single = _stream_request("s", resumable=False)
+    core.scheduler.add_request(single)
+
+    _reject(core, _core_request("s", [1], resumable=True, continuation=True))
+
+    assert core.scheduler.requests["s"] is single
+    assert core.output_queue.published == []
+
+
+# @spec PSTATE-ADMIT-022 PSTATE-ADMIT-021
+def test_rejected_opener_for_a_held_id_ends_the_held_request(monkeypatch):
+    core, free_pages = _live_core(monkeypatch)
+    held = _hold_kind(core, "parked")
+
+    _reject(core, _core_request("s", [1], resumable=True, client_index=1))
+
+    assert held.status == RequestStatus.FINISHED_ERROR
+    _assert_ended_after_free(core, free_pages, FinishReason.ERROR)
+
+
+# @spec PSTATE-ADMIT-022 PSTATE-ADMIT-018
+def test_rejected_opener_of_a_new_stream_gets_a_terminal_error(monkeypatch):
+    core, _ = _live_core(monkeypatch)
+
+    _reject(core, _core_request("s", [1], resumable=True, client_index=1))
+
+    assert not core.scheduler.has_request("s")
+    _, output, _, _ = _only_output(core)
+    assert (output.finish_reason, output.terminal) == (FinishReason.ERROR, True)
+    assert output.error is not None and output.error.code == "validation_error"
+
+
+# @spec PSTATE-DECL-013 PSTATE-ADMIT-022
+def test_ordinary_model_streams_open_without_admission_at_capacity(monkeypatch):
+    core, _ = _live_core(monkeypatch, ordinary=True, max_num_seqs=1)
+
+    _add(core, _stream_request("a", 3))
+    _add(core, _stream_request("b", 3))
+
+    assert core.scheduler.has_request("a") and core.scheduler.has_request("b")
+    assert core.output_queue.published == []
+
+
+# @spec PSTATE-ADMIT-023
+@pytest.mark.parametrize("state", [True, False], ids=["state", "ordinary"])
+def test_in_process_client_refuses_state_streams_only(state):
+    client = object.__new__(InprocClient)
+    preprocessed: list[str] = []
+    client.engine_core = SimpleNamespace(
+        scheduler=SimpleNamespace(has_unrecomputable_state=state),
+        preprocess_add_request=lambda request: (
+            preprocessed.append(request.request_id) or (request, 0)
+        ),
+        add_request=lambda request, wave: None,
+    )
+
+    stream = _core_request("s", [1], resumable=True)
+    if state:
+        with pytest.raises(ValueError, match="not supported for this model"):
+            client.add_request(stream)
+        client.add_request(_core_request("single", [1]))
+        assert preprocessed == ["single"]
+    else:
+        client.add_request(stream)
+        assert preprocessed == ["s"]

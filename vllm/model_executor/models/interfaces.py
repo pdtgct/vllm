@@ -1042,7 +1042,8 @@ class SupportsPersistentState(Protocol):
     persistent_state_resumable_stops: ClassVar[frozenset[str]] = frozenset({"eos"})
     """The stops at which a state stream parks or takes its next input instead
     of ending: `"eos"`, a stop-free EOS, and `"max_tokens"`, the per-turn
-    `max_tokens` stop below `max_model_len`."""
+    `max_tokens` stop below the position limit (`max_model_len`, counting
+    the positions compaction dropped)."""
 
 
 @overload

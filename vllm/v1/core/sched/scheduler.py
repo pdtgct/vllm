@@ -3060,7 +3060,6 @@ class Scheduler(SchedulerInterface):
         """Whether a state stream's stop ends only its turn: a stop-free EOS or
         a per-turn `max_tokens` stop below the position limit, each only if
         the model declares it. Every other stop ends the stream."""
-        # @spec PSTATE-TURN-001 PSTATE-TURN-002 PSTATE-TURN-012
         if request.status == RequestStatus.FINISHED_STOPPED:
             return request.stop_reason is None and "eos" in self.state_resumable_stops
         return (
@@ -3070,6 +3069,7 @@ class Scheduler(SchedulerInterface):
             and request.num_tokens + request.position_offset < self.max_model_len
         )
 
+    # @spec PSTATE-TURN-001 PSTATE-TURN-002 PSTATE-TURN-012
     def _handle_stopped_request(self, request: Request) -> bool:
         """Return True if finished (can be False for resumable requests)."""
         if not request.resumable:

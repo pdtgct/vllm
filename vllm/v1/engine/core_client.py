@@ -435,7 +435,15 @@ class InprocClient(EngineCoreClient):
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.engine_core.get_supported_tasks()
 
+    # @spec PSTATE-ADMIT-023
     def add_request(self, request: EngineCoreRequest) -> None:
+        if request.resumable and self.engine_core.scheduler.has_unrecomputable_state:
+            # The guards and terminal outputs of persistent-state streams live
+            # in the engine-core process.
+            raise ValueError(
+                "Streaming input is not supported for this model without the "
+                "engine-core process; set VLLM_ENABLE_V1_MULTIPROCESSING=1"
+            )
         req, request_wave = self.engine_core.preprocess_add_request(request)
         self.engine_core.add_request(req, request_wave)
 

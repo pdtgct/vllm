@@ -2091,10 +2091,7 @@ class EngineCoreProc(EngineCore):
             )
             self._invoke_utility_method(method_name, get_result, output, enqueue_output)
         elif request_type == EngineCoreRequestType.REJECTED_STREAM_INPUT:
-            rejected, error = request
-            self._end_held_stream(
-                rejected.request_id, RequestStatus.FINISHED_ERROR, error
-            )
+            self._reject_preprocessed_input(*request)
         elif request_type == EngineCoreRequestType.EXECUTOR_FAILED:
             raise RuntimeError("Executor failed.")
         else:
@@ -2110,11 +2107,9 @@ class EngineCoreProc(EngineCore):
             "[shutdown] EngineCore: rejecting new request request_id=%s",
             request.request_id,
         )
-        # @spec PSTATE-ADMIT-022
+        # @spec PSTATE-ADMIT-022: other continuations were dropped already.
         state = self.scheduler.has_unrecomputable_state
-        if request.continuation or (
-            state and self.scheduler.has_request(request.request_id)
-        ):
+        if state and self.scheduler.has_request(request.request_id):
             self._end_held_stream(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
             self._send_finish_outputs_to_client(
@@ -2129,27 +2124,29 @@ class EngineCoreProc(EngineCore):
         """Drop an input of a persistent-state stream core no longer holds,
         or whose id names a held single request."""
         # @spec PSTATE-TURN-006
-        return request.continuation and not self.scheduler.holds_stream(
-            request.request_id
+        scheduler = self.scheduler
+        return (
+            request.continuation
+            and scheduler.has_unrecomputable_state
+            and not scheduler.holds_stream(request.request_id)
         )
 
+    # @spec PSTATE-ADMIT-022 PSTATE-ADMIT-021 PSTATE-TURN-019 PSTATE-ADMIT-018
     def _guard_state_stream_add(self, request: Request) -> bool:
         """Handle an ADD of a state model that would break a held request or
         that the scheduler cannot apply, and an opener that skipped
         `admit_stream`; return whether the ADD is handled."""
-        # @spec PSTATE-ADMIT-022
         scheduler = self.scheduler
         if not scheduler.has_unrecomputable_state:
             return False
         req_id = request.request_id
         if not request.continuation and scheduler.has_request(req_id):
-            # @spec PSTATE-ADMIT-021: the opener would merge into the held one.
+            # The opener would merge into the held one.
             self._end_held_stream(req_id, RequestStatus.FINISHED_ERROR)
             return True
         if not request.resumable:
             return False
         if (problem := _unappliable_state_input(request)) is not None:
-            # @spec PSTATE-TURN-019
             error = RequestError(code="validation_error", message=problem)
             if request.continuation:
                 self._end_held_stream(req_id, RequestStatus.FINISHED_ERROR, error)
@@ -2161,7 +2158,6 @@ class EngineCoreProc(EngineCore):
         if request.continuation:
             return False
         if (reason := scheduler.open_stream(request)) is not None:
-            # @spec PSTATE-ADMIT-018
             error = RequestError(
                 code=reason,
                 message=f"The stream was not admitted: {reason}.",
@@ -2184,15 +2180,36 @@ class EngineCoreProc(EngineCore):
         for stream in self.scheduler.finish_requests(request_id, status):
             self._send_terminal_output(stream, error)
 
+    # @spec PSTATE-TURN-003
     def abort_requests(self, request_ids: list[str]) -> list[Request]:
         aborted = super().abort_requests(request_ids)
         if self.scheduler.has_unrecomputable_state:
-            for request in aborted:
-                if request.resumable:
-                    # @spec PSTATE-TURN-003: published after the free; an id
-                    # no longer held finishes nothing and publishes nothing.
-                    self._send_terminal_output(request)
+            # Published after the free; an id no longer held finishes nothing
+            # and publishes nothing.
+            self._send_abort_outputs([r for r in aborted if r.resumable])
         return aborted
+
+    # @spec PSTATE-ADMIT-022 PSTATE-PAGE-004
+    def _reject_preprocessed_input(
+        self, request: EngineCoreRequest, error: RequestError | None
+    ) -> None:
+        """Give an input that preprocessing rejected the outcome its ADD would
+        get from the ordered guards."""
+        req_id = request.request_id
+        scheduler = self.scheduler
+        if self._drop_unknown_continuation(request) or self._reject_add_in_shutdown(
+            request
+        ):
+            return
+        if request.continuation:
+            self._end_held_stream(req_id, RequestStatus.FINISHED_ERROR, error)
+            return
+        if scheduler.has_request(req_id):
+            self._end_held_stream(req_id, RequestStatus.FINISHED_ERROR)
+            return
+        self._send_finish_outputs_to_client(
+            [req_id], request.client_index, FinishReason.ERROR, error, True
+        )
 
     def _send_terminal_output(
         self, stream: Request, error: RequestError | None = None
@@ -2633,11 +2650,14 @@ class EngineCoreProc(EngineCore):
         """Hand a rejected input of a persistent-state stream to the core
         loop, which ends the stream it holds after freeing it."""
         # @spec PSTATE-PAGE-004
-        if request.continuation:
+        route = request.continuation or (
+            request.resumable and self.scheduler.has_unrecomputable_state
+        )
+        if route:
             self.input_queue.put_nowait(
                 (EngineCoreRequestType.REJECTED_STREAM_INPUT, (request, error))
             )
-        return request.continuation
+        return route
 
     def pause_scheduler(
         self,
