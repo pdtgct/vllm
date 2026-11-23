@@ -128,6 +128,10 @@ class InputStreamError(Exception):
 class AsyncLLM(EngineClient):
     """An asynchronous wrapper for the vLLM engine."""
 
+    # Whether the model keeps per-request state its tokens cannot rebuild
+    # (`SupportsPersistentState`); __init__ sets it from the model config.
+    persistent_state: bool = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -178,6 +182,7 @@ class AsyncLLM(EngineClient):
         self.vllm_config = vllm_config
         self._elastic_ep_lock = asyncio.Lock()
         self.model_config = vllm_config.model_config
+        self.persistent_state = self.model_config.has_persistent_state
         self.scheduler_config = vllm_config.scheduler_config
         self.observability_config = vllm_config.observability_config
 
@@ -218,7 +223,7 @@ class AsyncLLM(EngineClient):
             stream_interval=self.vllm_config.scheduler_config.stream_interval,
             tracing_enabled=tracing_endpoint is not None,
             admission_stats=self.admission_stats,
-            persistent_state=self.model_config.has_persistent_state,
+            persistent_state=self.persistent_state,
             max_pending_stream_inputs=(
                 self.vllm_config.scheduler_config.max_pending_stream_inputs
             ),
@@ -244,7 +249,7 @@ class AsyncLLM(EngineClient):
         # the engine core's retirements release.
         self._state_stream_numbers = itertools.count(1)
         self._state_stream_ids: dict[str, str] = {}
-        if self.model_config.has_persistent_state:
+        if self.persistent_state:
             self.engine_core.stream_retired_callback = partial(
                 _unbind_retired_streams, self._state_stream_ids
             )
@@ -527,7 +532,7 @@ class AsyncLLM(EngineClient):
             raise VLLMValidationError(
                 "stream_admission requires an async generator of StreamingInput"
             )
-        if not is_pooling and self.model_config.has_persistent_state:
+        if self.persistent_state and not is_pooling:
             # A single turn; its output kind is free.
             self._validate_state_sampling_params(params, stream=False)
 
@@ -656,11 +661,13 @@ class AsyncLLM(EngineClient):
 
         # Register locally before the first await so concurrent tasks see this request.
         self.output_processor.add_request(request, prompt, parent_req, index, queue)
-        if request.resumable and not self.output_processor.has_request(
-            request.request_id
+        if (
+            self.persistent_state
+            and request.resumable
+            and not self.output_processor.has_request(request.request_id)
         ):
-            # The output processor ended a persistent-state stream on an input
-            # beyond its pending bound; the engine must drop the stream too.
+            # The output processor ended the stream on an input beyond its
+            # pending bound; the engine must drop the stream too.
             await self.engine_core.abort_requests_async([request.request_id])
             return
 
@@ -705,7 +712,7 @@ class AsyncLLM(EngineClient):
         stream_admission: bool = False,
     ) -> RequestOutputCollector:
         self._validate_resumable_request()
-        state_stream = self.model_config.has_persistent_state
+        state_stream = self.persistent_state
         if stream_admission and not state_stream:
             # @spec PSTATE-ADMIT-011 PSTATE-ADMIT-006
             raise VLLMValidationError(

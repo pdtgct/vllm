@@ -519,8 +519,9 @@ def test_update_past_position_limit_finishes_state_stream_length_capped(
     monkeypatch,
 ):
     scheduler = make_scheduler(monkeypatch)
+    free_before = free_blocks(scheduler)
     request = park_after_two_turns(scheduler)
-    free_before = free_blocks(scheduler) + 1
+    assert free_blocks(scheduler) < free_before
 
     scheduler.add_request(update("s", 40))
 

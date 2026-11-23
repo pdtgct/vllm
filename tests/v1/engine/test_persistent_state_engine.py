@@ -315,6 +315,7 @@ def _state_llm(monkeypatch: pytest.MonkeyPatch, mm_features=None) -> AsyncLLM:
         max_num_queued_reqs=None, max_num_queued_tokens=None
     )
     llm.model_config = MagicMock(is_diffusion=False, has_persistent_state=True)
+    llm.persistent_state = True
     llm._state_stream_numbers = itertools.count(1)
     llm._state_stream_ids = {}
     llm.engine_core = MagicMock(client_index=3)

@@ -26,7 +26,6 @@ from vllm.engine.protocol import StreamingInput
 from vllm.inputs import TokensPrompt
 from vllm.plugins import load_general_plugins
 from vllm.sampling_params import RequestOutputKind
-from vllm.utils.vmm_driver import vmm_unavailable_reason
 from vllm.v1.engine.async_llm import AsyncLLM
 
 INPUTS = [[10, 20, 30], [40, 50], [60]]
@@ -79,8 +78,9 @@ def _register_no_warmup_arch() -> None:
 def _in_process_llm(arch: str = STUB_ARCH, **kwargs) -> Iterator[LLM]:
     """An engine in this process, so a test can read the stub's `EVENTS`.
 
-    The block-count override stays under an extensible KV cache: the sizing
-    steps still run, and the override bounds the measured block count.
+    Without an extensible KV cache, which refuses the block-count override
+    the stub's 16-byte page needs; the sizing warmup is covered by the worker
+    tests.
     """
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     _register_no_warmup_arch()
@@ -89,11 +89,6 @@ def _in_process_llm(arch: str = STUB_ARCH, **kwargs) -> Iterator[LLM]:
     engine_kwargs = _engine_kwargs(arch, stub_initial_total=INITIAL_TOTAL)
     with _llm(**engine_kwargs, **kwargs) as llm:
         yield llm
-
-
-def _requires_extensible_kv_cache() -> None:
-    if (reason := vmm_unavailable_reason()) is not None:
-        pytest.skip(f"VMM unavailable: {reason}")
 
 
 # @spec PSTATE-DECL-004
@@ -136,7 +131,7 @@ def _stub_layer_spec(**hf_config):
 @pytest.mark.parametrize("initial_total", [0, INITIAL_TOTAL])
 def test_stub_state_declares_one_initial_value_per_component(initial_total):
     spec = _stub_layer_spec(stub_initial_total=initial_total)
-    assert spec.initial_values == (initial_total, 0)
+    assert spec.initial_values == (initial_total, stub.TURN_LEN - 1)
     assert len(spec.initial_values) == len(spec.shapes)
 
 
@@ -278,11 +273,10 @@ def test_model_reported_failure_ends_only_its_request():
     assert outputs[1].outputs[0].finish_reason == "error"
 
 
-# @spec PSTATE-PREP-001 PSTATE-PREP-002 PSTATE-PREP-003
+# @spec PSTATE-PREP-001 PSTATE-PREP-003
 @create_new_process_for_each_test("spawn")
 def test_startup_runs_no_request_through_a_model_that_declines_warmup():
-    _requires_extensible_kv_cache()
-    with _in_process_llm(NO_WARMUP_ARCH, enable_extensible_kv_cache=True):
+    with _in_process_llm(NO_WARMUP_ARCH):
         assert [event for event in stub.EVENTS if event[0] == "add"] == []
 
 
@@ -291,16 +285,14 @@ def test_startup_runs_no_request_through_a_model_that_declines_warmup():
 def test_startup_warms_up_a_model_that_accepts_it():
     """The control of the test above: the same startup does run warmup
     requests through a model that accepts them."""
-    _requires_extensible_kv_cache()
-    with _in_process_llm(enable_extensible_kv_cache=True):
+    with _in_process_llm():
         assert [event for event in stub.EVENTS if event[0] == "add"] != []
 
 
 # @spec PSTATE-PREP-005
 @create_new_process_for_each_test("spawn")
 def test_warmup_requests_read_initialized_pages():
-    _requires_extensible_kv_cache()
-    with _in_process_llm(enable_extensible_kv_cache=True):
+    with _in_process_llm():
         assert stub.PREFILL_STARTS
         assert set(stub.PREFILL_STARTS) == {INITIAL_TOTAL}
 

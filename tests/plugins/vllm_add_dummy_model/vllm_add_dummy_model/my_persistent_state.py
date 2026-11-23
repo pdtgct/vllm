@@ -4,10 +4,13 @@
 
 `StubStateLayer` keeps two components in a `MambaSpec` page allocated by
 `MambaManager`: the sum of the values a request has fed it (starting from
-`stub_initial_total`) and the number of decode steps in the current turn. A
-turn ends with EOS after `TURN_LEN - 1` sampled tokens. A page that is not
-initialized on allocation, a state lost between streaming inputs, or a state
-write for an input the request never commits changes the output.
+`stub_initial_total`) and the number of decode steps in the current turn,
+which starts at `TURN_LEN - 1`, no turn in progress. A turn ends with EOS
+after `TURN_LEN - 1` sampled tokens. Core schedules a single-token input as a
+decode; on a row with no turn in progress, that token starts the next turn. A
+page that is not initialized on allocation, a state lost between streaming
+inputs, or a state write for an input the request never commits changes the
+output.
 
 The model reads these `hf_overrides` entries:
 
@@ -122,7 +125,7 @@ class StubStateLayer(MambaBase, nn.Module):
             dtypes=self.get_state_dtype(),
             block_size=vllm_config.model_config.max_model_len,
             mamba_type=self.mamba_type,
-            initial_values=(self.initial_total, 0),
+            initial_values=(self.initial_total, TURN_LEN - 1),
             tp_replicated=True,
         )
         return MambaManager.layer_config(spec, recomputable=False)
@@ -150,8 +153,10 @@ class StubStateLayer(MambaBase, nn.Module):
         if num_decodes := metadata.num_decodes:
             assert metadata.state_indices_tensor_d is not None
             slots = metadata.state_indices_tensor_d[:num_decodes, 0]
+            # A single-token input to a row whose turn ended starts a turn.
+            new_turn = counts[slots] >= TURN_LEN - 1
+            counts[slots] = torch.where(new_turn, 0, counts[slots] + 1)
             totals[slots] += input_ids[:num_decodes]
-            counts[slots] += 1
             token = emit(totals[slots] + offsets[:num_decodes], self.vocab_size)
             out[:num_decodes, 0] = torch.where(
                 counts[slots] >= TURN_LEN - 1, EOS_TOKEN_ID, token

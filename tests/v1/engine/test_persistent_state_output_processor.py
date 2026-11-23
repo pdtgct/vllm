@@ -179,8 +179,9 @@ _TURN_TEXT = (
 
 
 def _turn_texts(tokenizer, persistent_state: bool) -> tuple[list[str], list[int]]:
-    """Stream six turns, each queued before the previous one ends, and return
-    each turn's text and the tokens the detokenizer retains after it."""
+    """Stream six turns, each input sent once the previous turn ends, and
+    return each turn's text and the tokens the detokenizer retains at the
+    turn's end, before the next input starts the next turn."""
     processor = _processor(tokenizer, persistent_state=persistent_state)
     queue = StreamingInputOutputCollector(RequestOutputKind.DELTA, "s")
     prompts = [
@@ -193,9 +194,6 @@ def _turn_texts(tokenizer, persistent_state: bool) -> tuple[list[str], list[int]
     processor.add_request(_input("s", prompts[0], detokenize=True), None, queue=queue)
     texts, retained = [], []
     for i, turn in enumerate(turns):
-        if i + 1 < len(turns):
-            next_prompt = prompts[(i + 1) % len(prompts)]
-            processor.add_request(_input("s", next_prompt, detokenize=True), None)
         processor.process_outputs(
             [EngineCoreOutput("s", turn, finish_reason=FinishReason.STOP)]
         )
@@ -203,6 +201,9 @@ def _turn_texts(tokenizer, persistent_state: bool) -> tuple[list[str], list[int]
         assert output is not None
         texts.append(output.outputs[0].text)
         retained.append(len(processor.request_states["s"].detokenizer.token_ids))
+        if i + 1 < len(turns):
+            next_prompt = prompts[(i + 1) % len(prompts)]
+            processor.add_request(_input("s", next_prompt, detokenize=True), None)
     return texts, retained
 
 

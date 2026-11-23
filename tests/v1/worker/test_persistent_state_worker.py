@@ -243,6 +243,7 @@ def test_extensible_kv_cache_growth_keeps_state_pages_and_graphs_valid():
     spec = _state_spec()
     layer = MambaManager.layer_config(spec, recomputable=False)
     vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+    vllm_config.cache_config.kv_cache_layout = KVCacheLayout.BLNHC.name
     config = get_kv_cache_config_from_groups(
         vllm_config,
         [new_kv_cache_group(["state"], layer)],
@@ -343,6 +344,7 @@ def test_runner_attaches_failed_ids_after_the_state_postprocesses(monkeypatch):
             return {"failed"}
 
     runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.eplb = SimpleNamespace(step=lambda **kwargs: None)
     runner.is_last_pp_rank = True
     runner.pcp_manager = None
     runner.pp_handler = None
@@ -563,7 +565,7 @@ def test_model_state_prepares_its_workspace_inside_the_profiling_scope(monkeypat
             speculative_config=None,
         ),
         randomize_dummy_inputs=False,
-        cache_config=SimpleNamespace(kv_cache_memory_bytes=1),
+        cache_config=SimpleNamespace(kv_cache_memory_bytes=None),
         model_runner=SimpleNamespace(
             profile_run=profile_run,
             prepare_execution_memory=lambda: events.append("prepare"),

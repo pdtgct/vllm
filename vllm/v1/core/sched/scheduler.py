@@ -98,6 +98,15 @@ logger = init_logger(__name__)
 
 
 class Scheduler(SchedulerInterface):
+    # The persistent-state facts of the served model (PSTATE-DECL-001,
+    # PSTATE-DECL-004); __init__ sets them from the KV cache groups and the
+    # model config. The defaults describe an ordinary model.
+    has_unrecomputable_state: bool = False
+    compacts_state_history: bool = False
+    state_reads_positions: bool = False
+    state_parks_on_eos: bool = False
+    state_barrier: bool = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -971,6 +980,11 @@ class Scheduler(SchedulerInterface):
                         self.connector is not None
                         and self.connector.has_pending_block_frees()
                     ):
+                        break
+
+                    if self.has_unrecomputable_state:
+                        # @spec PSTATE-PRES-001: no state request is a
+                        # preemption victim; this one waits for a later step.
                         break
 
                     # The request cannot be scheduled.
@@ -2567,13 +2581,13 @@ class Scheduler(SchedulerInterface):
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         # Updates dropped on arrival precede outputs of any later update.
         self._emit_dropped_streaming_updates(outputs)
-        if self.stream_finish_outputs:
-            self._emit_stream_finish_outputs(outputs)
         spec_decoding_stats: SpecDecodingStats | None = None
 
         # @spec PSTATE-FAIL-002
         failed_req_ids: set[str] | None = None
         if self.has_unrecomputable_state:
+            if self.stream_finish_outputs:
+                self._emit_stream_finish_outputs(outputs)
             failed_req_ids = model_runner_output.failed_req_ids
 
         failed_kv_load_req_ids: set[str] = set()
@@ -3780,7 +3794,7 @@ class Scheduler(SchedulerInterface):
             self.has_unfinished_requests()
             or self.has_finished_requests()
             or bool(self.dropped_streaming_updates)
-            or bool(self.stream_finish_outputs)
+            or (self.has_unrecomputable_state and bool(self.stream_finish_outputs))
             or (self.connector is not None and self.connector.has_pending_push_work())
             or (
                 self.ec_connector is not None
