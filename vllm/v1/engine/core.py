@@ -128,6 +128,20 @@ HANDSHAKE_TIMEOUT_MINS = 5
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 
+def _unappliable_state_input(request: Request) -> str | None:
+    """Why the scheduler cannot fold `request`, a non-close input of a state
+    stream, or None: it has no tokens to schedule, embeddings the fold drops,
+    or a grammar the fold path never waits for."""
+    if request.prompt_embeds is not None:
+        return "prompt_embeds is not supported for this model"
+    if not request.prompt_token_ids:
+        return "An input of this stream carries no prompt tokens"
+    params = request.sampling_params
+    if params is not None and params.structured_outputs is not None:
+        return "structured_outputs is not supported for this model"
+    return None
+
+
 class EngineCore:
     """Inner loop of vLLM's Engine."""
 
@@ -611,21 +625,40 @@ class EngineCore:
             # to free any pre-admission KV-transfer resources.
             self.abort_requests([request.request_id])
 
-    def abort_requests(self, request_ids: list[str]):
+    def abort_requests(self, request_ids: list[str]) -> list[Request]:
         """Abort requests from the scheduler."""
         # TODO: The scheduler doesn't really need to know the
         # specific finish reason, TBD whether we propagate that
         # (i.e. client-aborted vs stop criteria met).
-        self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
+        return self.scheduler.finish_requests(
+            request_ids, RequestStatus.FINISHED_ABORTED
+        )
 
     def admit_stream(self, request: EngineCoreRequest) -> str | None:
         """Admit a persistent-state stream before any input, or return the
         refusal reason."""
+        # @spec PSTATE-ADMIT-021 PSTATE-TURN-019 PSTATE-ADMIT-022
+        if self.scheduler.has_request(request.request_id):
+            self._end_held_stream(request.request_id, RequestStatus.FINISHED_ERROR)
+            return "duplicate_request_id"
+        params = request.sampling_params
+        if params is not None and params.structured_outputs is not None:
+            return "validation_error"
         if request.prompt_token_ids is None:
             # A utility call carries no packed prompt; the first input brings one.
             request.prompt_token_ids = []
         req, _ = self.preprocess_add_request(request)
         return self.scheduler.admit_stream(req)
+
+    def _end_held_stream(
+        self,
+        request_id: str,
+        status: RequestStatus,
+        error: RequestError | None = None,
+    ) -> None:
+        """End a held persistent-state request; a process engine core also
+        publishes its terminal output."""
+        self.scheduler.finish_requests(request_id, status)
 
     def _held_state(self, streams_only: bool) -> str:
         """The ids of the held persistent-state streams, or of every held
@@ -2030,6 +2063,7 @@ class EngineCoreProc(EngineCore):
             if (
                 self._drop_unknown_continuation(req)
                 or self._reject_add_in_shutdown(req)
+                or self._guard_state_stream_add(req)
                 or self._reject_add_while_paused(req)
             ):
                 return
@@ -2076,21 +2110,67 @@ class EngineCoreProc(EngineCore):
             "[shutdown] EngineCore: rejecting new request request_id=%s",
             request.request_id,
         )
-        if request.continuation:
+        # @spec PSTATE-ADMIT-022
+        state = self.scheduler.has_unrecomputable_state
+        if request.continuation or (
+            state and self.scheduler.has_request(request.request_id)
+        ):
             self._end_held_stream(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
-            self._send_abort_outputs_to_client(
-                [request.request_id], request.client_index
+            self._send_finish_outputs_to_client(
+                [request.request_id],
+                request.client_index,
+                FinishReason.ABORT,
+                terminal=state and request.resumable,
             )
         return True
 
     def _drop_unknown_continuation(self, request: Request) -> bool:
-        """Drop an input of a persistent-state stream core no longer holds;
-        the stream's end has already reached its client."""
+        """Drop an input of a persistent-state stream core no longer holds,
+        or whose id names a held single request."""
         # @spec PSTATE-TURN-006
-        return request.continuation and not self.scheduler.has_request(
+        return request.continuation and not self.scheduler.holds_stream(
             request.request_id
         )
+
+    def _guard_state_stream_add(self, request: Request) -> bool:
+        """Handle an ADD of a state model that would break a held request or
+        that the scheduler cannot apply, and an opener that skipped
+        `admit_stream`; return whether the ADD is handled."""
+        # @spec PSTATE-ADMIT-022
+        scheduler = self.scheduler
+        if not scheduler.has_unrecomputable_state:
+            return False
+        req_id = request.request_id
+        if not request.continuation and scheduler.has_request(req_id):
+            # @spec PSTATE-ADMIT-021: the opener would merge into the held one.
+            self._end_held_stream(req_id, RequestStatus.FINISHED_ERROR)
+            return True
+        if not request.resumable:
+            return False
+        if (problem := _unappliable_state_input(request)) is not None:
+            # @spec PSTATE-TURN-019
+            error = RequestError(code="validation_error", message=problem)
+            if request.continuation:
+                self._end_held_stream(req_id, RequestStatus.FINISHED_ERROR, error)
+            else:
+                self._send_finish_outputs_to_client(
+                    [req_id], request.client_index, FinishReason.ERROR, error, True
+                )
+            return True
+        if request.continuation:
+            return False
+        if (reason := scheduler.open_stream(request)) is not None:
+            # @spec PSTATE-ADMIT-018
+            error = RequestError(
+                code=reason,
+                message=f"The stream was not admitted: {reason}.",
+                retryable=True,
+            )
+            self._send_finish_outputs_to_client(
+                [req_id], request.client_index, FinishReason.ERROR, error, True
+            )
+        return True
 
     def _end_held_stream(
         self,
@@ -2103,6 +2183,16 @@ class EngineCoreProc(EngineCore):
         # @spec PSTATE-PAGE-004
         for stream in self.scheduler.finish_requests(request_id, status):
             self._send_terminal_output(stream, error)
+
+    def abort_requests(self, request_ids: list[str]) -> list[Request]:
+        aborted = super().abort_requests(request_ids)
+        if self.scheduler.has_unrecomputable_state:
+            for request in aborted:
+                if request.resumable:
+                    # @spec PSTATE-TURN-003: published after the free; an id
+                    # no longer held finishes nothing and publishes nothing.
+                    self._send_terminal_output(request)
+        return aborted
 
     def _send_terminal_output(
         self, stream: Request, error: RequestError | None = None

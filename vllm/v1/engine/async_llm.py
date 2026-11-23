@@ -792,8 +792,8 @@ class AsyncLLM(EngineClient):
             finally:
                 queue._input_stream_task = None
                 if state_stream and (cancelled or errored):
-                    # @spec PSTATE-ADMIT-015: ending the collector without
-                    # the core, whose abort publishes nothing.
+                    # @spec PSTATE-ADMIT-015: the output processor drops the
+                    # stream here, so it ignores the core's terminal output.
                     if self.output_processor.abort_requests(
                         [internal_req_id], internal=True
                     ):
@@ -820,7 +820,7 @@ class AsyncLLM(EngineClient):
         """Have the engine core admit a persistent-state stream before any of
         its input is read; the admission carries the stream's parameters and
         no prompt."""
-        # @spec PSTATE-ADMIT-001 PSTATE-ADMIT-017
+        # @spec PSTATE-ADMIT-020 PSTATE-ADMIT-017
         request_id = request.request_id
         admission = msgspec.structs.replace(
             request, prompt_token_ids=[], resumable=True

@@ -2271,6 +2271,10 @@ class ModelConfig:
         return self._model_info.persistent_state_accepts_synthetic_warmup
 
     @property
+    def persistent_state_resumable_stops(self) -> frozenset[str]:
+        return frozenset(self._model_info.persistent_state_resumable_stops)
+
+    @property
     def speculator_config_class(self) -> str | None:
         """For a speculative decoding draft model, the config class of the
         speculator it's for, if it declares one (see `SpeculativeDraftModel`)."""

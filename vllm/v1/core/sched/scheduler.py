@@ -176,6 +176,9 @@ class Scheduler(SchedulerInterface):
             self.state_reads_positions = (
                 vllm_config.model_config.persistent_state_reads_positions
             )
+            self.state_resumable_stops = (
+                vllm_config.model_config.persistent_state_resumable_stops
+            )
         self.max_num_scheduled_tokens = (
             self.scheduler_config.max_num_scheduled_tokens
             if self.scheduler_config.max_num_scheduled_tokens is not None
@@ -3053,14 +3056,18 @@ class Scheduler(SchedulerInterface):
             < limit
         )
 
-    @staticmethod
-    def _is_resumable_stop(request: Request) -> bool:
-        """Whether a state stream's stop ends only its turn: a stop-free EOS.
-        Every other stop ends the stream."""
-        # @spec PSTATE-TURN-001 PSTATE-TURN-002
+    def _is_resumable_stop(self, request: Request) -> bool:
+        """Whether a state stream's stop ends only its turn: a stop-free EOS or
+        a per-turn `max_tokens` stop below the position limit, each only if
+        the model declares it. Every other stop ends the stream."""
+        # @spec PSTATE-TURN-001 PSTATE-TURN-002 PSTATE-TURN-012
+        if request.status == RequestStatus.FINISHED_STOPPED:
+            return request.stop_reason is None and "eos" in self.state_resumable_stops
         return (
-            request.status == RequestStatus.FINISHED_STOPPED
-            and request.stop_reason is None
+            request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+            and "max_tokens" in self.state_resumable_stops
+            # check_stop ends at the position limit with the same status.
+            and request.num_tokens + request.position_offset < self.max_model_len
         )
 
     def _handle_stopped_request(self, request: Request) -> bool:
@@ -3350,6 +3357,24 @@ class Scheduler(SchedulerInterface):
         )
         if num_active >= self.max_num_active_reqs:
             return "active_limit"
+        return None
+
+    def holds_stream(self, request_id: str) -> bool:
+        """Whether `request_id` names a held state stream, not a single request."""
+        request = self.requests.get(request_id)
+        return request is not None and request.resumable
+
+    def open_stream(self, request: Request) -> str | None:
+        """Admit `request`, a state stream opened by an input instead of
+        `admit_stream`, with that input as its first, or return the refusal
+        reason having changed nothing."""
+        # @spec PSTATE-ADMIT-018
+        if (reason := self._stream_admission_refusal()) is not None:
+            return reason
+        self.add_request(request)
+        # The reservation starts now, as it would on a first input after
+        # admit_stream, so a second opener sees it.
+        self.resumed_streaming_sessions.add(request)
         return None
 
     def held_state_requests(self) -> Iterable[str]:

@@ -741,7 +741,7 @@ class OutputProcessor:
     ) -> None:
         """Queue a streaming update instead of immediately applying it."""
         if not request.resumable and req_state.state_stream:
-            # @spec PSTATE-TURN-003: the engine core's terminal output ends the
+            # @spec PSTATE-TURN-016: the engine core's terminal output ends the
             # stream, after any input it still runs.
             return
         if not request.resumable:

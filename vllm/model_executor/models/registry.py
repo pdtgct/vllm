@@ -1005,6 +1005,8 @@ class _ModelInfo:
     has_persistent_state: bool
     persistent_state_reads_positions: bool
     persistent_state_accepts_synthetic_warmup: bool
+    # Sorted, so the JSON cache round-trips it.
+    persistent_state_resumable_stops: tuple[str, ...]
     has_noops: bool
     supports_replayssm: bool
     supports_transcription: bool
@@ -1048,6 +1050,7 @@ class _ModelInfo:
             persistent_state_accepts_synthetic_warmup=getattr(
                 model, "persistent_state_accepts_synthetic_warmup", True
             ),
+            persistent_state_resumable_stops=_resumable_stops(model),
             supports_replayssm=supports_replayssm(model),
             supports_transcription=supports_transcription(model),
             supports_transcription_only=(
@@ -1068,6 +1071,17 @@ class _ModelInfo:
             ),
             may_use_target_embed=hasattr(model, "has_own_embed_tokens"),
         )
+
+
+def _resumable_stops(model: type[nn.Module]) -> tuple[str, ...]:
+    # @spec PSTATE-DECL-004
+    stops = frozenset(getattr(model, "persistent_state_resumable_stops", {"eos"}))
+    if unknown := stops - {"eos", "max_tokens"}:
+        raise ValueError(
+            f"{model.__name__}.persistent_state_resumable_stops may name only "
+            f"'eos' and 'max_tokens', not {sorted(unknown)}"
+        )
+    return tuple(sorted(stops))
 
 
 class _BaseRegisteredModel(ABC):

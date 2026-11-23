@@ -1039,6 +1039,11 @@ class SupportsPersistentState(Protocol):
     persistent_state_accepts_synthetic_warmup: ClassVar[bool] = True
     """Startup may run warmup and sizing requests through the model state."""
 
+    persistent_state_resumable_stops: ClassVar[frozenset[str]] = frozenset({"eos"})
+    """The stops at which a state stream parks or takes its next input instead
+    of ending: `"eos"`, a stop-free EOS, and `"max_tokens"`, the per-turn
+    `max_tokens` stop below `max_model_len`."""
+
 
 @overload
 def supports_persistent_state(
