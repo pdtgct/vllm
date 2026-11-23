@@ -12,9 +12,9 @@ outputs each test feeds.
 
 import asyncio
 import queue
+import re
 from collections import deque
 from collections.abc import Mapping
-from functools import partial
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -32,6 +32,7 @@ from tests.v1.core.utils import (
 )
 from vllm import ModelRegistry
 from vllm.config import (
+    CUDAGraphMode,
     ECTransferConfig,
     LoggingConfig,
     ParallelConfig,
@@ -231,6 +232,7 @@ def test_state_model_accepts_async_scheduling_and_cuda_graphs():
         compilation_config={"cudagraph_mode": "FULL_DECODE_ONLY"},
     ).create_engine_config()
     assert config.scheduler_config.async_scheduling is True
+    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
 
 
 def _state_group(spec: MambaSpec | None = None):
@@ -270,7 +272,7 @@ def test_state_group_refuses_initial_values_of_the_wrong_length():
         _verify_groups(_state_group(_state_spec(initial_values=(0, 1))))
 
 
-# @spec PSTATE-PAGE-001
+# @spec PSTATE-DECL-005
 def test_state_group_refuses_prefix_caching():
     """The prefix-caching allocator does not record the pages to initialize."""
     with pytest.raises(ValueError, match="enable_prefix_caching is not supported"):
@@ -431,19 +433,33 @@ def _chunks(*prompts, reads: list | None = None, then: Exception | None = None):
     return chunks()
 
 
-async def _settle() -> None:
-    """Let every ready task run until none can make progress."""
+WATCHDOG = 30.0
+"""Seconds before a wait counts as a hang; no test relies on it for timing."""
+
+
+async def _until(predicate, what: str) -> None:
+    """Wait until `predicate()` holds."""
+
+    async def poll():
+        while not predicate():
+            await asyncio.sleep(0.001)
+
+    try:
+        await asyncio.wait_for(poll(), WATCHDOG)
+    except TimeoutError:
+        pytest.fail(f"timed out waiting for {what}")
+
+
+async def _let_ready_tasks_run() -> None:
+    """Before a check that something did not happen: give every ready task the
+    chance to do it."""
     for _ in range(50):
         await asyncio.sleep(0)
 
 
 async def _open(llm: AsyncLLM, chunks, params: SamplingParams | None = None):
-    """Open a state stream and return its output collector."""
-    collector = await llm._add_streaming_input_request(
-        "ext", chunks, params or _params()
-    )
-    await _settle()
-    return collector
+    """Open a stream and return its output collector."""
+    return await llm._add_streaming_input_request("ext", chunks, params or _params())
 
 
 def _sent(llm: AsyncLLM) -> list[EngineCoreRequest]:
@@ -489,25 +505,23 @@ def _emit(
     )
 
 
-async def _ended(collector) -> bool:
-    """Whether the collector's next output ends its stream, by a finished
-    output or an error, within a second."""
+async def _ended(collector, errors: tuple[type[BaseException], ...] = ()) -> bool:
+    """Whether the collector's next output ends its stream: a finished output,
+    or one of the `errors` it was failed with."""
     try:
-        output = await asyncio.wait_for(collector.get(), 1)
-    except TimeoutError:
-        return False
-    except Exception:
+        output = await asyncio.wait_for(collector.get(), WATCHDOG)
+    except errors:
         return True
     return output.finished
 
 
 async def _consume(llm: AsyncLLM, chunks, params: SamplingParams | None = None):
-    """Run `generate` over `chunks` to its end, within two seconds."""
+    """Run `generate` over `chunks` to its end."""
 
     async def consume():
         return [out async for out in llm.generate(chunks, params or _params(), "ext")]
 
-    return await asyncio.wait_for(consume(), 2)
+    return await asyncio.wait_for(consume(), WATCHDOG)
 
 
 # @spec PSTATE-ADMIT-001
@@ -526,6 +540,7 @@ async def test_state_stream_is_admitted_before_its_inputs_are_read(monkeypatch):
         yield StreamingInput(prompt=TokensPrompt(prompt_token_ids=[1]))
 
     collector = await _open(llm, chunks())
+    await _until(lambda: len(_sent(llm)) == 2, "the input and the close")
 
     assert events == ["admit", "read"]
     assert _stream_id(llm) == collector.request_id
@@ -561,27 +576,46 @@ async def test_single_requests_and_ordinary_streams_open_without_admission(
         await llm.add_request("single", TokensPrompt(prompt_token_ids=[1]), _params())
     else:
         await _open(llm, _chunks([1]))
+        await _until(lambda: _sent(llm), "the input")
 
     llm.engine_core.admit_stream_async.assert_not_awaited()
     assert _sent_prompts(llm)[0] == [1]
 
 
+def _id_fields(request_id: str) -> list[str]:
+    """The fields an internal id adds to the external id `ext`."""
+    assert request_id.startswith("ext")
+    return re.findall(r"[0-9A-Za-z]+", request_id.removeprefix("ext"))
+
+
 # @spec PSTATE-ADMIT-006
 @pytest.mark.asyncio
-async def test_state_stream_ids_never_repeat_across_streams_or_frontends(
+async def test_state_stream_ids_share_a_nonce_per_frontend_and_count_up(
     monkeypatch,
 ):
-    """Two frontends on one client index, as after a frontend restart, and
-    several streams of one external id each get their own internal id."""
-    ids = []
-    for num_streams in (2, 1):
-        llm = _state_llm(monkeypatch)
-        for _ in range(num_streams):
-            collector = await _open(llm, _chunks([1]))
-            ids.append(collector.request_id)
+    """Streams of one `AsyncLLM` differ only in a counter that increases; a
+    second `AsyncLLM` on the same client index, as after a frontend restart,
+    draws another nonce, so its first id differs from the first one's."""
+    first = _state_llm(monkeypatch)
+    ids = [(await _open(first, _chunks([1]))).request_id for _ in range(3)]
+    second = _state_llm(monkeypatch)
+    restarted = (await _open(second, _chunks([1]))).request_id
 
-    assert len(set(ids)) == len(ids)
-    assert all("ext" in request_id for request_id in ids)
+    fields = [_id_fields(request_id) for request_id in ids]
+    assert len({len(f) for f in fields}) == 1
+    [counter] = [i for i in range(len(fields[0])) if len({f[i] for f in fields}) > 1]
+    assert [int(f[counter]) for f in fields] == sorted(
+        {int(f[counter]) for f in fields}
+    )
+    assert "3" in fields[0]
+    restarted_fields = _id_fields(restarted)
+    assert len(restarted_fields) == len(fields[0])
+    assert restarted != ids[0]
+    assert any(
+        restarted_fields[i] != fields[0][i]
+        for i in range(len(restarted_fields))
+        if i != counter
+    )
 
 
 # @spec PSTATE-ADMIT-006
@@ -589,8 +623,8 @@ async def test_state_stream_ids_never_repeat_across_streams_or_frontends(
 async def test_state_stream_inputs_and_close_carry_the_stream_id(monkeypatch):
     llm = _state_llm(monkeypatch)
     collector = await _open(llm, _chunks([1], [2]))
+    await _until(lambda: len(_sent(llm)) == 3, "two inputs and the close")
 
-    assert len(_sent(llm)) == 3
     assert {request.request_id for request in _sent(llm)} == {collector.request_id}
 
 
@@ -599,6 +633,7 @@ async def test_state_stream_inputs_and_close_carry_the_stream_id(monkeypatch):
 async def test_every_input_after_admission_carries_continuation(monkeypatch):
     llm = _state_llm(monkeypatch)
     await _open(llm, _chunks([1], [2], [3]))
+    await _until(lambda: len(_sent(llm)) == 4, "three inputs and the close")
 
     assert [(r.resumable, r.continuation) for r in _sent(llm)] == [
         (True, True),
@@ -621,10 +656,15 @@ async def test_inputs_after_the_stream_ended_are_not_forwarded(monkeypatch):
         yield StreamingInput(prompt=TokensPrompt(prompt_token_ids=[3]))
 
     collector = await _open(llm, chunks())
-    _emit(llm, _stream_id(llm), [5], FinishReason.STOP, terminal=True)
-    await _settle()
+    input_task = collector._input_stream_task
+    await _until(lambda: _sent(llm), "the first input")
+    stream_id = _stream_id(llm)
+    _emit(llm, stream_id, [5], FinishReason.STOP, terminal=True)
+    await _until(
+        lambda: not llm.output_processor.has_request(stream_id), "the stream's end"
+    )
     ended.set()
-    await _settle()
+    await _until(input_task.done, "the input task to end")
 
     assert _sent_prompts(llm) == [[1]]
     assert await _ended(collector)
@@ -690,6 +730,7 @@ async def test_input_with_any_content_is_forwarded(monkeypatch, prompt):
     llm = _state_llm(monkeypatch)
 
     await _open(llm, _chunks([1], prompt))
+    await _until(lambda: len(_sent(llm)) == 3, "two inputs and the close")
 
     assert [r.resumable for r in _sent(llm)] == [True, True, False]
 
@@ -708,14 +749,25 @@ REFUSED_SAMPLING_PARAMETERS = [
 ]
 """Parameters whose effect outlives a turn, each alone."""
 
-REFUSED_STREAM_PARAMETERS = [
-    *REFUSED_SAMPLING_PARAMETERS,
+UPSTREAM_STREAMING_REFUSALS = [
     ("n", dict(n=2)),
     ("stop", dict(stop=["."])),
     ("output_kind", dict(output_kind=RequestOutputKind.FINAL_ONLY)),
+]
+"""What upstream input streaming refuses for every model."""
+
+REFUSED_STREAM_PARAMETERS = [
+    *REFUSED_SAMPLING_PARAMETERS,
+    *UPSTREAM_STREAMING_REFUSALS,
     ("output_kind", dict(output_kind=RequestOutputKind.CUMULATIVE)),
 ]
 """Every parameter a state stream's input cannot carry."""
+
+LOADED_PROCESSORS = [
+    dict(logits_processors=["pkg.module:Processor"]),
+    dict(installed_processors=True),
+]
+"""Custom logits processors from the model config, and from an entry point."""
 
 
 # @spec PSTATE-DECL-007
@@ -759,9 +811,7 @@ async def test_input_carrying_a_refused_parameter_ends_the_stream(
 # @spec PSTATE-DECL-007
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "loaded",
-    [dict(logits_processors=["pkg.module:Processor"]), dict(installed_processors=True)],
-    ids=["model_config", "entry_point"],
+    "loaded", LOADED_PROCESSORS, ids=["model_config", "entry_point"]
 )
 async def test_state_stream_refused_while_custom_logits_processors_are_loaded(
     monkeypatch, loaded
@@ -781,11 +831,9 @@ async def test_state_stream_refused_while_custom_logits_processors_are_loaded(
 @pytest.mark.parametrize(
     ("loaded", "params"),
     [
-        (dict(logits_processors=["pkg.module:Processor"]), {}),
-        (dict(installed_processors=True), {}),
+        *[(loaded, {}) for loaded in LOADED_PROCESSORS],
         *[({}, params) for _, params in REFUSED_SAMPLING_PARAMETERS],
-        ({}, dict(n=2)),
-        ({}, dict(stop=["."])),
+        *[({}, params) for _, params in UPSTREAM_STREAMING_REFUSALS],
         *[({}, dict(output_kind=kind)) for kind in RequestOutputKind],
     ],
 )
@@ -802,6 +850,58 @@ async def test_single_state_request_keeps_upstream_validation(
     assert len(_sent(llm)) == params.get("n", 1)
 
 
+# @spec PSTATE-DECL-013 PSTATE-DECL-007 PSTATE-TURN-007
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("loaded", "params", "middle"),
+    [
+        *[({}, params, [2]) for _, params in REFUSED_SAMPLING_PARAMETERS],
+        ({}, dict(output_kind=RequestOutputKind.CUMULATIVE), [2]),
+        *[(loaded, {}, [2]) for loaded in LOADED_PROCESSORS],
+        ({}, {}, TokensPrompt(prompt_token_ids=[])),
+    ],
+)
+async def test_ordinary_stream_takes_what_state_streams_refuse(
+    monkeypatch, loaded, params, middle
+):
+    """Every state-stream refusal is inactive for an ordinary model, the
+    empty-input refusal included."""
+    llm = _state_llm(monkeypatch, persistent_state=False, **loaded)
+
+    await _open(llm, _chunks([1], middle, [3]), _params(**params))
+    await _until(lambda: len(_sent(llm)) == 4, "three inputs and the close")
+
+    assert [r.resumable for r in _sent(llm)] == [True, True, True, False]
+
+
+# @spec PSTATE-DECL-013 PSTATE-HIST-006
+@pytest.mark.asyncio
+async def test_ordinary_stream_reads_inputs_without_credits(monkeypatch):
+    llm = _state_llm(monkeypatch, persistent_state=False, max_pending=1)
+    reads: list = []
+
+    await _open(llm, _chunks(*([i] for i in range(1, 7)), reads=reads))
+    await _until(lambda: len(_sent(llm)) == 7, "six inputs and the close")
+
+    assert len(reads) == 6
+
+
+# @spec PSTATE-DECL-013
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("parameter", "params"), UPSTREAM_STREAMING_REFUSALS)
+async def test_ordinary_stream_keeps_upstream_streaming_refusals(
+    monkeypatch, parameter, params
+):
+    llm = _state_llm(monkeypatch, persistent_state=False)
+
+    with pytest.raises(
+        VLLMValidationError, match="Input streaming not currently supported"
+    ):
+        await _consume(llm, _chunks([1]), _params(**params))
+
+    assert not _sent(llm)
+
+
 # @spec PSTATE-HIST-006
 @pytest.mark.asyncio
 async def test_input_iterator_is_not_advanced_while_no_credit_is_free(monkeypatch):
@@ -809,6 +909,8 @@ async def test_input_iterator_is_not_advanced_while_no_credit_is_free(monkeypatc
     reads: list = []
 
     await _open(llm, _chunks(*([i] for i in range(1, 7)), reads=reads))
+    await _until(lambda: len(_sent(llm)) >= 2, "two inputs")
+    await _let_ready_tasks_run()
 
     assert len(reads) == 2
     assert _sent_prompts(llm) == [[1], [2]]
@@ -821,14 +923,16 @@ async def test_credit_returns_once_the_consumer_receives_the_turn_end(monkeypatc
     llm = _state_llm(monkeypatch, max_pending=2)
     reads: list = []
     collector = await _open(llm, _chunks([1], [2], [3], [4], reads=reads))
-    assert len(reads) == 2
+    await _until(lambda: len(_sent(llm)) >= 2, "two inputs")
 
     _emit(llm, _stream_id(llm), [], FinishReason.STOP)
-    await _settle()
+    await _until(collector.ready.is_set, "the turn end to reach the collector")
+    await _let_ready_tasks_run()
     assert len(reads) == 2
 
     boundary = collector.get_nowait()
-    await _settle()
+    await _until(lambda: len(_sent(llm)) >= 3, "the third input")
+    await _let_ready_tasks_run()
 
     assert boundary is not None and not boundary.finished
     assert boundary.outputs[0].finish_reason == "stop"
@@ -842,15 +946,16 @@ async def test_stream_closes_and_ends_with_its_only_credit_held(monkeypatch):
     """The close and the terminal output take no credit."""
     llm = _state_llm(monkeypatch, max_pending=1)
     consumer = asyncio.ensure_future(_consume(llm, _chunks([1])))
-    await _settle()
+    await _until(lambda: _sent(llm), "the input")
+    await _let_ready_tasks_run()
     assert [r.resumable for r in _sent(llm)] == [True]
 
     _emit(llm, _stream_id(llm), [5], FinishReason.STOP)
-    await _settle()
+    await _until(lambda: len(_sent(llm)) == 2, "the close")
     assert [r.resumable for r in _sent(llm)] == [True, False]
 
     _emit(llm, _stream_id(llm), [], FinishReason.STOP, terminal=True)
-    outputs = await consumer
+    outputs = await asyncio.wait_for(consumer, WATCHDOG)
 
     assert [output.finished for output in outputs] == [False, True]
 
@@ -863,16 +968,17 @@ async def test_cancelled_input_task_waiting_for_a_credit_aborts_the_stream(
     llm = _state_llm(monkeypatch, max_pending=1)
     reads: list = []
     collector = await _open(llm, _chunks([1], [2], [3], [4], reads=reads))
+    await _until(lambda: _sent(llm), "the first input")
+    await _let_ready_tasks_run()
     assert len(reads) == 1
     input_task = collector._input_stream_task
 
     input_task.cancel()
-    await _settle()
+    await _until(input_task.done, "the cancelled input task to end")
+    await _until(lambda: _stream_id(llm) in _aborted(llm), "the abort")
 
-    assert input_task.done()
     assert len(reads) == 1
-    assert _stream_id(llm) in _aborted(llm)
-    assert await _ended(collector)
+    assert await _ended(collector, (async_llm_module.InputStreamError,))
 
 
 # @spec PSTATE-ADMIT-015
@@ -883,9 +989,10 @@ async def test_input_task_error_aborts_the_stream_and_fails_its_collector(
     llm = _state_llm(monkeypatch)
 
     collector = await _open(llm, _chunks([1], then=RuntimeError("source failed")))
+    await _until(lambda: _sent(llm), "the input")
+    await _until(lambda: _stream_id(llm) in _aborted(llm), "the abort")
 
-    assert _stream_id(llm) in _aborted(llm)
-    assert await _ended(collector)
+    assert await _ended(collector, (async_llm_module.InputStreamError, RuntimeError))
 
 
 # @spec PSTATE-ADMIT-016
@@ -895,11 +1002,10 @@ async def test_engine_core_death_fails_every_open_state_stream(monkeypatch):
     collectors = [await _open(llm, _chunks([1], [2])) for _ in range(2)]
 
     llm.engine_core.feed.put_nowait(EngineDeadError())
-    await _settle()
 
     for collector in collectors:
         with pytest.raises(EngineDeadError):
-            await asyncio.wait_for(collector.get(), 1)
+            await asyncio.wait_for(collector.get(), WATCHDOG)
 
 
 # @spec PSTATE-ADMIT-017
@@ -910,11 +1016,11 @@ async def test_cancelled_admission_aborts_the_stream(monkeypatch):
 
     async def admit(request, *args, **kwargs):
         admitting.set()
-        await asyncio.sleep(10)
+        await asyncio.Event().wait()
 
     llm.engine_core.admit_stream_async.side_effect = admit
     consumer = asyncio.ensure_future(_consume(llm, _chunks([1])))
-    await asyncio.wait_for(admitting.wait(), 1)
+    await asyncio.wait_for(admitting.wait(), WATCHDOG)
 
     consumer.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -933,21 +1039,24 @@ async def test_output_generator_ending_early_aborts_the_stream(monkeypatch, endi
     llm = _state_llm(monkeypatch)
     outputs = llm.generate(_chunks([1], [2]), _params(), "ext")
     first = asyncio.ensure_future(outputs.__anext__())
-    await _settle()
+    await _until(lambda: _sent(llm), "the first input")
     stream_id = _stream_id(llm)
     _emit(llm, stream_id, [5], FinishReason.STOP)
-    assert not (await asyncio.wait_for(first, 1)).finished
+    assert not (await asyncio.wait_for(first, WATCHDOG)).finished
 
     if ending == "cancel":
         second = asyncio.ensure_future(outputs.__anext__())
-        await _settle()
+        await _let_ready_tasks_run()
         second.cancel()
         with pytest.raises(asyncio.CancelledError):
             await second
     else:
         if ending == "close_after_terminal":
             _emit(llm, stream_id, [], FinishReason.STOP, terminal=True)
-            await _settle()
+            await _until(
+                lambda: not llm.output_processor.has_request(stream_id),
+                "the terminal output",
+            )
         await outputs.aclose()
 
     assert stream_id in _aborted(llm)
@@ -1019,15 +1128,9 @@ def test_admission_refuses_while_paused(monkeypatch, pause_state):
 # Engine core
 
 
-def _state_core(held: list[str] | None = None) -> EngineCoreProc:
-    """A bare engine core over a mocked scheduler that holds `held` streams.
-
-    The scheduler mock keeps its pause state and refuses admissions while
-    paused, as the scheduler does; `core.events` records the cache, sleep and
-    release operations with the streams held when each ran.
-    """
-    held = [] if held is None else held
-    events: list[tuple] = []
+def _bare_core(scheduler) -> EngineCoreProc:
+    """A bare engine core over `scheduler` whose executor is a mock and which
+    publishes into a `_PublishLog`."""
     core = object.__new__(EngineCoreProc)
     core._checkpoint_state = CheckpointState.RUNNING
     core._checkpoint_error = None
@@ -1040,37 +1143,6 @@ def _state_core(held: list[str] | None = None) -> EngineCoreProc:
     core.model_executor = MagicMock()
     core.model_executor.is_sleeping = False
     core.model_executor.vllm_config.cache_config.enable_extensible_kv_cache = False
-    core.model_executor.sleep.side_effect = lambda level: events.append(
-        ("sleep", tuple(held))
-    )
-    core.model_executor.discard.side_effect = lambda tags: events.append(
-        ("discard", tuple(held))
-    )
-    scheduler = MagicMock()
-    scheduler.has_unrecomputable_state = True
-    scheduler.has_requests.return_value = False
-    scheduler.has_request.return_value = False
-    scheduler.held_state_streams.side_effect = lambda: list(held)
-    scheduler.pause_state = PauseState.UNPAUSED
-
-    def set_pause_state(state):
-        scheduler.pause_state = state
-
-    def reset_prefix_cache(*args, **kwargs):
-        events.append(("reset", tuple(held)))
-        return True
-
-    def finish_requests(*args):
-        events.append(("finish", tuple(held)))
-        held.clear()
-        return []
-
-    scheduler.set_pause_state.side_effect = set_pause_state
-    scheduler.reset_prefix_cache.side_effect = reset_prefix_cache
-    scheduler.finish_requests.side_effect = finish_requests
-    scheduler.admit_stream.side_effect = lambda request: (
-        None if scheduler.pause_state == PauseState.UNPAUSED else "engine_paused"
-    )
     core.scheduler = scheduler
     core.batch_queue = None
     core.engines_running = False
@@ -1078,11 +1150,11 @@ def _state_core(held: list[str] | None = None) -> EngineCoreProc:
     core.reject_new_requests = False
     core.shutdown_state = EngineShutdownState.RUNNING
     core._idle_state_callbacks = []
-    core.output_queue = queue.Queue()
-    core._send_finish_outputs_to_client = MagicMock()
-    core._send_abort_outputs_to_client = MagicMock()
-    core.held = held
-    core.events = events
+    core.output_queue = _PublishLog(core)
+    core.input_queue = queue.Queue()
+    core.aborts_queue = queue.Queue()
+    core._deferred_inputs = deque()
+    core.process_input_queue_block = False
     return core
 
 
@@ -1129,24 +1201,17 @@ class _PublishLog(queue.Queue):
         super().put_nowait(item)
 
 
-def _live_core(monkeypatch: pytest.MonkeyPatch, ordinary: bool = False):
-    """A bare engine core over a real scheduler that publishes into a
-    `_PublishLog`, and the scheduler's free page count before any request."""
-    core = _state_core()
-    core.scheduler = (
-        create_scheduler(max_model_len=64, block_size=64)
+def _live_core(
+    monkeypatch: pytest.MonkeyPatch, ordinary: bool = False, **scheduler_kwargs
+):
+    """A bare engine core over a real scheduler, a state model's unless
+    `ordinary`, and the scheduler's free page count before any request."""
+    scheduler = (
+        create_scheduler(max_model_len=64, block_size=64, **scheduler_kwargs)
         if ordinary
-        else _state_scheduler(monkeypatch)
+        else _state_scheduler(monkeypatch, **scheduler_kwargs)
     )
-    for name in ("_send_finish_outputs_to_client", "_send_abort_outputs_to_client"):
-        setattr(core, name, partial(getattr(EngineCoreProc, name), core))
-    core.output_queue = _PublishLog(core)
-    core.input_queue = queue.Queue()
-    core.aborts_queue = queue.Queue()
-    core._deferred_inputs = deque()
-    core.process_input_queue_block = False
-    core.has_work = lambda: True
-    return core, _free_pages(core.scheduler)
+    return _bare_core(scheduler), _free_pages(scheduler)
 
 
 def _add(core: EngineCoreProc, request) -> None:
@@ -1216,7 +1281,10 @@ def test_close_of_a_parked_stream_publishes_its_end_after_freeing_it(monkeypatch
 
 
 def _drain_inputs(core: EngineCoreProc) -> None:
+    """Handle every queued input, as the busy loop does before a step."""
+    core.has_work = lambda: True
     core._process_input_queue()
+    del core.has_work
 
 
 def _reject_in_validation(core: EngineCoreProc, request: EngineCoreRequest) -> None:
@@ -1307,14 +1375,11 @@ def test_ordinary_stream_closed_while_parked_publishes_nothing(monkeypatch):
 
 
 # @spec PSTATE-PAGE-004
-def test_no_add_or_utility_overtakes_an_earlier_message_of_its_client():
+def test_no_add_or_utility_overtakes_an_earlier_message_of_its_client(monkeypatch):
     """A utility deferred while a step runs still precedes every later add."""
-    core = _state_core()
+    core, _ = _live_core(monkeypatch)
     handled: list[str] = []
     core._handle_client_request = lambda kind, request: handled.append(request)
-    core._deferred_inputs = deque()
-    core.input_queue = queue.Queue()
-    core.aborts_queue = queue.Queue()
     for message in (
         (EngineCoreRequestType.UTILITY, "admit"),
         (EngineCoreRequestType.ADD, "input"),
@@ -1330,9 +1395,7 @@ def test_no_add_or_utility_overtakes_an_earlier_message_of_its_client():
     )
 
     core._wait_for_output(step_output)
-    core.process_input_queue_block = False
-    core.has_work = lambda: True
-    core._process_input_queue()
+    _drain_inputs(core)
 
     assert [h for h in handled if h != "abort"] == ["admit", "input", "next"]
 
@@ -1341,45 +1404,63 @@ def _admission() -> EngineCoreRequest:
     return _core_request("s", [], resumable=True, client_index=1)
 
 
-# @spec PSTATE-ADMIT-001
-@pytest.mark.parametrize("reason", ["active_limit", "engine_paused"])
-def test_admit_stream_returns_the_refusal_reason(reason):
-    core = _state_core()
-    core.scheduler.admit_stream.side_effect = None
-    core.scheduler.admit_stream.return_value = reason
-
-    assert core.admit_stream(_admission()) == reason
-
-    [call] = core.scheduler.admit_stream.call_args_list
-    assert call.args[0].request_id == "s"
-    core._send_finish_outputs_to_client.assert_not_called()
+def _hold_single_request(core: EngineCoreProc) -> None:
+    request = _stream_request("held-1", resumable=False)
+    core.scheduler.add_request(request)
+    core.scheduler.schedule()
 
 
-# @spec PSTATE-ADMIT-001
-def test_admit_stream_returns_none_when_admitted():
-    core = _state_core()
-
-    assert core.admit_stream(_admission()) is None
-
-    core.scheduler.admit_stream.assert_called_once()
-    core._send_finish_outputs_to_client.assert_not_called()
+def _admit_full(core: EngineCoreProc) -> None:
+    assert core.scheduler.admit_stream(_stream_request("held-1", 0)) is None
 
 
-# @spec PSTATE-ADMIT-001
-def test_draining_clearing_pause_refuses_admissions():
-    core = _state_core()
-    core.engines_running = True
+def _admit_paused(core: EngineCoreProc) -> None:
+    core.pause_scheduler(mode="keep", clear_cache=False)
+
+
+def _admit_draining_pause(core: EngineCoreProc) -> None:
+    _hold_single_request(core)
     future = core.pause_scheduler(mode="wait", clear_cache=True)
     assert future is not None and not future.done()
 
-    assert core.admit_stream(_admission()) == "engine_paused"
+
+def _admit_draining_sleep(core: EngineCoreProc) -> None:
+    _hold_single_request(core)
+    future = core.sleep(level=1, mode="wait")
+    assert future is not None and not future.done()
+
+
+# @spec PSTATE-ADMIT-001
+@pytest.mark.parametrize(
+    ("prepare", "reason"),
+    [
+        (None, None),
+        (_admit_full, "active_limit"),
+        (_admit_paused, "engine_paused"),
+        (_admit_draining_pause, "engine_paused"),
+        (_admit_draining_sleep, "engine_paused"),
+    ],
+    ids=["admitted", "active_limit", "paused", "draining_pause", "draining_sleep"],
+)
+def test_admit_stream_admits_or_returns_the_refusal_reason(
+    monkeypatch, prepare, reason
+):
+    """A refusal creates no request and publishes nothing; a wait-mode pause or
+    sleep that clears the cache refuses while it drains a single request."""
+    core, _ = _live_core(monkeypatch, max_num_seqs=1)
+    if prepare is not None:
+        prepare(core)
+
+    assert core.admit_stream(_admission()) == reason
+
+    assert core.scheduler.has_request("s") is (reason is None)
+    assert core.output_queue.published == []
 
 
 def _holding_core(monkeypatch: pytest.MonkeyPatch, kind: str) -> EngineCoreProc:
     """A bare engine core whose real scheduler holds `held-1`: a running or a
     parked state stream, or a running single request."""
-    core = _state_core()
-    core.scheduler = _state_scheduler(monkeypatch)
+    core, _ = _live_core(monkeypatch)
     request = _stream_request("held-1", resumable=kind != "single_request")
     core.scheduler.add_request(request)
     if kind == "parked_stream":
@@ -1459,38 +1540,61 @@ def test_checkpoint_prepare_names_the_held_streams_and_changes_nothing(
     assert core.scheduler.pause_state == PauseState.UNPAUSED
 
 
-def _pause_abort(core):
-    core.pause_scheduler(mode="abort", clear_cache=True)
-    return "reset"
+# @spec PSTATE-PRES-006 PSTATE-PAGE-004
+@pytest.mark.parametrize("operation", ["pause", "sleep", "checkpoint_prepare"])
+def test_abort_mode_frees_every_request_before_the_operation(monkeypatch, operation):
+    """Parked and running streams and a single request are all finished, their
+    pages back in the pool, when the cache reset, sleep or KV cache discard
+    begins."""
+    core, free_pages = _live_core(monkeypatch)
+    scheduler = core.scheduler
+    _park(scheduler, "parked")
+    for request_id, resumable in (("running", True), ("single", False)):
+        scheduler.add_request(_stream_request(request_id, resumable=resumable))
+    scheduler.schedule()
+    began: list[tuple[str, set[str], int]] = []
 
+    def record(name: str) -> None:
+        began.append((name, set(scheduler.requests), _free_pages(scheduler)))
 
-def _sleep_abort(core):
-    core.sleep(level=1, mode="abort")
-    return "sleep"
+    reset_prefix_cache = scheduler.reset_prefix_cache
 
+    def recording_reset(*args, **kwargs):
+        record("reset")
+        return reset_prefix_cache(*args, **kwargs)
 
-def _checkpoint_abort(core):
-    assert core.checkpoint_prepare("abort") is None
-    assert core._checkpoint_state == CheckpointState.PREPARED
-    return "discard"
+    monkeypatch.setattr(scheduler, "reset_prefix_cache", recording_reset)
+    core.model_executor.sleep.side_effect = lambda level: record("sleep")
+    core.model_executor.discard.side_effect = lambda tags: record("discard")
 
+    if operation == "pause":
+        core.pause_scheduler(mode="abort", clear_cache=True)
+    elif operation == "sleep":
+        core.sleep(level=1, mode="abort")
+    else:
+        assert core.checkpoint_prepare("abort") is None
+        assert core._checkpoint_state == CheckpointState.PREPARED
 
-# @spec PSTATE-PRES-006
-@pytest.mark.parametrize("call", [_pause_abort, _sleep_abort, _checkpoint_abort])
-def test_abort_mode_finishes_every_stream_then_performs_the_operation(call):
-    core = _state_core(["stream-1"])
-
-    operation = call(core)
-
-    assert core.events[0] == ("finish", ("stream-1",))
-    assert (operation, ()) in core.events
-    assert all(held == () for _, held in core.events[1:])
+    expected = {"pause": "reset", "sleep": "sleep", "checkpoint_prepare": "discard"}
+    assert expected[operation] in [name for name, _, _ in began]
+    assert all(held == set() and free == free_pages for _, held, free in began)
+    ended = {
+        output.request_id: output for _, output, _, _ in core.output_queue.published
+    }
+    assert set(ended) == {"parked", "running", "single"}
+    assert all(o.finish_reason == FinishReason.ABORT for o in ended.values())
 
 
 # @spec PSTATE-PRES-007
+@pytest.mark.parametrize("kind", HELD_STREAMS)
 @pytest.mark.parametrize("mode", ["wait", "keep"])
-def test_sleep_level_zero_is_allowed_while_a_stream_is_held(mode):
-    core = _state_core(["stream-1"])
+def test_sleep_level_zero_is_allowed_while_a_stream_is_held(monkeypatch, kind, mode):
+    core = _holding_core(monkeypatch, kind)
+    free_pages = _free_pages(core.scheduler)
+
     core.sleep(level=0, mode=mode)
-    core.scheduler.set_pause_state.assert_called_once()
+
+    assert core.scheduler.pause_state != PauseState.UNPAUSED
+    assert core.scheduler.has_request("held-1")
+    assert _free_pages(core.scheduler) == free_pages
     core.model_executor.sleep.assert_not_called()

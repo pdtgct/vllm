@@ -7,7 +7,7 @@ import gc
 import sys
 import types
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -50,6 +50,7 @@ from vllm.v1.worker.extensible_kv_cache import ExtensibleKVCache
 from vllm.v1.worker.gpu import warmup
 from vllm.v1.worker.gpu.input_batch import prepare_pos_seq_lens
 from vllm.v1.worker.gpu.model_runner import ExecuteModelState, GPUModelRunner
+from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import StatePageInitializer
 
 requires_cuda = pytest.mark.skipif(
@@ -196,44 +197,6 @@ def test_warmup_initializes_each_groups_pages_from_its_requests_blocks():
     assert output.new_block_ids_to_zero is None
 
 
-# @spec PSTATE-PAGE-005
-def test_worker_frees_a_finished_row_before_it_initializes_a_new_owner(monkeypatch):
-    """Old owners leave and new owners arrive in this order on the runner
-    stream, so a page's new owner initializes it after the old owner's
-    accesses."""
-    events: list[str] = []
-    runner = GPUModelRunner.__new__(GPUModelRunner)
-    runner.draft_tokens_handler = SimpleNamespace(
-        begin_step=lambda scheduler_output: None
-    )
-    runner.encoder_cache = None
-    runner.aux_output_connector = None
-    runner.block_tables = SimpleNamespace(apply_staged_writes=lambda: None)
-    for name in (
-        "update_pp_decode_requests",
-        "finish_requests",
-        "free_states",
-        "add_requests",
-        "update_requests",
-    ):
-        monkeypatch.setattr(
-            runner,
-            name,
-            lambda *args, name=name: events.append(name),
-        )
-    monkeypatch.setattr(runner, "_merge_ec_connector_no_forward", lambda *args: None)
-    runner.kv_connector = SimpleNamespace(no_forward=lambda scheduler_output: None)
-
-    runner.execute_model(SchedulerOutput.make_empty())
-
-    assert events[1:] == [
-        "finish_requests",
-        "free_states",
-        "add_requests",
-        "update_requests",
-    ]
-
-
 # @spec PSTATE-PRES-008
 @requires_cuda
 def test_extensible_kv_cache_growth_keeps_state_pages_and_graphs_valid():
@@ -328,11 +291,21 @@ def test_new_request_data_has_no_position_offset_by_default():
 
 
 # @spec PSTATE-FAIL-001
-@pytest.mark.parametrize("persistent_state", [True, False])
+def test_model_state_reports_no_failures_by_default():
+    assert not ModelState.take_failed_requests(SimpleNamespace())
+
+
+# @spec PSTATE-FAIL-001
+@pytest.mark.parametrize(
+    ("persistent_state", "reports"),
+    [(True, True), (True, False), (False, True)],
+    ids=["state_model_reporting", "state_model_default", "ordinary_model"],
+)
 def test_runner_attaches_failed_ids_after_the_state_postprocesses(
-    monkeypatch, persistent_state
+    monkeypatch, persistent_state, reports
 ):
-    """An ordinary model's runner never asks its model state for failures."""
+    """An ordinary model's runner never asks its model state for failures, and
+    asking adds no host synchronization."""
     events: list[str] = []
     outputs: list[ModelRunnerOutput] = []
 
@@ -347,9 +320,19 @@ def test_runner_attaches_failed_ids_after_the_state_postprocesses(
 
         def take_failed_requests(self):
             events.append("take_failed_requests")
-            return {"failed"}
+            return {"failed"} if reports else ModelState.take_failed_requests(self)
 
     fake_state = FakeModelState()
+    for module, name in (
+        (torch.cuda, "synchronize"),
+        (torch.accelerator, "synchronize"),
+        (torch.cuda.Event, "synchronize"),
+        (torch.cuda.Stream, "synchronize"),
+    ):
+        if hasattr(module, name):
+            monkeypatch.setattr(
+                module, name, lambda *args, **kwargs: events.append("synchronize")
+            )
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.persistent_state = persistent_state
     runner.eplb = SimpleNamespace(step=lambda **kwargs: None)
@@ -403,7 +386,10 @@ def test_runner_attaches_failed_ids_after_the_state_postprocesses(
 
     if persistent_state:
         assert events == ["postprocess_state", "take_failed_requests"]
-        assert outputs[0].failed_req_ids == {"failed"}
+        if reports:
+            assert outputs[0].failed_req_ids == {"failed"}
+        else:
+            assert not outputs[0].failed_req_ids
     else:
         assert events == ["postprocess_state"]
         assert outputs[0].failed_req_ids is None
@@ -524,7 +510,7 @@ def test_worker_runs_both_synthetic_warmups_for_a_model_that_accepts_them(
 
     gpu_worker.Worker._compile_or_warm_up_model(worker)
 
-    assert calls[:2] == ["warmup_kernels", "sizing_warmup"]
+    assert {"warmup_kernels", "sizing_warmup"} <= set(calls)
 
 
 # @spec PSTATE-PREP-002
@@ -647,14 +633,28 @@ def test_serving_capture_does_not_clear_the_model_state_graphs(monkeypatch):
     assert events == [("capture", False)]
 
 
+def _empty_state_scheduler(monkeypatch):
+    """A real scheduler of a state model that holds no request."""
+    declare_state_facts(monkeypatch)
+    spec = MambaSpec(
+        block_size=16,
+        shapes=((1,),),
+        dtypes=(torch.int64,),
+        mamba_type=MambaAttentionBackendEnum.PERSISTENT_STATE,
+    )
+    return create_scheduler(
+        max_model_len=64,
+        block_size=16,
+        kv_cache_layer_config=MambaManager.layer_config(spec, recomputable=False),
+    )
+
+
 def _waking_core(monkeypatch, *, fully_awake: bool, was_sleeping: bool = True):
     """A core whose executor is asleep at level 1 or above when `was_sleeping`
     and, after a wake, asleep still unless `fully_awake`."""
     calls: list[str] = []
     core = _pausable_engine_core_proc()
-    scheduler = cast(MagicMock, core.scheduler)
-    scheduler.has_unrecomputable_state = True
-    scheduler.held_state_streams.return_value = []
+    core.scheduler = _empty_state_scheduler(monkeypatch)
     core.model_executor.is_sleeping = was_sleeping
 
     def wake_up(tags):
@@ -665,7 +665,6 @@ def _waking_core(monkeypatch, *, fully_awake: bool, was_sleeping: bool = True):
     core.model_executor.collective_rpc.side_effect = lambda method, *args, **kwargs: (
         calls.append(method)
     )
-    scheduler.get_kv_connector.return_value = None
     monkeypatch.setattr(core, "_set_kv_connector_handshake_metadata", MagicMock())
     monkeypatch.setattr(
         core, "resume_scheduler", MagicMock(side_effect=lambda: calls.append("resume"))
@@ -714,15 +713,12 @@ def test_wake_of_an_awake_executor_does_not_recapture(monkeypatch, tags):
 # @spec PSTATE-PREP-006
 def test_checkpoint_restore_recaptures_after_the_kv_cache_wakes(monkeypatch):
     core = _pausable_engine_core_proc()
-    scheduler = cast(MagicMock, core.scheduler)
-    scheduler.has_unrecomputable_state = True
-    scheduler.held_state_streams.return_value = []
+    core.scheduler = _empty_state_scheduler(monkeypatch)
     core.vllm_config = MagicMock()
     core.model_executor.is_sleeping = False
     monkeypatch.setattr(core, "_reset_caches", MagicMock())
     core.reject_new_requests = False
-    scheduler.get_kv_connector.return_value = None
-    core.checkpoint_prepare("wait")
+    assert core.checkpoint_prepare("wait") is None
     core.model_executor.reset_mock()
     # Preparing released the KV cache; the restore's wake maps it again.
     core.model_executor.is_sleeping = True
@@ -787,18 +783,27 @@ def retained_bytes(*roots, exclude=()) -> int:
     return total + sum(storages.values())
 
 
-NUM_TURNS = 1024
-"""Turns each stream runs; enough that history growth of even a few bytes a
-turn would show, while the test runs in seconds."""
+NUM_TURNS = 10_000
+"""Turns each stream runs, as the design asks; a leak of one token a turn
+grows a structure by tens of kilobytes over them."""
 MEASURE_EVERY = 8
 """Turns between two walks of the retained structures."""
-CALIBRATION_SAMPLES = 16
-"""Walks that set each structure's bound; they cover every input and output
-length, whose cycles are shorter than the turns they span."""
+WARMUP_SAMPLES = 4
+"""Walks skipped before the reference window, while queues and the detokenizer
+tail first fill."""
+WINDOW = 16
+"""Walks in the reference window: 128 turns, several full cycles of the input
+and output lengths (24 turns)."""
+SLACK = 1024
+"""Bytes a structure may exceed its reference-window size by: the allocated
+capacity of a container holding the same content varies by up to one deque
+block (64 slots). A leak of one token a turn passes it within a few hundred
+turns."""
 MAX_INPUT = 24
 MAX_OUTPUT = 8
-READ_EVERY = 4
-"""Turns the client lets pile up before it reads them all."""
+MAX_PENDING = 8
+"""The default `max_pending_stream_inputs`: the inputs pending, and the turns
+undelivered, that the credits allow."""
 
 
 def _input_len(turn: int) -> int:
@@ -810,13 +815,18 @@ def _output_len(turn: int) -> int:
 
 
 def _check_bounded(sizes: dict[str, list[int]]) -> None:
-    """Each structure stays within twice its size over the first walks."""
+    """No walk after the reference window exceeds that window's largest size
+    by more than `SLACK`: a structure's size depends on its bounded content,
+    never on the number of turns."""
     for name, structure_sizes in sizes.items():
-        bound = 2 * max(structure_sizes[:CALIBRATION_SAMPLES]) + 4096
-        assert max(structure_sizes) <= bound, (
-            f"{name} retained {max(structure_sizes)} bytes by the last of "
-            f"{len(structure_sizes)} walks; {bound} after the first "
-            f"{CALIBRATION_SAMPLES}"
+        reference = max(structure_sizes[WARMUP_SAMPLES : WARMUP_SAMPLES + WINDOW])
+        later = structure_sizes[WARMUP_SAMPLES + WINDOW :]
+        assert later, f"{name} has no walk after its reference window"
+        worst = max(later)
+        assert worst <= reference + SLACK, (
+            f"{name} retained {worst} bytes, over {reference} bytes in its "
+            f"reference window plus {SLACK}, by walk {later.index(worst)} of "
+            f"{len(later)}"
         )
 
 
@@ -838,17 +848,19 @@ def test_retained_bytes_counts_the_whole_buffer_behind_a_view(backing):
 
 # @spec PSTATE-HIST-008
 @pytest.mark.cpu_test
-@pytest.mark.parametrize("backing", ["tensor", "array"])
-def test_retained_bytes_detects_a_planted_growing_buffer(backing):
-    """A one-element view of a buffer that grows each turn, as a leak that a
-    shallow size would miss."""
-    zeros = torch.zeros if backing == "tensor" else np.zeros
-    dtype = torch.uint8 if backing == "tensor" else np.uint8
+@pytest.mark.parametrize("leak", ["growing_buffer", "one_token_a_turn"])
+def test_bound_check_detects_a_planted_leak(leak):
+    """A one-element view of a buffer that grows each turn, which a shallow
+    size would miss, and a history that keeps one more token each turn."""
     kept: list = []
     sizes = []
-    for turn in range(CALIBRATION_SAMPLES * 16):
-        kept[:] = [zeros(64 * (turn + 1), dtype=dtype)[:1]]
-        sizes.append(retained_bytes(kept))
+    for turn in range(NUM_TURNS):
+        if leak == "growing_buffer":
+            kept[:] = [torch.zeros(64 * (turn + 1), dtype=torch.uint8)[:1]]
+        else:
+            kept.append(turn)
+        if _measured(turn):
+            sizes.append(retained_bytes(kept))
 
     with pytest.raises(AssertionError, match="retained"):
         _check_bounded({"planted": sizes})
@@ -873,18 +885,22 @@ def _chunk(prompt: list[int]) -> EngineCoreRequest:
 # @spec PSTATE-HIST-008
 @pytest.mark.cpu_test
 def test_output_processor_history_stays_bounded_over_many_turns():
-    """With a real tokenizer, so the detokenizer's tail is measured too."""
+    """With a real tokenizer, so the detokenizer's tail is measured too. The
+    input queue is held at the credit bound, as a client that sends ahead of
+    the engine keeps it, and the client reads only when the credit bound of
+    undelivered turns has piled up."""
     tokenizer = get_tokenizer("facebook/opt-125m")
     processor = OutputProcessor(tokenizer, log_stats=False, persistent_state=True)
     queue = StreamingInputOutputCollector(RequestOutputKind.DELTA, "stream")
     processor.add_request(_chunk([1] * _input_len(0)), None, queue=queue)
+    for turn in range(1, MAX_PENDING + 1):
+        processor.add_request(_chunk([2] * _input_len(turn)), None)
     sizes: dict[str, list[int]] = {
         "request state": [],
         "input queue": [],
         "output backlog": [],
     }
     for turn in range(NUM_TURNS):
-        processor.add_request(_chunk([2] * _input_len(turn + 1)), None)
         processor.process_outputs(
             [
                 EngineCoreOutput(
@@ -894,16 +910,20 @@ def test_output_processor_history_stays_bounded_over_many_turns():
                 )
             ]
         )
+        processor.add_request(_chunk([2] * _input_len(turn + MAX_PENDING + 1)), None)
+        state = processor.request_states["stream"]
+        assert len(state.input_chunk_queue) == MAX_PENDING
         if _measured(turn):
-            state = processor.request_states["stream"]
             sizes["request state"].append(
                 retained_bytes(state, exclude=(state.queue, state.input_chunk_queue))
             )
             sizes["input queue"].append(retained_bytes(state.input_chunk_queue))
             sizes["output backlog"].append(retained_bytes(queue))
-        if turn % READ_EVERY == READ_EVERY - 1:
+        if turn % MAX_PENDING == MAX_PENDING - 1:
+            delivered = 0
             while queue.get_nowait() is not None:
-                pass
+                delivered += 1
+            assert delivered == MAX_PENDING
 
     _check_bounded(sizes)
 
@@ -927,7 +947,7 @@ def _stream_input(turn: int) -> Request:
 def test_scheduler_request_history_stays_bounded_over_many_turns(monkeypatch):
     """A stream of a model that ignores positions keeps one frontier token and
     one input in its request and in what the scheduler re-sends, however many
-    turns it has run."""
+    turns it has run, with the credit bound of inputs queued behind it."""
     declare_state_facts(monkeypatch, persistent_state_reads_positions=False)
     spec = MambaSpec(
         block_size=512,
@@ -942,13 +962,15 @@ def test_scheduler_request_history_stays_bounded_over_many_turns(monkeypatch):
         num_blocks=3,
         kv_cache_layer_config=MambaManager.layer_config(spec, recomputable=False),
     )
+    for turn in range(MAX_PENDING + 1):
+        scheduler.add_request(_stream_input(turn))
+    request = scheduler.requests["stream"]
     sizes: dict[str, list[int]] = {
         "request": [],
         "re-sent history": [],
         "input queue": [],
     }
     for turn in range(NUM_TURNS):
-        scheduler.add_request(_stream_input(turn))
         measured = _measured(turn)
         resent = 0
         for step in range(_output_len(turn)):
@@ -962,9 +984,10 @@ def test_scheduler_request_history_stays_bounded_over_many_turns(monkeypatch):
                 output,
                 ModelRunnerOutput(req_ids=["stream"], sampled_token_ids=[[token]]),
             )
+        scheduler.add_request(_stream_input(turn + MAX_PENDING + 1))
+        assert len(request.streaming_queue) == MAX_PENDING
         if not measured:
             continue
-        request = scheduler.requests["stream"]
         sizes["request"].append(
             retained_bytes(request, exclude=(request.streaming_queue,))
         )

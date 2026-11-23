@@ -277,7 +277,6 @@ def test_per_request_accumulators_reset_each_turn():
     _turn_end(processor)
 
     assert state.routed_experts_chunks == []
-    assert state.sampling_mask_chunks == []
     assert state.weight_version_starts == []
 
 

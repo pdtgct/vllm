@@ -13,6 +13,7 @@ import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from vllm_add_dummy_model import my_persistent_state as stub
@@ -27,6 +28,8 @@ from vllm.inputs import TokensPrompt
 from vllm.plugins import load_general_plugins
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine.async_llm import AsyncLLM
+from vllm.v1.engine.core import EngineCore
+from vllm.v1.engine.exceptions import StreamAdmissionError
 
 INPUTS = [[10, 20, 30], [40, 50], [60]]
 MAX_TOKENS = 16
@@ -133,17 +136,23 @@ def test_stub_state_declares_one_initial_value_per_component(initial_total):
     assert len(spec.initial_values) == len(spec.shapes)
 
 
-# @spec PSTATE-PAGE-001
+# @spec PSTATE-PAGE-001 PSTATE-PAGE-005
 @create_new_process_for_each_test("spawn")
+@pytest.mark.parametrize("async_scheduling", [False, True])
 @pytest.mark.parametrize("enforce_eager", [True, False])
 @pytest.mark.parametrize("initial_total", [0, INITIAL_TOTAL])
-def test_llm_reuses_slots_from_a_fresh_state(enforce_eager, initial_total):
+def test_llm_reuses_slots_from_a_fresh_state(
+    enforce_eager, initial_total, async_scheduling
+):
     """Six prompts through two slots: each produces the tokens of a page that
     holds its initial values, so a reused slot never carries its previous
-    owner's sum."""
+    owner's sum. Under async scheduling the step after a request's stop is
+    enqueued before core frees its page, so the old owner's work is still on
+    the runner stream when the new owner initializes the page."""
     with _llm(
         **_engine_kwargs(stub_initial_total=initial_total),
         enforce_eager=enforce_eager,
+        async_scheduling=async_scheduling,
     ) as llm:
         vocab_size = llm.llm_engine.model_config.get_vocab_size()
         prompts = [[11 * i + 1, 11 * i + 2, 11 * i + 3] for i in range(6)]
@@ -155,13 +164,29 @@ def test_llm_reuses_slots_from_a_fresh_state(enforce_eager, initial_total):
     ]
 
 
+WATCHDOG = 120
+"""Seconds before a streaming test counts as hung."""
+
+
 async def _stream(
-    llm: AsyncLLM, request_id: str, inputs: list[list[int]] = INPUTS
+    llm: AsyncLLM,
+    request_id: str,
+    inputs: list[list[int]] = INPUTS,
+    *,
+    hold: asyncio.Event | None = None,
+    turns_done: asyncio.Event | None = None,
 ) -> list[list[int]]:
+    """Stream `inputs` and return each turn's tokens. With `hold`, the input
+    iterator stays open after its last input until `hold` is set, so the
+    stream stays held, parked; `turns_done` is set once every input's turn has
+    ended."""
+
     async def stream_inputs():
         for prompt in inputs:
             # Copies: the output processor extends a request's prompt in place.
             yield StreamingInput(prompt=TokensPrompt(prompt_token_ids=list(prompt)))
+        if hold is not None:
+            await hold.wait()
 
     params = SamplingParams(
         temperature=0, max_tokens=MAX_TOKENS, output_kind=RequestOutputKind.DELTA
@@ -172,20 +197,60 @@ async def _stream(
         turns[-1].extend(completion.token_ids)
         if completion.finish_reason is not None and not output.finished:
             turns.append([])
+            if turns_done is not None and len(turns) == len(inputs) + 1:
+                turns_done.set()
     return [without_eos(turn) for turn in turns if turn]
+
+
+async def _stream_in_waves(
+    llm: AsyncLLM, inputs: list[list[list[int]]]
+) -> list[list[list[int]]]:
+    """Stream each entry of `inputs`, at most `max_num_seqs` (two) at a time.
+    While two streams are held, a third is refused with `active_limit`; once
+    the oldest ends, the next stream takes its row."""
+    results: list = [None] * len(inputs)
+    pending = list(range(len(inputs)))
+    held: dict[int, tuple[asyncio.Future, asyncio.Event]] = {}
+    while pending or held:
+        while pending and len(held) < 2:
+            index = pending.pop(0)
+            hold, turns_done = asyncio.Event(), asyncio.Event()
+            task = asyncio.ensure_future(
+                _stream(
+                    llm,
+                    f"stream-{index}",
+                    inputs[index],
+                    hold=hold,
+                    turns_done=turns_done,
+                )
+            )
+            waiter = asyncio.ensure_future(turns_done.wait())
+            await asyncio.wait({task, waiter}, return_when=asyncio.FIRST_COMPLETED)
+            if not waiter.done():
+                waiter.cancel()
+                task.result()
+                raise AssertionError(f"stream-{index} ended before its turns")
+            held[index] = (task, hold)
+        if pending:
+            with pytest.raises(StreamAdmissionError) as excinfo:
+                await _stream(llm, "refused", inputs[pending[0]])
+            assert excinfo.value.reason == "active_limit"
+        oldest = min(held)
+        task, hold = held.pop(oldest)
+        hold.set()
+        results[oldest] = await task
+    return results
 
 
 @pytest.mark.asyncio
 async def test_async_llm_streams_keep_their_state_across_inputs():
-    """Three streaming sessions share two slots: each keeps its state from
-    one input to the next, and the third starts from a fresh slot once one
-    of the first two ends."""
+    """Three streaming sessions through two rows: each keeps its state from
+    one input to the next, the third is refused while both rows are held, and
+    it starts from a fresh page once one of the first two ends."""
     llm = AsyncLLM.from_engine_args(AsyncEngineArgs(**_engine_kwargs()))
     try:
         expected = expected_turns(INPUTS, llm.model_config.get_vocab_size())
-        results = await asyncio.wait_for(
-            asyncio.gather(*(_stream(llm, f"stream-{i}") for i in range(3))), 60
-        )
+        results = await asyncio.wait_for(_stream_in_waves(llm, [INPUTS] * 3), WATCHDOG)
         assert results == [expected] * 3
     finally:
         llm.shutdown()
@@ -203,7 +268,7 @@ async def test_page_is_initialized_once_across_the_turns_of_a_stream():
         expected = expected_turns(
             INPUTS, llm.model_config.get_vocab_size(), initial_total=INITIAL_TOTAL
         )
-        result = await asyncio.wait_for(_stream(llm, "stream"), 60)
+        result = await asyncio.wait_for(_stream(llm, "stream"), WATCHDOG)
         assert result == expected
     finally:
         llm.shutdown()
@@ -212,9 +277,9 @@ async def test_page_is_initialized_once_across_the_turns_of_a_stream():
 # @spec PSTATE-ASYNC-003
 @pytest.mark.asyncio
 async def test_async_scheduling_applies_each_committed_input_exactly_once():
-    """Four sessions share two slots under async scheduling. A step run for a
-    row after its stop would add the EOS token to the session's state and
-    shift every later turn."""
+    """Four sessions through two rows under async scheduling, in waves. A step
+    run for a row after its stop would add the EOS token to the session's
+    state and shift every later turn."""
     llm = AsyncLLM.from_engine_args(
         AsyncEngineArgs(**_engine_kwargs(), async_scheduling=True)
     )
@@ -222,10 +287,7 @@ async def test_async_scheduling_applies_each_committed_input_exactly_once():
         assert llm.vllm_config.scheduler_config.async_scheduling
         inputs = [[[i + 1, i + 2], [i + 3], [i + 4, i + 5, i + 6]] for i in range(4)]
         vocab_size = llm.model_config.get_vocab_size()
-        results = await asyncio.wait_for(
-            asyncio.gather(*(_stream(llm, f"stream-{i}", inputs[i]) for i in range(4))),
-            60,
-        )
+        results = await asyncio.wait_for(_stream_in_waves(llm, inputs), WATCHDOG)
         assert results == [expected_turns(i, vocab_size) for i in inputs]
     finally:
         llm.shutdown()
@@ -241,7 +303,7 @@ async def test_positions_stay_absolute_across_compacted_turns():
         expected = expected_turns(
             INPUTS, llm.model_config.get_vocab_size(), reads_positions=True
         )
-        result = await asyncio.wait_for(_stream(llm, "stream"), 60)
+        result = await asyncio.wait_for(_stream(llm, "stream"), WATCHDOG)
         assert result == expected
     finally:
         llm.shutdown()
@@ -293,12 +355,26 @@ def test_warmup_requests_read_initialized_pages():
 # @spec PSTATE-PREP-004 PSTATE-PREP-008
 @create_new_process_for_each_test("spawn")
 def test_engine_is_ready_after_the_model_state_is_prepared_and_captured():
-    with _in_process_llm() as llm:
-        assert stub.EVENTS.count(("prepare_execution_memory",)) == 1
-        assert ("capture", False) in stub.EVENTS
-        adds = [i for i, event in enumerate(stub.EVENTS) if event[0] == "add"]
-        prepared = stub.EVENTS.index(("prepare_execution_memory",))
-        assert all(i > prepared for i in adds)
+    """The engine core exists, and so can report ready, only once its startup
+    has prepared the model state and captured its serving graphs."""
+    construct = EngineCore.__init__
+
+    def recording_construct(self, *args, **kwargs):
+        construct(self, *args, **kwargs)
+        stub.EVENTS.append(("ready",))
+
+    with (
+        patch.object(EngineCore, "__init__", recording_construct),
+        _in_process_llm() as llm,
+    ):
+        events = list(stub.EVENTS)
+        assert events.count(("prepare_execution_memory",)) == 1
+        assert events.count(("ready",)) == 1
+        ready = events.index(("ready",))
+        assert events.index(("prepare_execution_memory",)) < ready
+        assert events.index(("capture", False)) < ready
+        adds = [i for i, event in enumerate(events) if event[0] == "add"]
+        assert all(i > events.index(("prepare_execution_memory",)) for i in adds)
         assert llm.llm_engine.engine_core.engine_core.is_inference_ready()
 
 

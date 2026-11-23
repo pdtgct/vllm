@@ -12,7 +12,11 @@ import torch
 
 from vllm.config import ModelConfig
 from vllm.multimodal.inputs import PlaceholderRange
-from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.sampling_params import (
+    RepetitionDetectionParams,
+    RequestOutputKind,
+    SamplingParams,
+)
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.engine import FinishReason
@@ -29,6 +33,8 @@ MAX_MODEL_LEN = 64
 EOS = EOS_TOKEN_ID
 TOKEN = 5
 STOP_TOKEN = 7
+REPEATS = RepetitionDetectionParams(max_pattern_size=1, min_count=2)
+"""Ends a turn once one token is sampled twice in a row."""
 
 
 def state_layer() -> KVCacheLayerConfig:
@@ -94,11 +100,13 @@ def stream_input(
     continuation: bool = False,
     max_tokens: int = 100,
     stop_token_ids: list[int] | None = None,
+    repetition_detection: RepetitionDetectionParams | None = None,
     **kwargs,
 ) -> Request:
     params = SamplingParams(
         max_tokens=max_tokens,
         stop_token_ids=stop_token_ids,
+        repetition_detection=repetition_detection,
         output_kind=RequestOutputKind.DELTA,
     )
     (request,) = create_requests(
@@ -341,14 +349,8 @@ def test_reused_page_is_fresh_for_its_new_owner(monkeypatch):
 
 
 # @spec PSTATE-ASYNC-001
-@pytest.mark.parametrize(
-    "facts",
-    [{}, {"persistent_state_ignores_stopped_row_echoes": True}],
-    ids=["default", "deferred_echo_declaration"],
-)
-def test_barrier_holds_state_request_while_its_step_is_in_flight(monkeypatch, facts):
-    """The barrier always applies; no model declaration lifts it."""
-    scheduler = make_scheduler(monkeypatch, async_scheduling=True, facts=facts)
+def test_barrier_holds_state_request_while_its_step_is_in_flight(monkeypatch):
+    scheduler = make_scheduler(monkeypatch, async_scheduling=True)
     scheduler.add_request(stream_input("s", 4))
     first = scheduler.schedule()
     assert scheduler.requests["s"].num_in_flight_tokens > 0
@@ -359,6 +361,23 @@ def test_barrier_holds_state_request_while_its_step_is_in_flight(monkeypatch, fa
     scheduler.update_from_output(
         first, ModelRunnerOutput(req_ids=["s"], sampled_token_ids=[[TOKEN]])
     )
+    assert "s" in scheduler.schedule().num_scheduled_tokens
+
+
+# @spec PSTATE-ASYNC-001
+def test_waiting_loop_holds_state_request_with_a_step_in_flight(monkeypatch):
+    """The running-loop barrier keeps a parked or resumed state request from
+    having a step in flight; the waiting loop checks the same predicate in case
+    another path ever lets one through, so the count is set directly."""
+    scheduler = make_scheduler(monkeypatch, async_scheduling=True)
+    request = open_stream(scheduler, "s", 4, [EOS])
+    scheduler.add_request(update("s", 4))
+    assert request in scheduler.waiting
+    request.num_in_flight_tokens = 1
+
+    assert "s" not in scheduler.schedule().num_scheduled_tokens
+
+    request.num_in_flight_tokens = 0
     assert "s" in scheduler.schedule().num_scheduled_tokens
 
 
@@ -469,6 +488,13 @@ def test_close_reaching_parked_stream_finishes_it_stopped(monkeypatch, admitted)
         ({"max_tokens": 1}, None, TOKEN, FinishReason.LENGTH, True),
         ({"num_tokens": MAX_MODEL_LEN - 1}, None, TOKEN, FinishReason.LENGTH, True),
         ({"stop_token_ids": [STOP_TOKEN]}, None, STOP_TOKEN, FinishReason.STOP, True),
+        (
+            {"repetition_detection": REPEATS},
+            "repeat",
+            TOKEN,
+            FinishReason.REPETITION,
+            True,
+        ),
         ({}, "model_failure", TOKEN, FinishReason.ERROR, True),
     ],
     ids=[
@@ -479,6 +505,7 @@ def test_close_reaching_parked_stream_finishes_it_stopped(monkeypatch, admitted)
         "max_tokens",
         "max_model_len",
         "stop_token",
+        "repetition",
         "model_failure",
     ],
 )
@@ -498,6 +525,8 @@ def test_finished_output_marks_whether_it_ends_the_stream(
             scheduler.add_request(update("s", 4))
         elif then == "close":
             scheduler.add_request(close("s"))
+        elif then == "repeat":
+            step(scheduler, {"s": sampled})
     runner_kwargs = {"failed_req_ids": {"s"}} if then == "model_failure" else {}
 
     _, outputs = step(scheduler, {"s": sampled}, **runner_kwargs)
@@ -525,8 +554,14 @@ def test_finished_output_marks_whether_it_ends_the_stream(
             [TOKEN, STOP_TOKEN],
             RequestStatus.FINISHED_STOPPED,
         ),
+        (
+            4,
+            {"repetition_detection": REPEATS},
+            [TOKEN, TOKEN],
+            RequestStatus.FINISHED_REPETITION,
+        ),
     ],
-    ids=["max_tokens", "max_model_len", "stop_token"],
+    ids=["max_tokens", "max_model_len", "stop_token", "repetition"],
 )
 def test_non_resumable_stop_finishes_state_stream_despite_queued_input(
     monkeypatch, num_tokens, request_kwargs, tokens, status
@@ -637,6 +672,29 @@ def test_decode_stops_at_position_limit(
 
     assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
     assert request.num_tokens == final_num_tokens
+
+
+# @spec PSTATE-TURN-010
+def test_running_loop_clamps_a_multi_token_step_to_the_position_length(monkeypatch):
+    """A chunked prefill continuing in the running loop: with 52 dropped
+    positions, 8 computed tokens and one sampled token a step, only 3 more
+    fit below the position limit, although the budget allows 8. Compaction
+    leaves no request this close to the limit mid-prefill, so the offset is
+    set directly."""
+    scheduler = make_scheduler(monkeypatch, max_num_batched_tokens=8)
+    request = stream_input("s", 20)
+    scheduler.add_request(request)
+    first = scheduler.schedule()
+    assert first.num_scheduled_tokens == {"s": 8}
+    # A partial prefill samples nothing.
+    scheduler.update_from_output(
+        first, ModelRunnerOutput(req_ids=["s"], sampled_token_ids=[[]])
+    )
+    request.position_offset = MAX_MODEL_LEN - 8 - 1 - 3
+
+    second = scheduler.schedule()
+
+    assert second.num_scheduled_tokens == {"s": 3}
 
 
 # @spec PSTATE-TURN-011 PSTATE-TURN-008
@@ -763,9 +821,18 @@ def test_fold_keeps_only_updates_features_relative_to_compacted_prompt(
 
     assert [f.identifier for f in request.mm_features] == ["update-image"]
     assert request.mm_features[0].mm_position.offset == 1 + 2
+
+    output = scheduler.schedule()
+
+    # The update's image is the request's only encoder input, at its rebased
+    # offset inside the compacted prompt.
+    assert output.num_scheduled_tokens == {"s": 1 + 10 - 1}
+    assert output.scheduled_encoder_inputs == {"s": [0]}
     encoder_cache = scheduler.encoder_cache_manager
+    assert encoder_cache.get_cached_input_ids(request) == {0}
+    assert encoder_cache.cached["update-image"] == {"s"}
     assert "s" not in encoder_cache.cached.get("opening-image", set())
-    assert "opening-image" not in encoder_cache.request_hash_refs.get("s", {})
+    assert set(encoder_cache.request_hash_refs["s"]) == {"update-image"}
 
 
 # @spec PSTATE-HIST-006
