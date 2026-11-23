@@ -61,6 +61,7 @@ from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    FullAttentionManager,
     MambaManager,
     SlidingWindowManager,
 )
@@ -2844,6 +2845,38 @@ def test_scheduler_reset_prefix_cache():
 
     for i, request in enumerate(requests):
         assert scheduler.waiting[i] == request
+
+
+def test_unrecomputable_state_is_never_preempted():
+    """With state that can't be recomputed, the scheduler starts only when the
+    pool holds every active request at `max_model_len`, and a cache reset
+    leaves running requests alone."""
+
+    def make_scheduler(num_blocks: int) -> Scheduler:
+        spec = AttentionSpec(
+            block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+        )
+        return create_scheduler(
+            max_num_seqs=2,
+            max_model_len=64,
+            num_blocks=num_blocks,
+            kv_cache_layer_config=FullAttentionManager.layer_config(
+                spec, recomputable=False
+            ),
+        )
+
+    # Two requests of four blocks each, plus the null block.
+    with pytest.raises(ValueError, match="can't be recomputed"):
+        make_scheduler(num_blocks=8)
+
+    scheduler = make_scheduler(num_blocks=9)
+    requests = create_requests(num_requests=2)
+    for request in requests:
+        scheduler.add_request(request)
+    scheduler.schedule()
+
+    assert not scheduler.reset_prefix_cache(reset_running_requests=True)
+    assert scheduler.running == requests
 
 
 @pytest.mark.parametrize("reset_successful", [False, True])

@@ -25,3 +25,9 @@ def register():
 
     if "MyLlava" not in ModelRegistry.get_supported_archs():
         ModelRegistry.register_model("MyLlava", "vllm_add_dummy_model.my_llava:MyLlava")
+
+    if "StubPersistentStateForCausalLM" not in ModelRegistry.get_supported_archs():
+        ModelRegistry.register_model(
+            "StubPersistentStateForCausalLM",
+            "vllm_add_dummy_model.my_persistent_state:StubPersistentStateForCausalLM",
+        )

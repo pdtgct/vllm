@@ -173,6 +173,9 @@ class ManagerConfig:
 
     manager_cls: type[SingleTypeKVCacheManager]
     params: SingleTypeKVCacheManager.Params
+    recomputable: bool = True
+    """Whether a request's inputs can rebuild this cache. When false, the
+    scheduler never preempts a request and admits only what the pool can hold."""
 
     def __post_init__(self):
         assert isinstance(self.params, self.manager_cls.Params), (

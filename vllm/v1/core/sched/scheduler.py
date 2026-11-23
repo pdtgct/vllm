@@ -144,6 +144,24 @@ class Scheduler(SchedulerInterface):
             if self.scheduler_config.max_num_active_seqs is not None
             else self.max_num_running_reqs
         )
+        # State that can't be recomputed rules out preemption, so the pool must
+        # hold every active request at its largest.
+        self.has_unrecomputable_state = any(
+            not group.manager_config.recomputable
+            for group in kv_cache_config.kv_cache_groups
+        )
+        if self.has_unrecomputable_state:
+            blocks_per_request = sum(
+                group.max_allocated_blocks_per_request(vllm_config)
+                for group in kv_cache_config.kv_cache_groups
+            )
+            max_requests = (kv_cache_config.num_blocks - 1) // blocks_per_request
+            if self.max_num_active_reqs > max_requests:
+                raise ValueError(
+                    f"The KV cache holds {max_requests} requests of state that "
+                    f"can't be recomputed, fewer than the {self.max_num_active_reqs} "
+                    "that can be active. Lower max_num_seqs or enlarge the cache."
+                )
         self.max_num_scheduled_tokens = (
             self.scheduler_config.max_num_scheduled_tokens
             if self.scheduler_config.max_num_scheduled_tokens is not None
@@ -1844,6 +1862,10 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        if self.has_unrecomputable_state:
+            raise RuntimeError(
+                f"Request {request.request_id} holds state that can't be recomputed"
+            )
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
         self._free_request_blocks(request)
@@ -3382,6 +3404,8 @@ class Scheduler(SchedulerInterface):
         Otherwise, this method will only reset the KV prefix cache when there
         is no running requests taking KV cache.
         """
+        if self.has_unrecomputable_state:
+            reset_running_requests = False
         if reset_running_requests:
             # For logging.
             timestamp = time.monotonic()
