@@ -82,17 +82,16 @@ def test_mamba_spec_initial_values_default_to_none():
 
 
 # @spec PSTATE-DECL-004
-def test_state_model_declarations_default_to_a_resumable_ordinary_model():
-    assert SupportsPersistentState.persistent_state_reads_positions is True
-    assert SupportsPersistentState.persistent_state_parks_on_eos is True
-    assert SupportsPersistentState.persistent_state_accepts_synthetic_warmup is True
-    assert SupportsPersistentState.persistent_state_ignores_stopped_row_echoes is False
-
-
-# @spec PSTATE-DECL-010
-def test_mamba_spec_states_tensor_parallel_ownership():
-    assert _state_spec(tp_replicated=True).tp_replicated is True
-    assert _state_spec().tp_replicated is False
+def test_state_model_declares_two_facts_with_their_defaults():
+    declared = {
+        name: getattr(SupportsPersistentState, name)
+        for name in dir(SupportsPersistentState)
+        if name.startswith("persistent_state_")
+    }
+    assert declared == {
+        "persistent_state_reads_positions": True,
+        "persistent_state_accepts_synthetic_warmup": True,
+    }
 
 
 # Page initialization and reuse
@@ -197,7 +196,7 @@ def test_warmup_initializes_each_groups_pages_from_its_requests_blocks():
     assert output.new_block_ids_to_zero is None
 
 
-# @spec PSTATE-PAGE-006
+# @spec PSTATE-PAGE-005
 def test_worker_frees_a_finished_row_before_it_initializes_a_new_owner(monkeypatch):
     """Old owners leave and new owners arrive in this order on the runner
     stream, so a page's new owner initializes it after the old owner's
@@ -611,7 +610,7 @@ def _fake_graph_capture(device):
     yield SimpleNamespace(stream=None)
 
 
-# @spec PSTATE-PREP-006 PSTATE-PREP-007
+# @spec PSTATE-PREP-006
 def test_runner_clears_then_recaptures_serving_graphs_of_the_model_state(
     monkeypatch,
 ):
@@ -627,7 +626,7 @@ def test_runner_clears_then_recaptures_serving_graphs_of_the_model_state(
     assert events == [("clear",), ("capture", False)]
 
 
-# @spec PSTATE-PREP-007
+# @spec PSTATE-PREP-006
 def test_serving_capture_does_not_clear_the_model_state_graphs(monkeypatch):
     events: list[tuple] = []
     runner = _make_capture_runner(monkeypatch, captured=False)
@@ -692,7 +691,7 @@ def test_partial_wake_does_not_recapture(monkeypatch):
     assert calls == ["wake_up"]
 
 
-# @spec PSTATE-PREP-009
+# @spec PSTATE-PREP-006
 def test_light_wake_keeps_captured_graphs(monkeypatch):
     core, calls = _waking_core(monkeypatch, fully_awake=True, was_sleeping=False)
 
@@ -701,7 +700,7 @@ def test_light_wake_keeps_captured_graphs(monkeypatch):
     assert calls == ["resume"]
 
 
-# @spec PSTATE-PREP-009
+# @spec PSTATE-PREP-006
 @pytest.mark.parametrize("tags", [None, ["weights", "kv_cache"]])
 def test_wake_of_an_awake_executor_does_not_recapture(monkeypatch, tags):
     """After a level-0 sleep, or a repeated wake, nothing was remapped."""
@@ -973,24 +972,3 @@ def test_scheduler_request_history_stays_bounded_over_many_turns(monkeypatch):
         sizes["input queue"].append(retained_bytes(request.streaming_queue))
 
     _check_bounded(sizes)
-
-
-# Declined by design
-
-
-# @spec PSTATE-ASYNC-005 PSTATE-ASYNC-006
-@pytest.mark.skip(
-    reason="the echo declaration is accepted only after the A40 exactly-once "
-    "test and latency comparison of PSTATE-ASYNC-006, which need the plugin"
-)
-def test_echo_declaration_is_accepted_only_after_the_a40_gate():
-    raise AssertionError
-
-
-# @spec PSTATE-PAGE-005
-@pytest.mark.skip(
-    reason="a model's write on a side stream is its own duty; core cannot "
-    "observe it, and no core behaviour changes"
-)
-def test_model_joins_side_streams_before_its_forward_returns():
-    raise AssertionError

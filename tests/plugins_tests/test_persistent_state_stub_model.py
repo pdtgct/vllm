@@ -95,8 +95,8 @@ def _in_process_llm(arch: str = STUB_ARCH, **kwargs) -> Iterator[LLM]:
 @pytest.mark.parametrize(
     ("arch", "declared"),
     [
-        (STUB_ARCH, (True, True, True, False)),
-        (NO_WARMUP_ARCH, (False, True, False, False)),
+        (STUB_ARCH, (True, True)),
+        (NO_WARMUP_ARCH, (False, False)),
     ],
 )
 def test_model_config_exposes_the_state_declarations(arch, declared):
@@ -108,9 +108,7 @@ def test_model_config_exposes_the_state_declarations(arch, declared):
     assert config.has_persistent_state
     assert (
         config.persistent_state_reads_positions,
-        config.persistent_state_parks_on_eos,
         config.persistent_state_accepts_synthetic_warmup,
-        config.persistent_state_ignores_stopped_row_echoes,
     ) == declared
 
 
@@ -133,11 +131,6 @@ def test_stub_state_declares_one_initial_value_per_component(initial_total):
     spec = _stub_layer_spec(stub_initial_total=initial_total)
     assert spec.initial_values == (initial_total, stub.TURN_LEN - 1)
     assert len(spec.initial_values) == len(spec.shapes)
-
-
-# @spec PSTATE-DECL-010
-def test_stub_state_declares_its_tensor_parallel_ownership():
-    assert _stub_layer_spec().tp_replicated is True
 
 
 # @spec PSTATE-PAGE-001
@@ -198,7 +191,7 @@ async def test_async_llm_streams_keep_their_state_across_inputs():
         llm.shutdown()
 
 
-# @spec PSTATE-PAGE-002
+# @spec PSTATE-PAGE-001
 @pytest.mark.asyncio
 async def test_page_is_initialized_once_across_the_turns_of_a_stream():
     """A later turn, which core compacts, continues from its page rather than
@@ -324,7 +317,7 @@ def test_full_wake_after_deep_sleep_recaptures_model_state_graphs_once():
         assert stub.EVENTS[ready:] == [("clear",), ("capture", False)]
 
 
-# @spec PSTATE-PREP-009
+# @spec PSTATE-PREP-006
 @create_new_process_for_each_test("spawn")
 def test_light_sleep_and_cache_reset_keep_model_state_graphs():
     with _in_process_llm(enable_sleep_mode=True) as llm:

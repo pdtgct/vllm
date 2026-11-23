@@ -7,8 +7,6 @@ scheduler fixtures below hold one state group, or one attention group and one
 state group for a hybrid model.
 """
 
-import time
-
 import pytest
 import torch
 
@@ -54,9 +52,7 @@ def attention_layer() -> KVCacheLayerConfig:
 STATE_FACTS = {
     "has_persistent_state": True,
     "persistent_state_reads_positions": True,
-    "persistent_state_parks_on_eos": True,
     "persistent_state_accepts_synthetic_warmup": True,
-    "persistent_state_ignores_stopped_row_echoes": False,
 }
 """The `SupportsPersistentState` defaults, as `ModelConfig` exposes them."""
 
@@ -183,33 +179,23 @@ def num_rows(scheduler) -> int:
     )
 
 
-# @spec PSTATE-DECL-001
-@pytest.mark.parametrize("hybrid", [False, True], ids=["state", "hybrid"])
-def test_group_that_inputs_cannot_rebuild_makes_scheduler_a_state_model(
-    monkeypatch, hybrid
-):
-    assert make_scheduler(monkeypatch, hybrid=hybrid).has_unrecomputable_state
+def finished_output(outputs, req_id: str):
+    """The finished output that one step's `outputs` carry for `req_id`."""
+    [output] = [
+        o
+        for eco in outputs.values()
+        for o in eco.outputs
+        if o.request_id == req_id and o.finish_reason is not None
+    ]
+    return output
 
 
-# @spec PSTATE-DECL-001
-def test_group_that_inputs_can_rebuild_leaves_scheduler_ordinary():
-    assert not create_scheduler().has_unrecomputable_state
+def new_request_data(output, req_id: str):
+    [data] = [r for r in output.scheduled_new_reqs if r.req_id == req_id]
+    return data
 
 
-# @spec PSTATE-DECL-012
-@pytest.mark.parametrize(
-    ("num_blocks", "fits"), [(10, False), (11, True)], ids=["short", "exact"]
-)
-def test_startup_needs_every_groups_footprint_for_every_active_row(
-    monkeypatch, num_blocks, fits
-):
-    # Per row: 4 attention blocks at max_model_len plus 1 state block, for 2 rows,
-    # plus the null block.
-    if fits:
-        make_scheduler(monkeypatch, hybrid=True, num_blocks=num_blocks)
-    else:
-        with pytest.raises(ValueError):
-            make_scheduler(monkeypatch, hybrid=True, num_blocks=num_blocks)
+# Preservation
 
 
 # @spec PSTATE-PRES-001
@@ -226,31 +212,29 @@ def test_allocation_failure_does_not_preempt_state_request(monkeypatch):
     assert not output.preempted_req_ids
 
 
-# @spec PSTATE-PRES-002
-def test_preempting_state_request_raises_naming_it(monkeypatch):
+# @spec PSTATE-PRES-004
+@pytest.mark.parametrize(
+    ("tokens", "resumable"),
+    [([TOKEN], True), ([EOS], True), ([TOKEN], False)],
+    ids=["running_stream", "parked_stream", "single_request"],
+)
+def test_reset_running_requests_refused_while_state_request_held(
+    monkeypatch, tokens, resumable
+):
     scheduler = make_scheduler(monkeypatch)
-    request = open_stream(scheduler, "stream-1", 4, [TOKEN])
+    request = open_stream(scheduler, "held-1", 4, tokens, resumable=resumable)
 
-    with pytest.raises(RuntimeError, match="stream-1"):
-        scheduler._preempt_request(request, time.monotonic())
-
-
-# @spec PSTATE-PRES-003
-@pytest.mark.parametrize("tokens", [[TOKEN], [EOS]], ids=["running", "parked"])
-def test_reset_running_requests_refused_while_state_stream_held(monkeypatch, tokens):
-    scheduler = make_scheduler(monkeypatch)
-    request = open_stream(scheduler, "stream-1", 4, tokens)
-
-    with pytest.raises(RuntimeError, match="stream-1"):
+    with pytest.raises(RuntimeError, match="held-1"):
         scheduler.reset_prefix_cache(reset_running_requests=True)
 
+    assert scheduler.requests["held-1"] is request
     assert request.status in (
         RequestStatus.RUNNING,
         RequestStatus.WAITING_FOR_STREAMING_REQ,
     )
 
 
-# @spec PSTATE-PRES-003 PSTATE-DECL-013
+# @spec PSTATE-PRES-004 PSTATE-DECL-013
 def test_reset_running_requests_still_preempts_ordinary_stream():
     scheduler = create_scheduler(max_num_seqs=1)
     request = open_stream(scheduler, "s", 4, [TOKEN])
@@ -260,7 +244,10 @@ def test_reset_running_requests_still_preempts_ordinary_stream():
     assert request.status == RequestStatus.PREEMPTED
 
 
-# @spec PSTATE-PAGE-004
+# Page initialization and reuse
+
+
+# @spec PSTATE-PAGE-004 PSTATE-TURN-002
 @pytest.mark.parametrize(
     ("request_kwargs", "tokens", "ending"),
     [
@@ -272,7 +259,7 @@ def test_reset_running_requests_still_preempts_ordinary_stream():
     ],
     ids=["abort_running", "abort_parked", "close_parked", "stop_token", "length"],
 )
-def test_terminal_finish_returns_state_page_to_pool(
+def test_terminal_finish_returns_state_page_and_row(
     monkeypatch, request_kwargs, tokens, ending
 ):
     scheduler = make_scheduler(monkeypatch)
@@ -287,34 +274,57 @@ def test_terminal_finish_returns_state_page_to_pool(
 
     assert "s" not in scheduler.requests
     assert free_blocks(scheduler) == free_before
+    assert num_rows(scheduler) == 0
+
+
+# @spec PSTATE-PAGE-004 PSTATE-ADMIT-002
+def test_aborted_admission_releases_its_row(monkeypatch):
+    scheduler = make_scheduler(monkeypatch)
+    free_before = free_blocks(scheduler)
+    scheduler.admit_stream(admission_request("a"))
+
+    scheduler.finish_requests("a", RequestStatus.FINISHED_ABORTED)
+
+    assert "a" not in scheduler.requests
+    assert num_rows(scheduler) == 0
+    assert free_blocks(scheduler) == free_before
 
 
 # @spec PSTATE-PAGE-007
-def test_first_step_names_request_whose_state_page_was_initialized(monkeypatch):
+@pytest.mark.parametrize("admitted", [False, True], ids=["opened", "admitted"])
+def test_first_schedule_of_a_stream_carries_no_computed_tokens(monkeypatch, admitted):
     scheduler = make_scheduler(monkeypatch)
-    scheduler.add_request(stream_input("s", 4))
+    if admitted:
+        scheduler.admit_stream(admission_request("s"))
+        idle, _ = step(scheduler)
+        assert not idle.num_scheduled_tokens
+        scheduler.add_request(update("s", 6))
+    else:
+        scheduler.add_request(stream_input("s", 6))
 
     first, _ = step(scheduler)
-    second, _ = step(scheduler)
 
-    assert first.new_state_page_req_ids == {"s"}
-    assert second.new_state_page_req_ids == set()
+    assert new_request_data(first, "s").num_computed_tokens == 0
 
 
-# @spec PSTATE-PAGE-007
-def test_resumed_turn_does_not_name_request_again(monkeypatch):
-    scheduler = make_scheduler(monkeypatch)
-    open_stream(scheduler, "s", 4, [EOS])
+# @spec PSTATE-PAGE-007 PSTATE-HIST-001
+@pytest.mark.parametrize(
+    ("hybrid", "num_computed_tokens"), [(False, 1), (True, 5)], ids=["state", "hybrid"]
+)
+def test_resumed_turn_carries_its_computed_frontier(
+    monkeypatch, hybrid, num_computed_tokens
+):
+    scheduler = make_scheduler(monkeypatch, hybrid=hybrid)
+    open_stream(scheduler, "s", 4, [TOKEN, EOS])
     scheduler.add_request(update("s", 4))
 
     resumed, _ = step(scheduler)
 
-    assert set(resumed.num_scheduled_tokens) == {"s"}
-    assert resumed.new_state_page_req_ids == set()
+    assert new_request_data(resumed, "s").num_computed_tokens == num_computed_tokens
 
 
 # @spec PSTATE-PAGE-007
-def test_reused_page_is_named_for_its_new_owner(monkeypatch):
+def test_reused_page_is_fresh_for_its_new_owner(monkeypatch):
     scheduler = make_scheduler(monkeypatch, max_num_seqs=1, num_blocks=2)
     open_stream(scheduler, "old", 4, [TOKEN])
     old_blocks = scheduler.kv_cache_manager.get_block_ids("old")
@@ -324,22 +334,21 @@ def test_reused_page_is_named_for_its_new_owner(monkeypatch):
     output, _ = step(scheduler)
 
     assert scheduler.kv_cache_manager.get_block_ids("new") == old_blocks
-    assert output.new_state_page_req_ids == {"new"}
+    assert new_request_data(output, "new").num_computed_tokens == 0
 
 
-# @spec PSTATE-PAGE-007
-def test_ordinary_model_names_no_initialized_state_pages():
-    scheduler = create_scheduler()
-    scheduler.add_request(stream_input("s", 4))
-
-    output, _ = step(scheduler)
-
-    assert output.new_state_page_req_ids == set()
+# Per-request barrier
 
 
 # @spec PSTATE-ASYNC-001
-def test_barrier_holds_state_request_while_its_step_is_in_flight(monkeypatch):
-    scheduler = make_scheduler(monkeypatch, async_scheduling=True)
+@pytest.mark.parametrize(
+    "facts",
+    [{}, {"persistent_state_ignores_stopped_row_echoes": True}],
+    ids=["default", "deferred_echo_declaration"],
+)
+def test_barrier_holds_state_request_while_its_step_is_in_flight(monkeypatch, facts):
+    """The barrier always applies; no model declaration lifts it."""
+    scheduler = make_scheduler(monkeypatch, async_scheduling=True, facts=facts)
     scheduler.add_request(stream_input("s", 4))
     first = scheduler.schedule()
     assert scheduler.requests["s"].num_in_flight_tokens > 0
@@ -350,19 +359,6 @@ def test_barrier_holds_state_request_while_its_step_is_in_flight(monkeypatch):
     scheduler.update_from_output(
         first, ModelRunnerOutput(req_ids=["s"], sampled_token_ids=[[TOKEN]])
     )
-    assert "s" in scheduler.schedule().num_scheduled_tokens
-
-
-# @spec PSTATE-ASYNC-001
-def test_declared_echo_tolerance_lifts_the_barrier(monkeypatch):
-    scheduler = make_scheduler(
-        monkeypatch,
-        async_scheduling=True,
-        facts={"persistent_state_ignores_stopped_row_echoes": True},
-    )
-    scheduler.add_request(stream_input("s", 4))
-    scheduler.schedule()
-
     assert "s" in scheduler.schedule().num_scheduled_tokens
 
 
@@ -385,6 +381,9 @@ def test_ordinary_model_keeps_async_overlap():
     scheduler.schedule()
 
     assert "s" in scheduler.schedule().num_scheduled_tokens
+
+
+# Turn boundary and position limit
 
 
 # @spec PSTATE-TURN-001
@@ -422,17 +421,6 @@ def test_eos_before_close_finishes_state_stream_with_stop(monkeypatch):
     assert "s" not in scheduler.requests
 
 
-# @spec PSTATE-TURN-001
-def test_eos_finishes_stream_of_model_that_does_not_park_on_eos(monkeypatch):
-    scheduler = make_scheduler(
-        monkeypatch, facts={"persistent_state_parks_on_eos": False}
-    )
-    request = open_stream(scheduler, "s", 4, [EOS])
-
-    assert request.status == RequestStatus.FINISHED_STOPPED
-    assert "s" not in scheduler.requests
-
-
 # @spec PSTATE-TURN-015
 def test_inputs_accepted_before_close_run_in_order(monkeypatch):
     scheduler = make_scheduler(monkeypatch)
@@ -451,25 +439,76 @@ def test_inputs_accepted_before_close_run_in_order(monkeypatch):
     assert "s" not in scheduler.requests
 
 
-# @spec PSTATE-TURN-016 PSTATE-ADMIT-013
-def test_input_after_close_finishes_stream_with_named_error(monkeypatch):
+# @spec PSTATE-TURN-015 PSTATE-TURN-002
+@pytest.mark.parametrize("admitted", [False, True], ids=["parked", "never_fed"])
+def test_close_reaching_parked_stream_finishes_it_stopped(monkeypatch, admitted):
     scheduler = make_scheduler(monkeypatch)
     free_before = free_blocks(scheduler)
-    request = open_stream(scheduler, "s", 4, [TOKEN])
+    if admitted:
+        request = admission_request("s")
+        scheduler.admit_stream(request)
+    else:
+        request = open_stream(scheduler, "s", 4, [EOS])
+
     scheduler.add_request(close("s"))
 
-    scheduler.add_request(update("s", 4))
-    _, outputs = step(scheduler)
-
-    assert request.status == RequestStatus.FINISHED_ERROR
+    assert request.status == RequestStatus.FINISHED_STOPPED
     assert "s" not in scheduler.requests
+    assert num_rows(scheduler) == 0
     assert free_blocks(scheduler) == free_before
-    [output] = [o for o in outputs[0].outputs if o.request_id == "s"]
-    assert output.finish_reason == FinishReason.ERROR
-    assert output.error.code == "input_after_close"
 
 
-# @spec PSTATE-TURN-002 PSTATE-HIST-011
+# @spec PSTATE-TURN-003 PSTATE-FAIL-002
+@pytest.mark.parametrize(
+    ("opening", "then", "sampled", "finish_reason", "terminal"),
+    [
+        ({}, None, EOS, FinishReason.STOP, False),
+        ({}, "update", EOS, FinishReason.STOP, False),
+        ({}, "close", EOS, FinishReason.STOP, True),
+        ({}, "fold_past_limit", EOS, FinishReason.LENGTH, True),
+        ({"max_tokens": 1}, None, TOKEN, FinishReason.LENGTH, True),
+        ({"num_tokens": MAX_MODEL_LEN - 1}, None, TOKEN, FinishReason.LENGTH, True),
+        ({"stop_token_ids": [STOP_TOKEN]}, None, STOP_TOKEN, FinishReason.STOP, True),
+        ({}, "model_failure", TOKEN, FinishReason.ERROR, True),
+    ],
+    ids=[
+        "eos_parks",
+        "eos_folds",
+        "eos_before_close",
+        "rejected_fold",
+        "max_tokens",
+        "max_model_len",
+        "stop_token",
+        "model_failure",
+    ],
+)
+def test_finished_output_marks_whether_it_ends_the_stream(
+    monkeypatch, opening, then, sampled, finish_reason, terminal
+):
+    scheduler = make_scheduler(monkeypatch)
+    opening = dict(opening)
+    num_tokens = opening.pop("num_tokens", 4)
+    if then == "fold_past_limit":
+        open_stream(scheduler, "s", 20, [EOS])
+        scheduler.add_request(update("s", 10))
+        scheduler.add_request(update("s", 40))
+    else:
+        scheduler.add_request(stream_input("s", num_tokens, **opening))
+        if then == "update":
+            scheduler.add_request(update("s", 4))
+        elif then == "close":
+            scheduler.add_request(close("s"))
+    runner_kwargs = {"failed_req_ids": {"s"}} if then == "model_failure" else {}
+
+    _, outputs = step(scheduler, {"s": sampled}, **runner_kwargs)
+
+    output = finished_output(outputs, "s")
+    assert output.finish_reason == finish_reason
+    assert output.terminal is terminal
+    assert ("s" in scheduler.requests) is not terminal
+
+
+# @spec PSTATE-TURN-002
 @pytest.mark.parametrize(
     ("num_tokens", "request_kwargs", "tokens", "status"),
     [
@@ -545,7 +584,7 @@ def test_refused_update_leaves_request_unchanged(monkeypatch):
     assert request.num_computed_tokens == len(prompt)
 
 
-# @spec PSTATE-TURN-009 PSTATE-HIST-003
+# @spec PSTATE-TURN-009 PSTATE-HIST-003 PSTATE-HIST-001
 def test_position_limit_uses_compacted_length_for_model_without_positions(
     monkeypatch,
 ):
@@ -553,17 +592,20 @@ def test_position_limit_uses_compacted_length_for_model_without_positions(
         monkeypatch, facts={"persistent_state_reads_positions": False}
     )
     request = park_after_two_turns(scheduler)
+    assert request.position_offset == 0
 
     scheduler.add_request(update("s", 40))
 
     assert request.status == RequestStatus.WAITING
     assert len(request.prompt_token_ids) == 1 + 40
+    assert request.position_offset == 0
 
 
 # @spec PSTATE-TURN-009
 def test_position_limit_counts_full_length_for_hybrid_request(monkeypatch):
     scheduler = make_scheduler(monkeypatch, hybrid=True)
     request = park_after_two_turns(scheduler)
+    assert request.position_offset == 0
 
     scheduler.add_request(update("s", 40))
 
@@ -571,20 +613,22 @@ def test_position_limit_counts_full_length_for_hybrid_request(monkeypatch):
     assert "s" not in scheduler.requests
 
 
-# @spec PSTATE-TURN-010
+# @spec PSTATE-TURN-010 PSTATE-TURN-009
 @pytest.mark.parametrize(
-    ("reads_positions", "final_num_tokens"),
-    [(True, MAX_MODEL_LEN - 19), (False, MAX_MODEL_LEN)],
+    ("reads_positions", "position_offset", "final_num_tokens"),
+    [(True, 19, MAX_MODEL_LEN - 19), (False, 0, MAX_MODEL_LEN)],
     ids=["reads_positions", "ignores_positions"],
 )
-def test_decode_stops_at_position_limit(monkeypatch, reads_positions, final_num_tokens):
+def test_decode_stops_at_position_limit(
+    monkeypatch, reads_positions, position_offset, final_num_tokens
+):
     scheduler = make_scheduler(
         monkeypatch, facts={"persistent_state_reads_positions": reads_positions}
     )
     open_stream(scheduler, "s", 20, [EOS])
     request = scheduler.requests["s"]
     scheduler.add_request(update("s", 10))
-    assert request.position_offset == 19
+    assert request.position_offset == position_offset
 
     for _ in range(MAX_MODEL_LEN):
         if request.is_finished():
@@ -595,13 +639,31 @@ def test_decode_stops_at_position_limit(monkeypatch, reads_positions, final_num_
     assert request.num_tokens == final_num_tokens
 
 
-# @spec PSTATE-TURN-011
-def test_eos_at_position_limit_ends_state_stream(monkeypatch):
-    scheduler = make_scheduler(monkeypatch)
+# @spec PSTATE-TURN-011 PSTATE-TURN-008
+@pytest.mark.parametrize(
+    ("hybrid", "reads_positions", "continues"),
+    [(False, True, False), (False, False, True), (True, True, False)],
+    ids=["reads_positions", "ignores_positions", "hybrid"],
+)
+def test_eos_at_position_limit_parks_and_next_update_meets_the_limit(
+    monkeypatch, hybrid, reads_positions, continues
+):
+    scheduler = make_scheduler(
+        monkeypatch,
+        hybrid=hybrid,
+        facts={"persistent_state_reads_positions": reads_positions},
+    )
     request = open_stream(scheduler, "s", MAX_MODEL_LEN - 1, [EOS])
+    assert request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
 
-    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
-    assert "s" not in scheduler.requests
+    scheduler.add_request(update("s", 4))
+
+    if continues:
+        assert request.status == RequestStatus.WAITING
+        assert len(request.prompt_token_ids) == 1 + 4
+    else:
+        assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+        assert "s" not in scheduler.requests
 
 
 # @spec PSTATE-TURN-011
@@ -623,18 +685,19 @@ def test_eos_at_position_limit_keeps_upstream_order_for_single_request(
 
 
 # @spec PSTATE-TURN-014
-def test_continuation_needing_reprefill_of_hybrid_request_finishes_it(monkeypatch):
+def test_hybrid_request_keeps_full_history_on_fold(monkeypatch):
     scheduler = make_scheduler(monkeypatch, hybrid=True)
-    request = open_stream(scheduler, "s", 4, [EOS])
-    # A parked hybrid request cannot lose its computed tokens through any
-    # scheduler path, so the state a re-prefill would start from is set directly.
-    request.num_computed_tokens = 0
+    request = open_stream(scheduler, "s", 20, [TOKEN, EOS])
 
-    scheduler.add_request(update("s", 4))
+    scheduler.add_request(update("s", 10))
 
-    assert request.is_finished()
-    assert "s" not in scheduler.requests
-    assert not scheduler.schedule().scheduled_new_reqs
+    assert list(request.prompt_token_ids) == [0] * 20 + [TOKEN] + [0] * 10
+    assert request.num_computed_tokens == 21
+    assert request.position_offset == 0
+    assert len(request.block_hashes) == 1
+
+
+# Bounded history
 
 
 # @spec PSTATE-HIST-001
@@ -705,37 +768,23 @@ def test_fold_keeps_only_updates_features_relative_to_compacted_prompt(
     assert "opening-image" not in encoder_cache.request_hash_refs.get("s", {})
 
 
-# @spec PSTATE-HIST-006 PSTATE-HIST-007
-def test_pending_stream_inputs_default_to_eight(monkeypatch):
-    scheduler = make_scheduler(monkeypatch)
-
-    assert scheduler.scheduler_config.max_pending_stream_inputs == 8
-
-
 # @spec PSTATE-HIST-006
-def test_stream_queue_holds_the_bound_of_pending_inputs(monkeypatch):
+def test_scheduler_queues_stream_inputs_beyond_the_pending_bound(monkeypatch):
+    """`AsyncLLM` bounds pending inputs by backpressure; the scheduler ends no
+    stream for the length of its queue."""
     scheduler = make_scheduler(monkeypatch)
     request = open_stream(scheduler, "s", 4, [TOKEN])
     bound = scheduler.scheduler_config.max_pending_stream_inputs
 
-    for _ in range(bound):
+    for _ in range(bound + 2):
         scheduler.add_request(update("s", 4))
+    scheduler.add_request(close("s"))
 
-    assert len(request.streaming_queue) == bound
+    assert len(request.streaming_queue) == bound + 3
     assert not request.is_finished()
 
 
-# @spec PSTATE-HIST-009
-def test_hybrid_request_keeps_full_history_on_fold(monkeypatch):
-    scheduler = make_scheduler(monkeypatch, hybrid=True)
-    request = open_stream(scheduler, "s", 20, [TOKEN, EOS])
-
-    scheduler.add_request(update("s", 10))
-
-    assert list(request.prompt_token_ids) == [0] * 20 + [TOKEN] + [0] * 10
-    assert request.num_computed_tokens == 21
-    assert request.position_offset == 0
-    assert len(request.block_hashes) == 1
+# Admission
 
 
 # @spec PSTATE-ADMIT-002
@@ -752,11 +801,14 @@ def test_admitted_stream_is_a_parked_request_with_an_empty_prompt(monkeypatch):
     assert len(request.prompt_token_ids) == 0
 
 
-# @spec PSTATE-ADMIT-010
-def test_first_input_becomes_prompt_of_admitted_request(monkeypatch):
+# @spec PSTATE-ADMIT-002
+def test_first_input_becomes_prompt_and_moves_reservation_without_a_gap(
+    monkeypatch,
+):
     scheduler = make_scheduler(monkeypatch)
     request = admission_request("a")
     scheduler.admit_stream(request)
+    assert num_rows(scheduler) == 1
 
     scheduler.add_request(update("a", 6))
 
@@ -765,17 +817,6 @@ def test_first_input_becomes_prompt_of_admitted_request(monkeypatch):
     assert request.num_computed_tokens == 0
     assert request.position_offset == 0
     assert request.status == RequestStatus.WAITING
-
-
-# @spec PSTATE-ADMIT-003
-def test_first_input_moves_reservation_without_a_gap(monkeypatch):
-    scheduler = make_scheduler(monkeypatch)
-    request = admission_request("a")
-    scheduler.admit_stream(request)
-    assert num_rows(scheduler) == 1
-
-    scheduler.add_request(update("a", 6))
-
     assert scheduler.num_waiting_for_streaming_input == 0
     assert request in scheduler.resumed_streaming_sessions
     assert num_rows(scheduler) == 1
@@ -785,34 +826,6 @@ def test_first_input_moves_reservation_without_a_gap(monkeypatch):
     assert output.num_scheduled_tokens == {"a": 6}
     assert not scheduler.resumed_streaming_sessions
     assert num_rows(scheduler) == 1
-
-
-# @spec PSTATE-PAGE-007 PSTATE-ADMIT-010
-def test_admitted_stream_page_is_initialized_when_first_input_is_scheduled(
-    monkeypatch,
-):
-    scheduler = make_scheduler(monkeypatch)
-    scheduler.admit_stream(admission_request("a"))
-    idle, _ = step(scheduler)
-    scheduler.add_request(update("a", 6))
-
-    first, _ = step(scheduler)
-
-    assert not idle.num_scheduled_tokens
-    assert first.new_state_page_req_ids == {"a"}
-
-
-# @spec PSTATE-ADMIT-005 PSTATE-PAGE-004
-def test_never_fed_admitted_stream_retires_without_a_page(monkeypatch):
-    scheduler = make_scheduler(monkeypatch)
-    free_before = free_blocks(scheduler)
-    scheduler.admit_stream(admission_request("a"))
-
-    scheduler.finish_requests("a", RequestStatus.FINISHED_ABORTED)
-
-    assert "a" not in scheduler.requests
-    assert scheduler.num_waiting_for_streaming_input == 0
-    assert free_blocks(scheduler) == free_before
 
 
 def _hold_row(scheduler, kind: str, req_id: str) -> None:
@@ -847,6 +860,9 @@ def test_admission_counts_running_parked_and_resumed_rows(monkeypatch, first, se
     scheduler.finish_requests("a", RequestStatus.FINISHED_ABORTED)
 
     assert scheduler.admit_stream(admission_request("c")) is None
+
+
+# Per-request failure and terminal precedence
 
 
 # @spec PSTATE-FAIL-002 PSTATE-ADMIT-014
@@ -889,19 +905,6 @@ def test_reported_failure_finishes_parked_stream(monkeypatch):
     assert scheduler.requests["running"].status == RequestStatus.RUNNING
 
 
-# @spec PSTATE-FAIL-003
-def test_failure_for_request_not_held_is_ignored(monkeypatch):
-    scheduler = make_scheduler(monkeypatch)
-    gone = open_stream(scheduler, "gone", 4, [TOKEN])
-    scheduler.finish_requests("gone", RequestStatus.FINISHED_ABORTED)
-    scheduler.add_request(stream_input("held", 4))
-
-    step(scheduler, failed_req_ids={"gone", "never-existed"})
-
-    assert gone.status == RequestStatus.FINISHED_ABORTED
-    assert list(scheduler.requests["held"].output_token_ids) == [TOKEN]
-
-
 # @spec PSTATE-ADMIT-014
 def test_abort_ahead_of_failure_report_fixes_aborted_outcome(monkeypatch):
     scheduler = make_scheduler(monkeypatch)
@@ -931,6 +934,9 @@ def test_abort_after_failure_keeps_error_outcome(monkeypatch):
     scheduler.finish_requests("s", RequestStatus.FINISHED_ABORTED)
 
     assert request.status == RequestStatus.FINISHED_ERROR
+
+
+# Ordinary models
 
 
 # @spec PSTATE-DECL-013
@@ -963,3 +969,16 @@ def test_ordinary_stream_parks_on_eos_at_max_model_len():
     request = open_stream(scheduler, "s", MAX_MODEL_LEN - 1, [EOS])
 
     assert request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+
+
+# @spec PSTATE-DECL-013
+def test_ordinary_stream_closed_while_parked_is_aborted_without_output():
+    scheduler = create_scheduler()
+    request = open_stream(scheduler, "s", 4, [EOS])
+
+    scheduler.add_request(stream_input("s", 4, resumable=False))
+    _, outputs = step(scheduler)
+
+    assert request.status == RequestStatus.FINISHED_ABORTED
+    assert "s" not in scheduler.requests
+    assert not any(o.request_id == "s" for eco in outputs.values() for o in eco.outputs)

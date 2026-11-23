@@ -230,9 +230,7 @@ class StubPersistentStateForCausalLM(
     """See the module docstring."""
 
     persistent_state_reads_positions = True
-    persistent_state_parks_on_eos = True
     persistent_state_accepts_synthetic_warmup = True
-    persistent_state_ignores_stopped_row_echoes = False
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
