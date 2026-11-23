@@ -2099,7 +2099,8 @@ class EngineCoreProc(EngineCore):
                 "Unrecognized input request type encountered: %s", request_type
             )
 
-    def _reject_add_in_shutdown(self, request: Request) -> bool:
+    # @spec PSTATE-ADMIT-022
+    def _reject_add_in_shutdown(self, request: Request | EngineCoreRequest) -> bool:
         if self.shutdown_state == EngineShutdownState.RUNNING:
             return False
 
@@ -2107,7 +2108,7 @@ class EngineCoreProc(EngineCore):
             "[shutdown] EngineCore: rejecting new request request_id=%s",
             request.request_id,
         )
-        # @spec PSTATE-ADMIT-022: other continuations were dropped already.
+        # Other continuations were dropped already.
         state = self.scheduler.has_unrecomputable_state
         if state and self.scheduler.has_request(request.request_id):
             self._end_held_stream(request.request_id, RequestStatus.FINISHED_ABORTED)
@@ -2120,7 +2121,7 @@ class EngineCoreProc(EngineCore):
             )
         return True
 
-    def _drop_unknown_continuation(self, request: Request) -> bool:
+    def _drop_unknown_continuation(self, request: Request | EngineCoreRequest) -> bool:
         """Drop an input of a persistent-state stream core no longer holds,
         or whose id names a held single request."""
         # @spec PSTATE-TURN-006
@@ -2214,12 +2215,13 @@ class EngineCoreProc(EngineCore):
         if scheduler.has_request(req_id):
             self._end_held_stream(req_id, RequestStatus.FINISHED_ERROR)
             return
+        # A single request keeps upstream's rejection output.
         self._send_finish_outputs_to_client(
             [req_id],
             request.client_index,
             FinishReason.ERROR,
             error,
-            True,
+            request.resumable,
             mm_cache_miss_hashes,
         )
 
@@ -2606,7 +2608,10 @@ class EngineCoreProc(EngineCore):
             message="Multi-modal processor cache miss.",
             retryable=True,
         )
-        if self._route_stream_input_rejection(request, error, list(err.mm_hashes)):
+        stream_input = request.continuation or request.resumable
+        if stream_input and self._route_stream_input_rejection(
+            request, error, list(err.mm_hashes)
+        ):
             return
         self.output_queue.put_nowait(
             (
@@ -2677,9 +2682,7 @@ class EngineCoreProc(EngineCore):
         """Hand a rejected input of a persistent-state stream to the core
         loop, which ends the stream it holds after freeing it."""
         # @spec PSTATE-PAGE-004
-        route = request.continuation or (
-            request.resumable and self.scheduler.has_unrecomputable_state
-        )
+        route = request.continuation or self.scheduler.has_unrecomputable_state
         if route:
             self.input_queue.put_nowait(
                 (

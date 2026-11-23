@@ -2121,6 +2121,45 @@ def test_rejected_opener_of_a_new_stream_gets_a_terminal_error(monkeypatch):
     assert output.error is not None and output.error.code == "validation_error"
 
 
+# @spec PSTATE-ADMIT-022
+def test_rejected_continuation_during_shutdown_ends_its_stream_as_an_abort(
+    monkeypatch,
+):
+    core, free_pages = _live_core(monkeypatch)
+    held = _hold_kind(core, "parked")
+    core.shutdown_state = EngineShutdownState.REQUESTED
+
+    _reject(
+        core,
+        _core_request("s", [1], resumable=True, continuation=True, client_index=1),
+    )
+
+    assert held.status == RequestStatus.FINISHED_ABORTED
+    _assert_ended_after_free(core, free_pages, FinishReason.ABORT)
+
+
+# @spec PSTATE-ADMIT-022 PSTATE-ADMIT-021
+def test_rejected_single_request_for_a_held_stream_id_ends_the_stream(monkeypatch):
+    core, free_pages = _live_core(monkeypatch)
+    held = _hold_kind(core, "parked")
+
+    _reject(core, _core_request("s", [1], client_index=1))
+
+    assert held.status == RequestStatus.FINISHED_ERROR
+    _assert_ended_after_free(core, free_pages, FinishReason.ERROR)
+
+
+# @spec PSTATE-ADMIT-022 PSTATE-DECL-013
+def test_rejected_single_request_keeps_the_upstream_output(monkeypatch):
+    core, _ = _live_core(monkeypatch)
+
+    _reject(core, _core_request("single", [1], client_index=1))
+
+    _, output, _, _ = _only_output(core)
+    assert (output.finish_reason, output.terminal) == (FinishReason.ERROR, False)
+    assert output.error is not None and output.error.code == "validation_error"
+
+
 # @spec PSTATE-DECL-013
 def test_ordinary_model_streams_open_without_admission_at_capacity(monkeypatch):
     core, _ = _live_core(monkeypatch, ordinary=True, max_num_seqs=1)

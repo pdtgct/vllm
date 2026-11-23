@@ -162,6 +162,16 @@ class SchedulerInterface(ABC):
         parked, or return the refusal reason having changed nothing."""
         raise NotImplementedError
 
+    def open_stream(self, request: "Request") -> str | None:
+        """Admit a persistent-state stream opened by an input instead of
+        `admit_stream`, with that input as its first, or return the refusal
+        reason having changed nothing."""
+        raise NotImplementedError
+
+    def holds_stream(self, request_id: str) -> bool:
+        """Whether `request_id` names a held persistent-state stream."""
+        raise NotImplementedError
+
     def held_state_requests(self) -> Iterable[str]:
         """Ids of the persistent-state requests held."""
         raise NotImplementedError
