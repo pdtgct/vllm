@@ -59,11 +59,12 @@ STATE_FACTS = {
     "has_persistent_state": True,
     "persistent_state_reads_positions": True,
     "persistent_state_accepts_synthetic_warmup": True,
+    "persistent_state_resumable_stops": frozenset({"eos"}),
 }
 """The `SupportsPersistentState` defaults, as `ModelConfig` exposes them."""
 
 
-def declare_state_facts(monkeypatch: pytest.MonkeyPatch, **facts: bool) -> None:
+def declare_state_facts(monkeypatch: pytest.MonkeyPatch, **facts: object) -> None:
     """Make `ModelConfig` describe a state model, with `facts` overriding the
     protocol defaults."""
     for name, value in {**STATE_FACTS, **facts}.items():
@@ -75,7 +76,7 @@ def make_scheduler(
     *,
     hybrid: bool = False,
     max_num_seqs: int = 2,
-    facts: dict[str, bool] | None = None,
+    facts: dict[str, object] | None = None,
     **kwargs,
 ):
     declare_state_facts(monkeypatch, **(facts or {}))
@@ -740,6 +741,98 @@ def test_eos_at_position_limit_keeps_upstream_order_for_single_request(
     request = open_stream(scheduler, "s", MAX_MODEL_LEN - 1, [EOS], resumable=False)
 
     assert request.status == RequestStatus.FINISHED_STOPPED
+
+
+DUPLEX_FACTS = {"persistent_state_resumable_stops": frozenset({"eos", "max_tokens"})}
+"""A model that also declares its per-turn `max_tokens` stop resumable."""
+
+
+# @spec PSTATE-TURN-012 PSTATE-TURN-001 PSTATE-TURN-003
+def test_declared_max_tokens_stop_parks_state_stream(monkeypatch):
+    scheduler = make_scheduler(monkeypatch, facts=DUPLEX_FACTS)
+    request = stream_input("s", 4, max_tokens=1)
+    scheduler.add_request(request)
+
+    _, outputs = step(scheduler, {"s": TOKEN})
+
+    assert request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    assert any(scheduler.kv_cache_manager.get_block_ids("s"))
+    output = finished_output(outputs, "s")
+    assert (output.finish_reason, output.terminal) == (FinishReason.LENGTH, False)
+
+
+# @spec PSTATE-TURN-012 PSTATE-TURN-001 PSTATE-HIST-001
+def test_declared_max_tokens_stop_folds_one_frame_per_turn(monkeypatch):
+    """One token per frame: each input folds at the previous frame's stop, and
+    history stays one frontier token plus the frame."""
+    scheduler = make_scheduler(monkeypatch, facts=DUPLEX_FACTS)
+    request = open_stream(scheduler, "s", 2, [], max_tokens=1)
+    for _ in range(3):
+        scheduler.add_request(update("s", 2, max_tokens=1))
+
+    for _ in range(3):
+        run_turn(scheduler, "s", [TOKEN])
+        assert request.status == RequestStatus.WAITING
+        assert len(request.prompt_token_ids) == 1 + 2
+    run_turn(scheduler, "s", [TOKEN])
+
+    assert request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+
+
+# @spec PSTATE-TURN-012 PSTATE-TURN-002
+def test_undeclared_max_tokens_stop_ends_state_stream(monkeypatch):
+    scheduler = make_scheduler(monkeypatch)
+    request = open_stream(scheduler, "s", 4, [TOKEN], max_tokens=1)
+
+    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert "s" not in scheduler.requests
+
+
+# @spec PSTATE-TURN-012 PSTATE-TURN-002
+def test_max_tokens_stop_at_the_position_limit_ends_state_stream(monkeypatch):
+    scheduler = make_scheduler(monkeypatch, facts=DUPLEX_FACTS)
+    request = open_stream(scheduler, "s", MAX_MODEL_LEN - 1, [TOKEN], max_tokens=1)
+
+    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert "s" not in scheduler.requests
+
+
+# @spec PSTATE-TURN-012
+def test_model_declaring_only_max_tokens_ends_on_eos(monkeypatch):
+    scheduler = make_scheduler(
+        monkeypatch,
+        facts={"persistent_state_resumable_stops": frozenset({"max_tokens"})},
+    )
+    request = open_stream(scheduler, "s", 4, [EOS])
+
+    assert request.status == RequestStatus.FINISHED_STOPPED
+    assert "s" not in scheduler.requests
+
+
+# @spec PSTATE-TURN-015 PSTATE-TURN-012
+@pytest.mark.parametrize(
+    ("parked", "status"),
+    [
+        (False, RequestStatus.FINISHED_LENGTH_CAPPED),
+        (True, RequestStatus.FINISHED_STOPPED),
+    ],
+    ids=["queued_close", "parked_close"],
+)
+def test_close_after_max_tokens_stop_takes_its_status_from_where_it_waits(
+    monkeypatch, parked, status
+):
+    scheduler = make_scheduler(monkeypatch, facts=DUPLEX_FACTS)
+    request = stream_input("s", 4, max_tokens=1)
+    scheduler.add_request(request)
+    if not parked:
+        scheduler.add_request(close("s"))
+
+    run_turn(scheduler, "s", [TOKEN])
+    if parked:
+        scheduler.add_request(close("s"))
+
+    assert request.status == status
+    assert "s" not in scheduler.requests
 
 
 # @spec PSTATE-TURN-014

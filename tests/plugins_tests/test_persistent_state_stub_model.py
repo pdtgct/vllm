@@ -25,6 +25,7 @@ from vllm.config import ModelConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.protocol import StreamingInput
 from vllm.inputs import TokensPrompt
+from vllm.model_executor.models.registry import _ModelInfo
 from vllm.plugins import load_general_plugins
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine.async_llm import AsyncLLM
@@ -98,8 +99,8 @@ def _in_process_llm(arch: str = STUB_ARCH, **kwargs) -> Iterator[LLM]:
 @pytest.mark.parametrize(
     ("arch", "declared"),
     [
-        (STUB_ARCH, (True, True)),
-        (NO_WARMUP_ARCH, (False, False)),
+        (STUB_ARCH, (True, True, frozenset({"eos"}))),
+        (NO_WARMUP_ARCH, (False, False, frozenset({"eos"}))),
     ],
 )
 def test_model_config_exposes_the_state_declarations(arch, declared):
@@ -112,7 +113,24 @@ def test_model_config_exposes_the_state_declarations(arch, declared):
     assert (
         config.persistent_state_reads_positions,
         config.persistent_state_accepts_synthetic_warmup,
+        config.persistent_state_resumable_stops,
     ) == declared
+
+
+class _DuplexStub(stub.StubPersistentStateForCausalLM):
+    persistent_state_resumable_stops = frozenset({"eos", "max_tokens"})
+
+
+class _UnknownStopStub(stub.StubPersistentStateForCausalLM):
+    persistent_state_resumable_stops = frozenset({"eos", "stop_token"})
+
+
+# @spec PSTATE-DECL-004
+def test_resumable_stops_take_a_declared_subset_and_refuse_others():
+    info = _ModelInfo.from_model_cls(_DuplexStub)
+    assert info.persistent_state_resumable_stops == frozenset({"eos", "max_tokens"})
+    with pytest.raises(ValueError, match="persistent_state_resumable_stops"):
+        _ModelInfo.from_model_cls(_UnknownStopStub)
 
 
 def _stub_layer_spec(**hf_config):

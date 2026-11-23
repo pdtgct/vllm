@@ -92,7 +92,7 @@ def _turn_end(
     )
 
 
-# @spec PSTATE-TURN-003
+# @spec PSTATE-TURN-016
 def test_terminal_finish_ends_the_stream_instead_of_starting_the_next_turn():
     processor = _processor()
     queue = _open(processor)
@@ -116,7 +116,7 @@ def _admit(processor: OutputProcessor) -> StreamingInputOutputCollector:
     return queue
 
 
-# @spec PSTATE-TURN-003 PSTATE-TURN-015
+# @spec PSTATE-TURN-016 PSTATE-TURN-015
 @pytest.mark.parametrize("opening", ["parked", "admitted"])
 def test_close_of_a_parked_stream_waits_for_the_terminal_output(opening):
     """The output processor synthesizes no completion for a state stream; the
@@ -141,7 +141,7 @@ def test_close_of_a_parked_stream_waits_for_the_terminal_output(opening):
     assert output is not STREAM_FINISHED and output.finished is True
 
 
-# @spec PSTATE-TURN-003
+# @spec PSTATE-TURN-016
 def test_eos_boundary_in_flight_when_the_close_is_sent_stays_a_boundary():
     """The close can reach the frontend before core applies it: the turn end
     that core marks resumable keeps the stream, and core's terminal output
@@ -305,7 +305,7 @@ def test_output_processor_sets_no_bound_of_its_own():
     ]
 
 
-# @spec PSTATE-TURN-003 PSTATE-HIST-006
+# @spec PSTATE-TURN-016 PSTATE-HIST-006
 def test_terminal_output_is_delivered_behind_undelivered_turns_and_drops_inputs():
     processor = _processor()
     queue = _open(processor)

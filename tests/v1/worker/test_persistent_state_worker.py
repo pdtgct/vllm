@@ -83,7 +83,7 @@ def test_mamba_spec_initial_values_default_to_none():
 
 
 # @spec PSTATE-DECL-004
-def test_state_model_declares_two_facts_with_their_defaults():
+def test_state_model_declares_three_facts_with_their_defaults():
     declared = {
         name: getattr(SupportsPersistentState, name)
         for name in dir(SupportsPersistentState)
@@ -92,6 +92,7 @@ def test_state_model_declares_two_facts_with_their_defaults():
     assert declared == {
         "persistent_state_reads_positions": True,
         "persistent_state_accepts_synthetic_warmup": True,
+        "persistent_state_resumable_stops": frozenset({"eos"}),
     }
 
 
@@ -834,7 +835,7 @@ def _measured(turn: int) -> bool:
     return turn % MEASURE_EVERY == MEASURE_EVERY - 1
 
 
-# @spec PSTATE-HIST-008
+# @spec PSTATE-HIST-008 PSTATE-HIST-009
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("backing", ["tensor", "array"])
 def test_retained_bytes_counts_the_whole_buffer_behind_a_view(backing):
@@ -846,7 +847,7 @@ def test_retained_bytes_counts_the_whole_buffer_behind_a_view(backing):
     assert retained_bytes(view) >= 1 << 16
 
 
-# @spec PSTATE-HIST-008
+# @spec PSTATE-HIST-008 PSTATE-HIST-009
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("leak", ["growing_buffer", "one_token_a_turn"])
 def test_bound_check_detects_a_planted_leak(leak):
@@ -882,7 +883,7 @@ def _chunk(prompt: list[int]) -> EngineCoreRequest:
     )
 
 
-# @spec PSTATE-HIST-008
+# @spec PSTATE-HIST-009
 @pytest.mark.cpu_test
 def test_output_processor_history_stays_bounded_over_many_turns():
     """With a real tokenizer, so the detokenizer's tail is measured too. The

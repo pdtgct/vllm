@@ -524,7 +524,7 @@ async def _consume(llm: AsyncLLM, chunks, params: SamplingParams | None = None):
     return await asyncio.wait_for(consume(), WATCHDOG)
 
 
-# @spec PSTATE-ADMIT-001
+# @spec PSTATE-ADMIT-020
 @pytest.mark.asyncio
 async def test_state_stream_is_admitted_before_its_inputs_are_read(monkeypatch):
     llm = _state_llm(monkeypatch)
@@ -547,7 +547,7 @@ async def test_state_stream_is_admitted_before_its_inputs_are_read(monkeypatch):
     assert {request.request_id for request in _sent(llm)} == {collector.request_id}
 
 
-# @spec PSTATE-ADMIT-001 PSTATE-ADMIT-017
+# @spec PSTATE-ADMIT-020 PSTATE-ADMIT-017
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reason", ["engine_paused", "active_limit"])
 async def test_refused_admission_raises_before_reading_input(monkeypatch, reason):
@@ -565,7 +565,7 @@ async def test_refused_admission_raises_before_reading_input(monkeypatch, reason
     assert llm.output_processor.get_num_unfinished_requests() == 0
 
 
-# @spec PSTATE-ADMIT-001 PSTATE-DECL-013
+# @spec PSTATE-ADMIT-020 PSTATE-DECL-013
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["single_request", "ordinary_stream"])
 async def test_single_requests_and_ordinary_streams_open_without_admission(
@@ -643,7 +643,7 @@ async def test_every_input_after_admission_carries_continuation(monkeypatch):
     ]
 
 
-# @spec PSTATE-TURN-006
+# @spec PSTATE-TURN-017
 @pytest.mark.asyncio
 async def test_inputs_after_the_stream_ended_are_not_forwarded(monkeypatch):
     llm = _state_llm(monkeypatch)
@@ -940,7 +940,7 @@ async def test_credit_returns_once_the_consumer_receives_the_turn_end(monkeypatc
     assert _sent_prompts(llm) == [[1], [2], [3]]
 
 
-# @spec PSTATE-HIST-006 PSTATE-TURN-015
+# @spec PSTATE-HIST-006 PSTATE-TURN-018
 @pytest.mark.asyncio
 async def test_stream_closes_and_ends_with_its_only_credit_held(monkeypatch):
     """The close and the terminal output take no credit."""
@@ -1598,3 +1598,296 @@ def test_sleep_level_zero_is_allowed_while_a_stream_is_held(monkeypatch, kind, m
     assert core.scheduler.has_request("held-1")
     assert _free_pages(core.scheduler) == free_pages
     core.model_executor.sleep.assert_not_called()
+
+
+# Engine-core guards that hold for every client
+
+
+def _only_output(core: EngineCoreProc):
+    [published] = core.output_queue.published
+    return published
+
+
+def _assert_ended_after_free(core, free_pages, finish_reason, code=None):
+    client_index, output, held, free_at_publish = _only_output(core)
+    assert (client_index, output.finish_reason, output.terminal) == (
+        1,
+        finish_reason,
+        True,
+    )
+    assert not held
+    assert free_at_publish == free_pages
+    if code is not None:
+        assert output.error is not None and output.error.code == code
+    return output
+
+
+def _hold_kind(core: EngineCoreProc, kind: str):
+    """Hold the state stream `s`: admitted with no input, waiting with its
+    first input, or parked after a turn."""
+    if kind == "waiting":
+        request = _stream_request("s")
+        core.scheduler.add_request(request)
+        return request
+    return _hold(core, kind)
+
+
+HOLD_KINDS = ["admitted", "waiting", "parked"]
+
+
+def _abort_from_input_queue(core: EngineCoreProc) -> None:
+    core._handle_client_request(EngineCoreRequestType.ABORT, ["s"])
+
+
+def _abort_from_eager_queue(core: EngineCoreProc) -> None:
+    core.aborts_queue.put_nowait(["s"])
+    core._process_aborts_queue()
+
+
+# @spec PSTATE-TURN-003 PSTATE-PAGE-004
+@pytest.mark.parametrize("kind", HOLD_KINDS)
+@pytest.mark.parametrize(
+    "abort",
+    [_abort_from_input_queue, _abort_from_eager_queue],
+    ids=["input_queue", "eager_queue"],
+)
+def test_explicit_abort_publishes_the_stream_end_after_freeing_it(
+    monkeypatch, kind, abort
+):
+    core, free_pages = _live_core(monkeypatch)
+    request = _hold_kind(core, kind)
+
+    abort(core)
+    abort(core)
+
+    assert request.status == RequestStatus.FINISHED_ABORTED
+    _assert_ended_after_free(core, free_pages, FinishReason.ABORT)
+
+
+# @spec PSTATE-TURN-003 PSTATE-DECL-013
+@pytest.mark.parametrize("ordinary", [False, True], ids=["single_request", "ordinary"])
+def test_abort_of_a_single_request_or_an_ordinary_stream_publishes_nothing(
+    monkeypatch, ordinary
+):
+    core, _ = _live_core(monkeypatch, ordinary=ordinary)
+    core.scheduler.add_request(_stream_request("s", resumable=ordinary))
+
+    _abort_from_input_queue(core)
+
+    assert not core.scheduler.has_request("s")
+    assert core.output_queue.published == []
+
+
+def _no_tokens(request):
+    request.prompt_token_ids = []
+    request._all_token_ids.clear()
+    request.num_prompt_tokens = 0
+    return request
+
+
+def _with_embeddings(request):
+    request.prompt_embeds = torch.zeros(len(request.prompt_token_ids), 4)
+    return request
+
+
+def _with_structured_outputs(request):
+    request.sampling_params = SamplingParams(
+        max_tokens=4,
+        output_kind=DELTA,
+        structured_outputs=StructuredOutputsParams(regex="a+"),
+    )
+    return request
+
+
+INAPPLICABLE = {
+    "no_tokens": _no_tokens,
+    "embeddings": _with_embeddings,
+    "structured_outputs": _with_structured_outputs,
+}
+
+
+# @spec PSTATE-TURN-019 PSTATE-PAGE-004
+@pytest.mark.parametrize("kind", HOLD_KINDS)
+@pytest.mark.parametrize("make", INAPPLICABLE.values(), ids=INAPPLICABLE.keys())
+def test_inapplicable_continuation_ends_its_stream_with_a_validation_error(
+    monkeypatch, kind, make
+):
+    core, free_pages = _live_core(monkeypatch)
+    request = _hold_kind(core, kind)
+
+    _add(core, make(_update("s", 2)))
+
+    assert request.status == RequestStatus.FINISHED_ERROR
+    _assert_ended_after_free(core, free_pages, FinishReason.ERROR, "validation_error")
+
+
+# @spec PSTATE-TURN-019
+@pytest.mark.parametrize("make", INAPPLICABLE.values(), ids=INAPPLICABLE.keys())
+def test_inapplicable_opener_creates_no_request(monkeypatch, make):
+    core, free_pages = _live_core(monkeypatch)
+
+    _add(core, make(_stream_request("s", 2)))
+
+    assert not core.scheduler.has_request("s")
+    _assert_ended_after_free(core, free_pages, FinishReason.ERROR, "validation_error")
+
+
+# @spec PSTATE-TURN-019
+def test_feature_only_input_with_tokens_is_applied(monkeypatch):
+    """After preprocessing a feature occupies placeholder token positions, so
+    such an input has tokens and joins the stream."""
+    core, _ = _live_core(monkeypatch)
+    request = _park(core.scheduler, "s")
+
+    _add(core, _update("s", 3))
+
+    assert request.status == RequestStatus.WAITING
+    assert core.output_queue.published == []
+
+
+# @spec PSTATE-TURN-019 PSTATE-ADMIT-022
+def test_admit_stream_refuses_structured_outputs(monkeypatch):
+    core, _ = _live_core(monkeypatch)
+    admission = _admission()
+    admission.sampling_params = SamplingParams(
+        max_tokens=4,
+        output_kind=DELTA,
+        structured_outputs=StructuredOutputsParams(regex="a+"),
+    )
+
+    assert core.admit_stream(admission) == "validation_error"
+
+    assert not core.scheduler.has_request("s")
+    assert core.output_queue.published == []
+
+
+# @spec PSTATE-TURN-006
+@pytest.mark.parametrize("make_input", [_update, _close], ids=["input", "close"])
+def test_continuation_naming_a_held_single_request_is_dropped(monkeypatch, make_input):
+    core, _ = _live_core(monkeypatch)
+    single = _stream_request("s", resumable=False)
+    core.scheduler.add_request(single)
+
+    _add(core, make_input())
+
+    assert core.scheduler.requests["s"] is single
+    assert single.status == RequestStatus.WAITING
+    assert core.output_queue.published == []
+
+
+# @spec PSTATE-ADMIT-021 PSTATE-PAGE-004
+@pytest.mark.parametrize("kind", [*HOLD_KINDS, "single_request"])
+def test_opener_for_a_held_id_ends_the_held_request(monkeypatch, kind):
+    core, free_pages = _live_core(monkeypatch)
+    if kind == "single_request":
+        held = _stream_request("s", resumable=False)
+        core.scheduler.add_request(held)
+    else:
+        held = _hold_kind(core, kind)
+
+    _add(core, _stream_request("s", 2))
+
+    assert held.status == RequestStatus.FINISHED_ERROR
+    assert not core.scheduler.has_request("s")
+    _assert_ended_after_free(core, free_pages, FinishReason.ERROR)
+
+
+# @spec PSTATE-ADMIT-021 PSTATE-ADMIT-022
+@pytest.mark.parametrize("paused", [False, True], ids=["running", "paused"])
+def test_admit_stream_for_a_held_id_ends_the_held_stream(monkeypatch, paused):
+    core, free_pages = _live_core(monkeypatch)
+    held = _hold_kind(core, "parked")
+    if paused:
+        _admit_paused(core)
+
+    assert core.admit_stream(_admission()) == "duplicate_request_id"
+
+    assert held.status == RequestStatus.FINISHED_ERROR
+    _assert_ended_after_free(core, free_pages, FinishReason.ERROR)
+
+
+# @spec PSTATE-ADMIT-018 PSTATE-ADMIT-002
+def test_unadmitted_opener_is_admitted_and_runs_its_input(monkeypatch):
+    core, _ = _live_core(monkeypatch)
+    opener = _stream_request("s", 3)
+
+    _add(core, opener)
+
+    held = core.scheduler.requests["s"]
+    assert held.status == RequestStatus.WAITING
+    assert held in core.scheduler.resumed_streaming_sessions
+    assert len(held.prompt_token_ids) == 3
+    assert (held.num_computed_tokens, held.position_offset) == (0, 0)
+    assert core.output_queue.published == []
+    assert "s" in core.scheduler.schedule().num_scheduled_tokens
+
+
+# @spec PSTATE-ADMIT-018 PSTATE-ADMIT-004
+def test_second_unadmitted_opener_beyond_the_active_limit_is_refused(monkeypatch):
+    """The first opener reserves its row on arrival, so a second one that
+    arrives before any step is refused."""
+    core, _ = _live_core(monkeypatch, max_num_seqs=1)
+
+    _add(core, _stream_request("a", 3))
+    _add(core, _stream_request("b", 3))
+
+    assert core.scheduler.has_request("a")
+    assert not core.scheduler.has_request("b")
+    client_index, output, held, _ = _only_output(core)
+    assert (output.request_id, output.finish_reason, output.terminal) == (
+        "b",
+        FinishReason.ERROR,
+        True,
+    )
+    assert (output.error.code, output.error.retryable) == ("active_limit", True)
+    assert not held
+
+
+# @spec PSTATE-ADMIT-018 PSTATE-ADMIT-022
+def test_unadmitted_opener_while_paused_is_refused_terminally(monkeypatch):
+    core, _ = _live_core(monkeypatch)
+    _admit_paused(core)
+    core.reject_new_requests = True
+
+    _add(core, _stream_request("s", 3))
+
+    assert not core.scheduler.has_request("s")
+    _, output, _, _ = _only_output(core)
+    assert (output.finish_reason, output.terminal) == (FinishReason.ERROR, True)
+    assert (output.error.code, output.error.retryable) == ("engine_paused", True)
+
+
+# @spec PSTATE-ADMIT-022 PSTATE-PAGE-004
+@pytest.mark.parametrize(
+    ("held_kind", "make_input", "finish_reason"),
+    [
+        (None, lambda: _stream_request("s", 3), FinishReason.ABORT),
+        ("parked", lambda: _stream_request("s", 3), FinishReason.ABORT),
+        ("parked", _update, FinishReason.ABORT),
+        ("parked", lambda: _no_tokens(_update("s", 2)), FinishReason.ABORT),
+    ],
+    ids=["opener", "opener_for_held_id", "continuation", "inapplicable_continuation"],
+)
+def test_shutdown_rejects_each_add_with_one_terminal_output(
+    monkeypatch, held_kind, make_input, finish_reason
+):
+    core, free_pages = _live_core(monkeypatch)
+    if held_kind is not None:
+        _hold_kind(core, held_kind)
+    core.shutdown_state = EngineShutdownState.REQUESTED
+
+    _add(core, make_input())
+
+    assert not core.scheduler.has_request("s")
+    _assert_ended_after_free(core, free_pages, finish_reason)
+
+
+# @spec PSTATE-ADMIT-022
+def test_inapplicable_opener_for_a_held_id_publishes_one_output(monkeypatch):
+    core, free_pages = _live_core(monkeypatch)
+    held = _hold_kind(core, "parked")
+
+    _add(core, _no_tokens(_stream_request("s", 2)))
+
+    assert held.status == RequestStatus.FINISHED_ERROR
+    _assert_ended_after_free(core, free_pages, FinishReason.ERROR)
