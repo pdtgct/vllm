@@ -766,9 +766,14 @@ def _validate_structured_outputs_in_place(llm: AsyncLLM) -> None:
     process_inputs = llm.input_processor.process_inputs.side_effect
 
     def validating(*, params, **kwargs):
-        if params.structured_outputs is not None:
-            params.structured_outputs._backend = "xgrammar"
-            params.structured_outputs._backend_was_auto = True
+        so = params.structured_outputs
+        if so is not None:
+            so._backend = "xgrammar"
+            so._backend_was_auto = True
+            if so.choice:
+                # xgrammar validation rewrites choices into a grammar.
+                so.grammar = "root ::= " + " | ".join(f'"{c}"' for c in so.choice)
+                so.choice = None
         return process_inputs(params=params, **kwargs)
 
     llm.input_processor.process_inputs.side_effect = validating
@@ -776,38 +781,47 @@ def _validate_structured_outputs_in_place(llm: AsyncLLM) -> None:
 
 # @spec PSTATE-DECL-007 PSTATE-TURN-020
 @pytest.mark.asyncio
-@pytest.mark.parametrize("case", ["same", "opener_object", "changed"])
+@pytest.mark.parametrize(
+    "case", ["same", "same_choice", "reused_choice", "opener_object", "changed"]
+)
 async def test_state_stream_keeps_its_structured_outputs(monkeypatch, case):
     llm = _state_llm(monkeypatch)
     _validate_structured_outputs_in_place(llm)
-    opener = _params(structured_outputs=StructuredOutputsParams(regex="a+"))
+
+    def constraint():
+        if case in ("same_choice", "reused_choice"):
+            return StructuredOutputsParams(choice=["yes", "no"])
+        return StructuredOutputsParams(regex="a+")
+
+    opener = _params(structured_outputs=constraint())
     if case == "opener_object":
         later = opener
     else:
         # Constructed apart from the opener's and not yet validated.
         later = _params(
-            structured_outputs=StructuredOutputsParams(
-                regex="b+" if case == "changed" else "a+"
-            )
+            structured_outputs=StructuredOutputsParams(regex="b+")
+            if case == "changed"
+            else constraint()
         )
     update = StreamingInput(
         prompt=TokensPrompt(prompt_token_ids=[2]), sampling_params=later
     )
+    # A reused continuation is validated in place by its first input.
+    updates = [update, update] if case == "reused_choice" else [update]
 
     if case == "changed":
         with pytest.raises(VLLMValidationError, match="structured_outputs"):
             await _consume(llm, _chunks([1], update), opener)
         assert _sent_prompts(llm) == [[1]]
     else:
-        await _open(llm, _chunks([1], update), opener)
-        await _until(lambda: len(_sent(llm)) == 3, "two inputs and the close")
-        assert all(
-            same_structured_outputs(
-                r.sampling_params.structured_outputs,
-                StructuredOutputsParams(regex="a+"),
-            )
-            for r in _sent(llm)[:2]
+        await _open(llm, _chunks([1], *updates), opener)
+        num_inputs = 1 + len(updates)
+        await _until(lambda: len(_sent(llm)) == num_inputs + 1, "inputs and close")
+        # Every input carries the opener's constraint as validation left it.
+        first, *rest = (
+            r.sampling_params.structured_outputs for r in _sent(llm)[:num_inputs]
         )
+        assert all(same_structured_outputs(first, so) for so in rest)
 
 
 REFUSED_SAMPLING_PARAMETERS = [

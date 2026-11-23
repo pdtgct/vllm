@@ -701,9 +701,10 @@ class AsyncLLM(EngineClient):
             kv_hints=kv_hints,
         )
 
-        # Validation below rewrites structured outputs in place, so inputs
-        # are compared with the caller's constraint, copied first.
-        opener = sampling_params
+        # Validation rewrites structured outputs in place (xgrammar turns
+        # choices into a grammar), so an input matches the stream when its
+        # constraint equals the opener's as the caller set it, copied here,
+        # or as validated, for parameters an earlier input already carried.
         opener_structured_outputs = (
             copy(sampling_params.structured_outputs)
             if isinstance(sampling_params, SamplingParams)
@@ -720,6 +721,12 @@ class AsyncLLM(EngineClient):
             prompt=TokensPrompt(prompt_token_ids=[0]),
             params=sampling_params,
             **inputs,  # type: ignore[arg-type]
+        )
+        opener_constraints = (
+            opener_structured_outputs,
+            sampling_params.structured_outputs
+            if isinstance(sampling_params, SamplingParams)
+            else None,
         )
         if state_stream:
             # @spec PSTATE-ADMIT-006
@@ -769,12 +776,9 @@ class AsyncLLM(EngineClient):
                         if state_stream:
                             self._validate_state_stream_input(sp)
                             # @spec PSTATE-DECL-007 PSTATE-TURN-020
-                            if (
-                                isinstance(sp, SamplingParams)
-                                and sp is not opener
-                                and not same_structured_outputs(
-                                    sp.structured_outputs, opener_structured_outputs
-                                )
+                            if isinstance(sp, SamplingParams) and not any(
+                                same_structured_outputs(sp.structured_outputs, so)
+                                for so in opener_constraints
                             ):
                                 raise VLLMValidationError(
                                     "structured_outputs cannot change within a stream",
