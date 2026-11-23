@@ -802,6 +802,10 @@ SLACK = 1024
 capacity of a container holding the same content varies by up to one deque
 block (64 slots). A leak of one token a turn passes it within a few hundred
 turns."""
+EARLY_ALLOWANCE = 8 * SLACK
+"""Bytes a structure may exceed its first walk by before its reference window
+ends: the first turns fill the detokenizer tail and vary the input and output
+lengths, each a few hundred bytes at most."""
 MAX_INPUT = 24
 MAX_OUTPUT = 8
 MAX_PENDING = 8
@@ -823,13 +827,14 @@ def _check_bounded(sizes: dict[str, list[int]]) -> None:
     never on the number of turns."""
     for name, structure_sizes in sizes.items():
         reference = max(structure_sizes[WARMUP_SAMPLES : WARMUP_SAMPLES + WINDOW])
-        # Nor may any walk up to the window's end outgrow the first cycle of
-        # turns, so a structure that grows early and then levels off fails.
-        first_cycle = max(structure_sizes[:WINDOW])
-        early = max(structure_sizes[WINDOW : WARMUP_SAMPLES + WINDOW])
-        assert early <= first_cycle + SLACK, (
+        # Nor may any walk up to the window's end outgrow the first walk, taken
+        # with the queues already full, by more than the content allowance, so
+        # a structure that grows early and then shrinks or levels off fails.
+        early = max(structure_sizes[: WARMUP_SAMPLES + WINDOW])
+        assert early <= structure_sizes[0] + EARLY_ALLOWANCE, (
             f"{name} retained {early} bytes before its reference window ended, "
-            f"over {first_cycle} bytes in its first {WINDOW} turns plus {SLACK}"
+            f"over {structure_sizes[0]} bytes at its first walk plus "
+            f"{EARLY_ALLOWANCE}"
         )
         later = structure_sizes[WARMUP_SAMPLES + WINDOW :]
         assert later, f"{name} has no walk after its reference window"
@@ -874,6 +879,21 @@ def test_bound_check_detects_a_planted_leak(leak):
             sizes.append(retained_bytes(kept))
 
     with pytest.raises(AssertionError, match="retained"):
+        _check_bounded({"planted": sizes})
+
+
+# @spec PSTATE-HIST-008 PSTATE-HIST-009
+@pytest.mark.cpu_test
+def test_bound_check_detects_early_growth_that_is_later_released():
+    """A view whose backing buffer grows 8 KiB a turn through the first cycle
+    and is released afterwards."""
+    sizes = []
+    for turn in range(NUM_TURNS):
+        held = 8192 * (turn + 1) if turn < WINDOW else 0
+        backing = torch.zeros(held + 1, dtype=torch.uint8)
+        sizes.append(retained_bytes([backing[:1]]))
+
+    with pytest.raises(AssertionError, match="before its reference window"):
         _check_bounded({"planted": sizes})
 
 
