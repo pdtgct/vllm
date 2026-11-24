@@ -141,6 +141,9 @@ class InputStreamError(Exception):
 class AsyncLLM(EngineClient):
     """An asynchronous wrapper for the vLLM engine."""
 
+    # The model declares `SupportsPersistentState`; set from the model config.
+    persistent_state: bool = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,

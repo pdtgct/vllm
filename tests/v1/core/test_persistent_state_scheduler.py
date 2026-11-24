@@ -375,7 +375,9 @@ def test_waiting_loop_holds_state_request_with_a_step_in_flight(monkeypatch):
     scheduler = make_scheduler(monkeypatch, async_scheduling=True)
     request = open_stream(scheduler, "s", 4, [EOS])
     scheduler.add_request(update("s", 4))
-    assert request in scheduler.waiting
+    # A resumed request still holds its pages, so it waits in the queue the
+    # waiting loop drains first.
+    assert request in scheduler.kv_holding_waiting
     request.num_in_flight_tokens = 1
 
     assert "s" not in scheduler.schedule().num_scheduled_tokens
@@ -1032,17 +1034,35 @@ def test_fold_keeps_only_updates_features_relative_to_compacted_prompt(
     assert [f.identifier for f in request.mm_features] == ["update-image"]
     assert request.mm_features[0].mm_position.offset == 1 + 2
 
+    # The scheduler drops a request's reference to an encoder input in the same
+    # `schedule()` that covers its placeholder, so record what it allocates.
+    encoder_cache = scheduler.encoder_cache_manager
+    allocated: list[tuple[str, int, str, set[int], set[str]]] = []
+    allocate = encoder_cache.allocate
+
+    def recording_allocate(alloc_request, input_id):
+        allocate(alloc_request, input_id)
+        allocated.append(
+            (
+                alloc_request.request_id,
+                input_id,
+                alloc_request.mm_features[input_id].identifier,
+                set(encoder_cache.get_cached_input_ids(alloc_request)),
+                set(encoder_cache.request_hash_refs[alloc_request.request_id]),
+            )
+        )
+
+    monkeypatch.setattr(encoder_cache, "allocate", recording_allocate)
+
     output = scheduler.schedule()
 
     # The update's image is the request's only encoder input, at its rebased
     # offset inside the compacted prompt.
     assert output.num_scheduled_tokens == {"s": 1 + 10 - 1}
     assert output.scheduled_encoder_inputs == {"s": [0]}
-    encoder_cache = scheduler.encoder_cache_manager
-    assert encoder_cache.get_cached_input_ids(request) == {0}
-    assert encoder_cache.cached["update-image"] == {"s"}
+    assert allocated == [("s", 0, "update-image", {0}, {"update-image"})]
     assert "s" not in encoder_cache.cached.get("opening-image", set())
-    assert set(encoder_cache.request_hash_refs["s"]) == {"update-image"}
+    assert "opening-image" not in encoder_cache.request_hash_refs.get("s", {})
 
 
 # @spec PSTATE-HIST-006

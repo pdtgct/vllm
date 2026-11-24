@@ -2849,8 +2849,8 @@ def test_scheduler_reset_prefix_cache():
 
 def test_unrecomputable_state_is_never_preempted():
     """With state that can't be recomputed, the scheduler starts only when the
-    pool holds every active request at `max_model_len`, and a cache reset
-    leaves running requests alone."""
+    pool holds every active request at `max_model_len`, and a reset of running
+    requests is refused, naming them, and leaves them alone."""
 
     def make_scheduler(num_blocks: int) -> Scheduler:
         spec = AttentionSpec(
@@ -2875,7 +2875,9 @@ def test_unrecomputable_state_is_never_preempted():
         scheduler.add_request(request)
     scheduler.schedule()
 
-    assert not scheduler.reset_prefix_cache(reset_running_requests=True)
+    # @spec PSTATE-PRES-004
+    with pytest.raises(RuntimeError, match="state requests are held: 0, 1"):
+        scheduler.reset_prefix_cache(reset_running_requests=True)
     assert scheduler.running == requests
 
 

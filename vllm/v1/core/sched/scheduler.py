@@ -2112,7 +2112,9 @@ class Scheduler(SchedulerInterface):
         del session._all_token_ids[:num_dropped]
         del session.prompt_token_ids[:num_dropped]
         session.block_hashes.clear()
-        session.position_offset += num_dropped
+        if self.state_reads_positions:
+            # @spec PSTATE-TURN-009: positions continue past the dropped tokens.
+            session.position_offset += num_dropped
         session.num_computed_tokens = 1
         if session.mm_features:
             self.encoder_cache_manager.free(session)

@@ -74,6 +74,7 @@ from vllm.v1.engine.core import (
 )
 from vllm.v1.engine.core_client import InprocClient
 from vllm.v1.engine.exceptions import EngineDeadError, StreamAdmissionError
+from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, MambaSpec
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
@@ -367,6 +368,8 @@ def _state_llm(
     engine_core.get_output_async = get_output_async
     input_processor = MagicMock()
     input_processor.process_inputs.side_effect = _request_from
+    # The real id assignment, which sets `external_req_id` as serving does.
+    input_processor.assign_request_id.side_effect = InputProcessor.assign_request_id
     input_processor.process_inputs_async = AsyncMock(
         side_effect=lambda request_id, prompt, params, **kwargs: _request_from(
             request_id=request_id, prompt=prompt, params=params, **kwargs
@@ -1293,6 +1296,17 @@ class _PublishLog(queue.Queue):
         super().put_nowait(item)
 
 
+def _run_until_idle(core: EngineCoreProc, max_steps: int = 8) -> None:
+    """Step the scheduler as the busy loop does until the engine core has no
+    work, then run the callbacks that a pending pause or sleep registered."""
+    for _ in range(max_steps):
+        if not core.has_work():
+            break
+        core.scheduler.schedule()
+    assert not core.has_work()
+    core._notify_idle_state_callbacks()
+
+
 def _live_core(
     monkeypatch: pytest.MonkeyPatch, ordinary: bool = False, **scheduler_kwargs
 ):
@@ -1665,6 +1679,8 @@ def test_abort_mode_frees_every_request_before_the_operation(monkeypatch, operat
         core.sleep(level=1, mode="abort")
     else:
         assert core.checkpoint_prepare("abort") is None
+    _run_until_idle(core)
+    if operation == "checkpoint_prepare":
         assert core._checkpoint_state == CheckpointState.PREPARED
 
     expected = {"pause": "reset", "sleep": "sleep", "checkpoint_prepare": "discard"}
