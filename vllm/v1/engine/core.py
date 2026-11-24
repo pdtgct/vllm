@@ -1059,6 +1059,9 @@ class EngineCore:
         # reset_connector=True so external connectors clear alongside
         # local caches, matching the pause_generation(clear_cache=True)
         # contract. No-op when no connector is configured.
+        # A held state request refuses the reset however running requests
+        # are treated, since the reset discards its pages.
+        self._refuse_while_state_held("reset caches", streams_only=False)
         if not self.reset_prefix_cache(
             reset_running_requests=reset_running_requests,
             reset_connector=reset_connector,

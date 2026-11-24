@@ -1037,7 +1037,7 @@ def test_fold_keeps_only_updates_features_relative_to_compacted_prompt(
     # The scheduler drops a request's reference to an encoder input in the same
     # `schedule()` that covers its placeholder, so record what it allocates.
     encoder_cache = scheduler.encoder_cache_manager
-    allocated: list[tuple[str, int, str, set[int], set[str]]] = []
+    allocated: list[tuple[str, int, str, set[int], set[str], set[str]]] = []
     allocate = encoder_cache.allocate
 
     def recording_allocate(alloc_request, input_id):
@@ -1049,6 +1049,7 @@ def test_fold_keeps_only_updates_features_relative_to_compacted_prompt(
                 alloc_request.mm_features[input_id].identifier,
                 set(encoder_cache.get_cached_input_ids(alloc_request)),
                 set(encoder_cache.request_hash_refs[alloc_request.request_id]),
+                set(encoder_cache.cached["update-image"]),
             )
         )
 
@@ -1060,7 +1061,7 @@ def test_fold_keeps_only_updates_features_relative_to_compacted_prompt(
     # offset inside the compacted prompt.
     assert output.num_scheduled_tokens == {"s": 1 + 10 - 1}
     assert output.scheduled_encoder_inputs == {"s": [0]}
-    assert allocated == [("s", 0, "update-image", {0}, {"update-image"})]
+    assert allocated == [("s", 0, "update-image", {0}, {"update-image"}, {"s"})]
     assert "s" not in encoder_cache.cached.get("opening-image", set())
     assert "opening-image" not in encoder_cache.request_hash_refs.get("s", {})
 

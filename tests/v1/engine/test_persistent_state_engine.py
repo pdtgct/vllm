@@ -1581,6 +1581,9 @@ HELD_REQUESTS = [*HELD_STREAMS, "single_request"]
 
 KEEP_MODE_OPERATIONS = {
     "reset_caches": lambda core: core._reset_caches(),
+    "reset_caches_keeping_running": lambda core: core._reset_caches(
+        reset_running_requests=False
+    ),
     "release_kv_cache_memory": lambda core: core.release_kv_cache_memory(),
     "pause": lambda core: core.pause_scheduler(mode="keep", clear_cache=True),
     "sleep": lambda core: core.sleep(level=1, mode="keep"),
