@@ -201,6 +201,7 @@ from vllm.v1.worker.utils import (
     StatePageInitializer,
     clear_layer_kv_caches,
     copy_kv_cache_blocks_inplace,
+    get_state_group_layouts,
     get_uniform_decode_token_count,
 )
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
@@ -891,6 +892,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.kv_caches = [
             cache for cache in kv_caches_dict.values() if cache.device == self.device
         ]
+        # @spec PSTATE-PREP-009
+        self.model_state._state_group_layouts = get_state_group_layouts(
+            self.kv_cache_config, self.compilation_config.static_forward_context
+        )
         self.model_state.initialize_kv_cache(self.kv_cache_config, self.block_tables)
         self.replayssm_block_copy_tensors = get_replayssm_block_copy_tensors(
             self.compilation_config.static_forward_context

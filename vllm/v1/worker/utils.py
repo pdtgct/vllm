@@ -5,6 +5,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from itertools import product as iprod
+from types import MappingProxyType
 from typing import Any
 
 import numpy as np
@@ -300,6 +301,59 @@ class StatePageInitializer:
             idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
             for state, value in self._pages_by_group[group_id]:
                 state.index_fill_(0, idx, value)
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class StateComponentLayout:
+    """One component of a state layer: `tensor` holds one page per block id
+    along its first dimension, the view the layer itself reads."""
+
+    tensor: torch.Tensor
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.tensor.dtype
+
+    @property
+    def page_shape(self) -> tuple[int, ...]:
+        return tuple(self.tensor.shape[1:])
+
+    @property
+    def page_stride(self) -> int:
+        """Elements of `dtype` from one page to the next."""
+        return self.tensor.stride(0)
+
+    def page(self, block_id: int) -> torch.Tensor:
+        return self.tensor[block_id]
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class StateGroupLayout:
+    """The pages of one state group: for each layer, its components in the
+    order of its spec's `shapes`. Valid until the runner next binds or
+    releases the KV cache."""
+
+    group_id: int
+    layers: Mapping[str, tuple[StateComponentLayout, ...]]
+
+
+def get_state_group_layouts(
+    kv_cache_config: KVCacheConfig, static_forward_context: dict[str, Any]
+) -> tuple[StateGroupLayout, ...]:
+    """The layout of each non-recomputable group's bound KV cache views."""
+    layouts = []
+    for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+        if group.manager_config.recomputable:
+            continue
+        layers = {
+            layer_name: tuple(
+                StateComponentLayout(state)
+                for state in static_forward_context[layer_name].kv_cache
+            )
+            for layer_name in group.kv_cache_specs
+        }
+        layouts.append(StateGroupLayout(group_id, MappingProxyType(layers)))
+    return tuple(layouts)
 
 
 @dataclass(eq=False, slots=True)

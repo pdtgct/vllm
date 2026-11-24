@@ -1184,6 +1184,7 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
         runner.model_state._mamba_ctx = None
     if hasattr(runner, "kv_caches"):
         runner.kv_caches.clear()
+    runner.model_state._state_group_layouts = ()
     if hasattr(runner, "attn_groups"):
         runner.attn_groups.clear()
     if hasattr(runner, "kv_cache_config"):

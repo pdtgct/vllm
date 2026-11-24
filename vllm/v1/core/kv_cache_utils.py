@@ -1084,11 +1084,11 @@ def verify_persistent_state_groups(
     """Refuse a configuration whose `SupportsPersistentState` declaration and
     state groups (manager config not recomputable) disagree, or whose state
     group spec is not a `PERSISTENT_STATE` `MambaSpec` with one initial value
-    per shape."""
+    per shape and a block spanning `max_model_len`."""
     # @spec PSTATE-DECL-003 PSTATE-DECL-009
     state_groups = [
-        group
-        for group in kv_cache_config.kv_cache_groups
+        (group_id, group)
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
         if not group.manager_config.recomputable
     ]
     if vllm_config.model_config.has_persistent_state != bool(state_groups):
@@ -1097,7 +1097,8 @@ def verify_persistent_state_groups(
             "group holds state that cannot be recomputed "
             "(ManagerConfig.recomputable=False)."
         )
-    for group in state_groups:
+    max_model_len = vllm_config.model_config.max_model_len
+    for group_id, group in state_groups:
         for layer_name, spec in group.kv_cache_specs.items():
             if (
                 not isinstance(spec, MambaSpec)
@@ -1113,6 +1114,14 @@ def verify_persistent_state_groups(
                 raise ValueError(
                     f"State layer {layer_name}: {len(spec.initial_values)} "
                     f"initial_values for {len(spec.shapes)} state shapes"
+                )
+            # @spec PSTATE-DECL-015 PSTATE-PRES-009: one page holds a state
+            # request for its whole length.
+            if spec.block_size < max_model_len:
+                raise ValueError(
+                    f"State group {group_id} (layer {layer_name}) has block_size "
+                    f"{spec.block_size}, below max_model_len {max_model_len}; a "
+                    "state group needs a block_size of at least max_model_len"
                 )
 
 

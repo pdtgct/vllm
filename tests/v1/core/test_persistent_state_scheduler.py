@@ -7,6 +7,8 @@ scheduler fixtures below hold one state group, or one attention group and one
 state group for a hybrid model.
 """
 
+import math
+
 import pytest
 import torch
 
@@ -40,8 +42,9 @@ REPEATS = RepetitionDetectionParams(max_pattern_size=1, min_count=2)
 
 
 def state_layer() -> KVCacheLayerConfig:
+    """One page holds a request for its whole length (PSTATE-DECL-015)."""
     spec = MambaSpec(
-        block_size=BLOCK_SIZE,
+        block_size=MAX_MODEL_LEN,
         shapes=((1,),),
         dtypes=(torch.int64,),
         mamba_type=MambaAttentionBackendEnum.PERSISTENT_STATE,
@@ -90,7 +93,7 @@ def make_scheduler(
     return create_scheduler(
         max_num_seqs=max_num_seqs,
         max_model_len=MAX_MODEL_LEN,
-        block_size=BLOCK_SIZE,
+        block_size=math.lcm(BLOCK_SIZE, MAX_MODEL_LEN),
         **kwargs,
     )
 
@@ -346,6 +349,118 @@ def test_reused_page_is_fresh_for_its_new_owner(monkeypatch):
 
     assert scheduler.kv_cache_manager.get_block_ids("new") == old_blocks
     assert new_request_data(output, "new").num_computed_tokens == 0
+
+
+# Fixed page address
+
+
+def state_pages(scheduler, req_id: str) -> list[list[int]]:
+    """The block ids `req_id` holds in each state group."""
+    block_ids = scheduler.kv_cache_manager.get_block_ids(req_id)
+    return [
+        list(block_ids[group_id])
+        for group_id, group in enumerate(scheduler.kv_cache_config.kv_cache_groups)
+        if not group.manager_config.recomputable
+    ]
+
+
+def sent_state_pages(scheduler, output, req_id: str) -> list[list[int]] | None:
+    """The state-group block ids one step sends the worker for `req_id`: all
+    of them for a newly scheduled row, the appended ones for a running row."""
+    groups = [
+        group_id
+        for group_id, group in enumerate(scheduler.kv_cache_config.kv_cache_groups)
+        if not group.manager_config.recomputable
+    ]
+    if any(r.req_id == req_id for r in output.scheduled_new_reqs):
+        block_ids = new_request_data(output, req_id).block_ids
+        return [list(block_ids[g]) for g in groups]
+    cached = output.scheduled_cached_reqs
+    if req_id not in cached.req_ids:
+        return None
+    new_block_ids = cached.new_block_ids[cached.req_ids.index(req_id)]
+    if new_block_ids is None:
+        return [[] for _ in groups]
+    return [list(new_block_ids[g]) for g in groups]
+
+
+# @spec PSTATE-PRES-009 PSTATE-ACC-008
+@pytest.mark.parametrize("hybrid", [False, True], ids=["state", "hybrid"])
+def test_state_page_keeps_its_block_id_across_turns_parks_folds_and_compaction(
+    monkeypatch, hybrid
+):
+    """The worker never sees another page for a held stream: each resumed turn
+    carries the first turn's state block ids, and no step appends one."""
+    scheduler = make_scheduler(monkeypatch, hybrid=hybrid)
+    request = stream_input("s", 20)
+    scheduler.add_request(request)
+    first, _ = step(scheduler, {"s": TOKEN})
+    pages = state_pages(scheduler, "s")
+    assert sent_state_pages(scheduler, first, "s") == pages
+    assert all(len(group_pages) == 1 for group_pages in pages)
+
+    def check(output) -> None:
+        sent = sent_state_pages(scheduler, output, "s")
+        assert sent in (None, pages, [[] for _ in pages])
+        assert state_pages(scheduler, "s") == pages
+
+    # A park, idle steps while parked, then a resume that compacts.
+    check(step(scheduler, {"s": EOS})[0])
+    assert request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    for _ in range(2):
+        check(step(scheduler)[0])
+    scheduler.add_request(update("s", 10))
+    resumed, _ = step(scheduler, {"s": TOKEN})
+    assert sent_state_pages(scheduler, resumed, "s") == pages
+    check(resumed)
+
+    # A fold of an input queued before the stop, then a second fold.
+    for num_tokens in (5, 3):
+        scheduler.add_request(update("s", num_tokens))
+        check(step(scheduler, {"s": EOS})[0])
+        folded, _ = step(scheduler, {"s": TOKEN})
+        assert sent_state_pages(scheduler, folded, "s") == pages
+        check(folded)
+    assert request.status == RequestStatus.RUNNING
+    if not hybrid:
+        assert request.position_offset > 0
+
+
+# @spec PSTATE-PRES-009 PSTATE-ACC-008
+@pytest.mark.parametrize("ending", ["close", "abort"])
+def test_state_page_goes_to_another_request_only_after_terminal_finish(
+    monkeypatch, ending
+):
+    """With one page in the pool, a waiting request gets it neither while the
+    stream runs nor while it is parked or folds, only once the stream ends."""
+    scheduler = make_scheduler(monkeypatch, max_num_seqs=1, num_blocks=2)
+    open_stream(scheduler, "s", 4, [TOKEN])
+    pages = state_pages(scheduler, "s")
+    scheduler.add_request(stream_input("other", 4, resumable=False))
+
+    def assert_not_handed_over(output) -> None:
+        assert "other" not in output.num_scheduled_tokens
+        assert scheduler.kv_cache_manager.get_block_ids("other") == ([],)
+        assert state_pages(scheduler, "s") == pages
+
+    assert_not_handed_over(step(scheduler, {"s": EOS})[0])
+    assert_not_handed_over(step(scheduler)[0])
+    scheduler.add_request(update("s", 2))
+    assert_not_handed_over(step(scheduler, {"s": TOKEN})[0])
+    scheduler.add_request(update("s", 3))
+    assert_not_handed_over(step(scheduler, {"s": EOS})[0])
+    assert_not_handed_over(step(scheduler, {"s": EOS})[0])
+    assert scheduler.requests["s"].status == RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    if ending == "close":
+        scheduler.add_request(close("s"))
+    else:
+        scheduler.finish_requests("s", RequestStatus.FINISHED_ABORTED)
+    assert "s" not in scheduler.requests
+
+    output, _ = step(scheduler)
+    assert "other" in output.num_scheduled_tokens
+    assert state_pages(scheduler, "other") == pages
 
 
 # Per-request barrier

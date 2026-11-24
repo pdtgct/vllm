@@ -22,7 +22,7 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.encoder_runner import EncoderRunner
 from vllm.v1.worker.gpu.states import RequestState
-from vllm.v1.worker.utils import AttentionGroup
+from vllm.v1.worker.utils import AttentionGroup, StateGroupLayout
 
 
 class ModelSpecificAttnMetadata:
@@ -47,6 +47,8 @@ class ModelState(ABC):
     """Whether the positions this state prepares depend on encoder outputs.
     Only the first PP stage runs the encoder, so later stages take the
     positions from it."""
+
+    _state_group_layouts: tuple[StateGroupLayout, ...] = ()
 
     def __init__(
         self,
@@ -99,6 +101,21 @@ class ModelState(ABC):
                     and observability_config.enable_mm_processor_stats
                 ),
             )
+
+    @property
+    def state_group_layouts(self) -> tuple[StateGroupLayout, ...]:
+        """The pages of each state group; empty for a model without one.
+
+        The runner sets it once it binds the KV cache, before
+        `initialize_kv_cache` and `capture_cudagraphs`, and clears it when it
+        releases that cache. Read it in those hooks and keep only what a
+        graph needs: a layout and its tensors are valid only until the next
+        bind or release, so do not retain them past `clear_cudagraphs` or
+        `shutdown`. A held request's page keeps its block id and address
+        until the request's terminal finish, so a graph may address it by
+        block id.
+        """
+        return self._state_group_layouts
 
     @property
     def max_model_len(self) -> int:

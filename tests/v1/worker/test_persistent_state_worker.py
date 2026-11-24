@@ -3,6 +3,7 @@
 """Worker, model-state and bounded-history behaviour of persistent state."""
 
 import contextlib
+import dataclasses
 import gc
 import sys
 import types
@@ -14,6 +15,7 @@ import numpy as np
 import pytest
 import torch
 
+import vllm.v1.worker.gpu.cudagraph_utils as cudagraph_utils
 import vllm.v1.worker.gpu.model_runner as model_runner_module
 from tests.v1.attention.test_mamba_metadata_builder import _make_vllm_config
 from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
@@ -51,7 +53,7 @@ from vllm.v1.worker.gpu import warmup
 from vllm.v1.worker.gpu.input_batch import prepare_pos_seq_lens
 from vllm.v1.worker.gpu.model_runner import ExecuteModelState, GPUModelRunner
 from vllm.v1.worker.gpu.model_states.interface import ModelState
-from vllm.v1.worker.utils import StatePageInitializer
+from vllm.v1.worker.utils import StatePageInitializer, get_state_group_layouts
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA"
@@ -178,6 +180,127 @@ def test_initializer_is_none_without_a_state_group():
         torch.device("cpu"), kv_cache_config, {}
     )
     assert initializer is None
+
+
+# State-group layout
+
+
+def _strided_state_groups():
+    """A state group whose layer's two components are views into one
+    interleaved buffer, as when components share a page, beside an ordinary
+    group the layout must skip."""
+    layer = MambaManager.layer_config(_state_spec(), recomputable=False)
+    kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[
+            new_kv_cache_group(["m"], _state_spec()),
+            new_kv_cache_group(["s"], layer),
+        ]
+    )
+    buffer = torch.arange(12, dtype=torch.int64).view(4, 3)
+    components = [buffer[:, 0:1], buffer[:, 1:2]]
+    context = {"s": SimpleNamespace(kv_cache=components)}
+    return kv_cache_config, context, buffer, components
+
+
+# @spec PSTATE-PREP-009
+def test_layout_gives_each_components_tensor_dtype_page_shape_and_stride():
+    kv_cache_config, context, buffer, components = _strided_state_groups()
+
+    [layout] = get_state_group_layouts(kv_cache_config, context)
+
+    assert layout.group_id == 1
+    assert list(layout.layers) == ["s"]
+    for component, tensor in zip(layout.layers["s"], components, strict=True):
+        assert component.tensor is tensor
+        assert component.dtype == torch.int64
+        assert component.page_shape == (1,)
+        assert component.page_stride == 3
+
+
+# @spec PSTATE-PREP-009
+def test_layout_addresses_a_page_by_block_id():
+    kv_cache_config, context, buffer, _ = _strided_state_groups()
+    [layout] = get_state_group_layouts(kv_cache_config, context)
+
+    total, count = layout.layers["s"]
+    item = buffer.element_size()
+    assert total.page(2).data_ptr() == buffer.data_ptr() + 2 * 3 * item
+    assert count.page(2).data_ptr() == buffer.data_ptr() + (2 * 3 + 1) * item
+    count.page(2).fill_(-1)
+    assert buffer[:, 1].tolist() == [1, 4, -1, 10]
+
+
+# @spec PSTATE-PREP-009
+def test_layout_cannot_be_changed_through_the_accessor():
+    kv_cache_config, context, _, _ = _strided_state_groups()
+    [layout] = get_state_group_layouts(kv_cache_config, context)
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        layout.group_id = 0  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        layout.layers["s"] = ()  # type: ignore[index]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        layout.layers["s"][0].tensor = torch.zeros(1)  # type: ignore[misc]
+
+
+# @spec PSTATE-PREP-009
+def test_layout_is_empty_without_a_state_group():
+    kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[new_kv_cache_group(["m"], _state_spec())]
+    )
+    assert get_state_group_layouts(kv_cache_config, {}) == ()
+    assert _bare_model_state().state_group_layouts == ()
+
+
+class _MinimalModelState(ModelState):
+    def prepare_inputs_embeds(self, *args, **kwargs):
+        return None
+
+    def prepare_inputs(self, *args, **kwargs):
+        return {}
+
+    def prepare_dummy_inputs(self, *args, **kwargs):
+        return {}
+
+    def prepare_attn(self, *args, **kwargs):
+        return {}
+
+
+def _bare_model_state() -> ModelState:
+    state = _MinimalModelState.__new__(_MinimalModelState)
+    state.supports_mm_inputs = False
+    return state
+
+
+# @spec PSTATE-PREP-009
+def test_model_state_cannot_replace_its_layout():
+    with pytest.raises(AttributeError):
+        _bare_model_state().state_group_layouts = ()  # type: ignore[misc]
+
+
+# @spec PSTATE-PREP-009
+def test_profiling_teardown_drops_the_layout_of_the_profiling_cache(monkeypatch):
+    """The layout holds the profiling KV cache's views, so the teardown that
+    releases that cache drops it too."""
+    kv_cache_config, context, _, _ = _strided_state_groups()
+    state = _bare_model_state()
+    state._state_group_layouts = get_state_group_layouts(kv_cache_config, context)
+    runner: Any = GPUModelRunner.__new__(GPUModelRunner)
+    runner.compilation_config = SimpleNamespace(static_forward_context={})
+    runner.model_state = state
+    runner.cache_config = SimpleNamespace(num_gpu_blocks=1)
+    runner.kv_caches = []
+    runner.attn_groups = []
+    runner.kv_cache_config = SimpleNamespace()
+    runner.cudagraph_manager = object()
+    runner.lora_config = None
+    runner.maybe_remove_all_loras = lambda _: None
+    monkeypatch.setattr(cudagraph_utils.torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(cudagraph_utils.torch.accelerator, "empty_cache", lambda: None)
+
+    cudagraph_utils._teardown_profiling_state(runner)
+
+    assert state.state_group_layouts == ()
 
 
 # @spec PSTATE-PREP-005

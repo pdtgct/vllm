@@ -21,6 +21,10 @@ The model reads these `hf_overrides` entries:
 `StubModelState` records its hook calls in `EVENTS` (readable only where the
 engine runs in the test's process), and reports a request whose prompt holds
 `FAIL_TOKEN` as failed after its first step.
+
+The state update breaks a breakable CUDA graph capture and runs eagerly, as a
+model's state kernel does, so a piecewise graph reads each replayed batch's
+metadata.
 """
 
 from collections.abc import Sequence
@@ -28,6 +32,7 @@ from collections.abc import Sequence
 import torch
 import torch.nn as nn
 
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.abstract import MambaBase
@@ -53,6 +58,23 @@ EVENTS: list[tuple] = []
 
 PREFILL_STARTS: list[int] = []
 """The state sum each prefill row starts from, recorded in eager forwards."""
+
+PAGES: dict[str, list[tuple[int, tuple[int, ...], int]]] = {}
+"""Per request id, each time the model state takes the request (once per
+turn): the state block id, the addresses of its components' pages read
+through `state_group_layouts`, and the turn's `position_offset`, which
+compaction raises."""
+
+PROMPTS: dict[str, tuple[int, ...]] = {}
+"""Per request id, the prompt of its first turn."""
+
+LAYOUTS_AT_CAPTURE: list[tuple] = []
+"""(profile_only, `describe_layouts(state_group_layouts)`) at each
+`capture_cudagraphs` call."""
+
+FORWARDS: list[tuple[int, int]] = []
+"""(decode rows, prefill rows) of each model forward that ran eagerly with
+metadata for the state layer; a replayed graph runs no Python forward."""
 
 EOS_TOKEN_ID = 2
 
@@ -99,6 +121,26 @@ def without_eos(token_ids: Sequence[int]) -> list[int]:
     return token_ids
 
 
+def describe_layouts(layouts) -> tuple:
+    """The state-group layouts as plain values, which hold no tensor."""
+    return tuple(
+        (
+            layout.group_id,
+            tuple(
+                (
+                    name,
+                    tuple(
+                        (c.tensor.data_ptr(), c.dtype, c.page_shape, c.page_stride)
+                        for c in components
+                    ),
+                )
+                for name, components in layout.layers.items()
+            ),
+        )
+        for layout in layouts
+    )
+
+
 class StubStateLayer(MambaBase, nn.Module):
     @property
     def mamba_type(self) -> MambaAttentionBackendEnum:
@@ -136,10 +178,16 @@ class StubStateLayer(MambaBase, nn.Module):
         """Add each request's tokens to its sum, and return the token to emit
         at each request's last position."""
         out = torch.zeros(input_ids.shape[0], 1, device=input_ids.device)
+        _update_stub_state(input_ids, positions, out, self.prefix)
+        return out
+
+    def update(
+        self, input_ids: torch.Tensor, positions: torch.Tensor | None, out: torch.Tensor
+    ) -> None:
         attn_metadata = get_forward_context().attn_metadata
         # Warm-up runs carry no metadata for this layer.
         if not isinstance(attn_metadata, dict) or self.prefix not in attn_metadata:
-            return out
+            return
         metadata = attn_metadata[self.prefix]
         assert isinstance(metadata, BaseMambaAttentionMetadata)
         totals = self.kv_cache[0][:, 0]
@@ -183,7 +231,17 @@ class StubStateLayer(MambaBase, nn.Module):
             out[last, 0] = emit(totals[slots] + offsets[last], self.vocab_size).to(
                 out.dtype
             )
-        return out
+
+
+@eager_break_during_capture
+def _update_stub_state(
+    input_ids: torch.Tensor,
+    positions: torch.Tensor | None,
+    out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    layer = get_forward_context().no_compile_layers[layer_name]
+    layer.update(input_ids, positions, out)
 
 
 class StubModelState(MambaHybridModelState):
@@ -197,6 +255,20 @@ class StubModelState(MambaHybridModelState):
     def add_request(self, req_index, new_req_data) -> None:
         super().add_request(req_index, new_req_data)
         EVENTS.append(("add", new_req_data.req_id))
+        for layout in self.state_group_layouts:
+            # The state row reads the first block of its group.
+            block_id = new_req_data.block_ids[layout.group_id][0]
+            addresses = tuple(
+                component.page(block_id).data_ptr()
+                for components in layout.layers.values()
+                for component in components
+            )
+            PAGES.setdefault(new_req_data.req_id, []).append(
+                (block_id, addresses, new_req_data.position_offset)
+            )
+        PROMPTS.setdefault(
+            new_req_data.req_id, tuple(new_req_data.prompt_token_ids or ())
+        )
         if FAIL_TOKEN in (new_req_data.prompt_token_ids or ()):
             self._failed.add(new_req_data.req_id)
 
@@ -219,6 +291,9 @@ class StubModelState(MambaHybridModelState):
 
     def capture_cudagraphs(self, *, graph_pool, stream, profile_only) -> None:
         EVENTS.append(("capture", profile_only))
+        LAYOUTS_AT_CAPTURE.append(
+            (profile_only, describe_layouts(self.state_group_layouts))
+        )
 
     def clear_cudagraphs(self) -> None:
         EVENTS.append(("clear",))
@@ -247,6 +322,14 @@ class StubPersistentStateForCausalLM(
     def forward(
         self, input_ids: torch.Tensor, positions: torch.Tensor, **kwargs
     ) -> torch.Tensor:
+        attn_metadata = get_forward_context().attn_metadata
+        if (
+            not torch.cuda.is_current_stream_capturing()
+            and isinstance(attn_metadata, dict)
+            and self.state.prefix in attn_metadata
+        ):
+            metadata = attn_metadata[self.state.prefix]
+            FORWARDS.append((metadata.num_decodes, metadata.num_prefills))
         return self.state(input_ids, positions)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:

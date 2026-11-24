@@ -16,6 +16,7 @@ import re
 from collections import deque
 from collections.abc import Mapping
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -48,6 +49,7 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm.engine.protocol import StreamingInput
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import TokensPrompt
+from vllm.model_executor.models.config import MambaModelConfig
 from vllm.multimodal.cache.base import MultiModalCacheMissError
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.sampling_params import (
@@ -103,7 +105,8 @@ def _state_spec(**kwargs) -> MambaSpec:
     kwargs.setdefault("shapes", ((1,),))
     kwargs.setdefault("dtypes", (torch.int64,))
     kwargs.setdefault("mamba_type", MambaAttentionBackendEnum.PERSISTENT_STATE)
-    return MambaSpec(block_size=64, **kwargs)
+    kwargs.setdefault("block_size", 64)
+    return MambaSpec(**kwargs)
 
 
 # Configuration
@@ -248,23 +251,83 @@ def _state_group(spec: MambaSpec | None = None):
     return new_kv_cache_group(["state"], layer)
 
 
-def _attention_group():
+def _attention_group(block_size: int = 64):
     return new_kv_cache_group(
         ["attn"],
-        AttentionSpec(block_size=64, num_kv_heads=1, head_size=1, dtype=torch.float32),
+        AttentionSpec(
+            block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32
+        ),
     )
 
 
-def _verify_groups(*groups, declared: bool = True) -> None:
+def _verify_groups(*groups, declared: bool = True, max_model_len: int = 64) -> None:
     """The engine's startup check over `groups`, for a model that declares
     `SupportsPersistentState` when `declared`."""
     vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(has_persistent_state=declared)
+        model_config=SimpleNamespace(
+            has_persistent_state=declared, max_model_len=max_model_len
+        )
     )
     kv_cache_config = KVCacheConfig(
         num_blocks=4, kv_cache_tensors=[], kv_cache_groups=list(groups)
     )
     verify_persistent_state_groups(vllm_config, kv_cache_config)
+
+
+# @spec PSTATE-DECL-015 PSTATE-PRES-009
+@pytest.mark.parametrize(
+    ("groups", "message"),
+    [
+        (
+            lambda: [_state_group(_state_spec(block_size=32))],
+            r"State group 0 \(layer state\) has block_size 32, below max_model_len 64",
+        ),
+        (
+            lambda: [_attention_group(16), _state_group(_state_spec(block_size=16))],
+            r"State group 1 \(layer state\) has block_size 16, below max_model_len 64",
+        ),
+    ],
+    ids=["state", "hybrid"],
+)
+def test_state_group_refuses_a_page_shorter_than_max_model_len(groups, message):
+    """A request longer than the block size would move its state to a new
+    page, so a state page must span `max_model_len`."""
+    with pytest.raises(ValueError, match=message):
+        _verify_groups(*groups(), max_model_len=64)
+
+
+# @spec PSTATE-DECL-015
+@pytest.mark.parametrize(
+    ("groups", "declared"),
+    [
+        (lambda: [_state_group()], True),
+        (lambda: [_attention_group(16), _state_group()], True),
+        (lambda: [_attention_group(16)], False),
+    ],
+    ids=["state", "hybrid_small_attention_blocks", "ordinary_small_blocks"],
+)
+def test_page_length_check_reads_only_state_groups(groups, declared):
+    """An attention group's block may be smaller than `max_model_len`."""
+    _verify_groups(*groups(), declared=declared, max_model_len=64)
+
+
+# @spec PSTATE-DECL-015
+def test_upstream_default_mamba_block_size_passes():
+    """Without prefix caching upstream sets `mamba_block_size` to
+    `max_model_len`, which a state layer built from it satisfies."""
+    vllm_config: Any = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=64),
+        cache_config=SimpleNamespace(
+            enable_prefix_caching=False, mamba_block_size=None
+        ),
+    )
+    MambaModelConfig.verify_and_update_config(vllm_config)
+    block_size = vllm_config.cache_config.mamba_block_size
+    _verify_groups(
+        _attention_group(16),
+        _state_group(_state_spec(block_size=block_size)),
+        max_model_len=64,
+    )
 
 
 # @spec PSTATE-DECL-003
