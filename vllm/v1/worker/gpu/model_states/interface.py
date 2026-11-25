@@ -106,14 +106,26 @@ class ModelState(ABC):
     def state_group_layouts(self) -> tuple[StateGroupLayout, ...]:
         """The pages of each state group; empty for a model without one.
 
-        The runner sets it once it binds the KV cache, before
+        The runner sets it once it binds a KV cache allocation, before
         `initialize_kv_cache` and `capture_cudagraphs`, and clears it when it
-        releases that cache. Read it in those hooks and keep only what a
-        graph needs: a layout and its tensors are valid only until the next
-        bind or release, so do not retain them past `clear_cudagraphs` or
-        `shutdown`. A held request's page keeps its block id and address
-        until the request's terminal finish, so a graph may address it by
-        block id.
+        releases that allocation (the profiling teardown, or shutdown); sleep
+        and wake keep it. It stays unchanged for the allocation's life:
+        `extend_kv_cache` rebinds the layers to views of the same pages, not
+        the layout. Read it in those hooks and keep only what a graph needs,
+        and do not retain a layout or its tensors past `clear_cudagraphs` or
+        `shutdown`.
+
+        A component's page count is `tensor.shape[0]`. It covers every block
+        id the allocation can address and the scheduler assigns, which is the
+        reservation capacity under the extensible KV cache, otherwise the
+        allocated block count. A held request's page keeps its block id and
+        address until the request's terminal finish, so a graph may reach it
+        by block id at replay. Under the extensible KV cache core guarantees
+        memory only behind block id 0 at capture (two blocks for a
+        block-outermost layout, and a capture after wake follows a recommit)
+        and other pages may have none, so a capture addresses only block id 0
+        or memory the model owns, and takes held pages' block ids as per-step
+        data.
         """
         return self._state_group_layouts
 
@@ -193,6 +205,13 @@ class ModelState(ABC):
         capture is measured for the graph-memory estimate and then released
         through `clear_cudagraphs`. Finish every warm-up and replay this call
         started before returning or raising.
+
+        This runs at the profiling, serving and after-wake captures, each
+        against that allocation's `state_group_layouts`. A capture addresses
+        only block id 0 or memory the model owns, because other pages may have
+        no memory behind them until the runner extends the KV cache, and
+        reaches a held request's page by its block id at replay, which then
+        needs no recapture when the cache grows.
         """
         return None
 

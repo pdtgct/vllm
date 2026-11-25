@@ -892,7 +892,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.kv_caches = [
             cache for cache in kv_caches_dict.values() if cache.device == self.device
         ]
-        # @spec PSTATE-PREP-009
+        # @spec PSTATE-PREP-009 PSTATE-PREP-010
         self.model_state._state_group_layouts = get_state_group_layouts(
             self.kv_cache_config, self.compilation_config.static_forward_context
         )

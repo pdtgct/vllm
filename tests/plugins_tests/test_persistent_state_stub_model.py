@@ -20,6 +20,7 @@ import torch
 from vllm_add_dummy_model import my_persistent_state as stub
 from vllm_add_dummy_model.my_persistent_state import expected_turns, without_eos
 
+import vllm.v1.worker.gpu.cudagraph_utils as cudagraph_utils
 from tests.utils import create_new_process_for_each_test
 from vllm import LLM, ModelRegistry, SamplingParams
 from vllm.config import ModelConfig
@@ -29,10 +30,13 @@ from vllm.engine.protocol import StreamingInput
 from vllm.inputs import TokensPrompt
 from vllm.plugins import load_general_plugins
 from vllm.sampling_params import RequestOutputKind
+from vllm.utils.vmm_driver import vmm_unavailable_reason
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.engine.core_client import InprocClient
 from vllm.v1.engine.exceptions import StreamAdmissionError
+from vllm.v1.worker import gpu_worker
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 INPUTS = [[10, 20, 30], [40, 50], [60]]
 MAX_TOKENS = 16
@@ -100,6 +104,38 @@ def _in_process_llm(arch: str = STUB_ARCH, **kwargs) -> Iterator[LLM]:
         yield llm
 
 
+PAGE_ELEMS = 1 << 16
+"""Elements per state component in a page of an engine that sizes its own KV
+cache: a 1 MiB page. A 16-byte page would give a block count in the billions,
+and the scheduler's block pool holds one host object per block."""
+
+SIZED_MEMORY_UTILIZATION = 0.3
+"""The share of device memory the sized engines may use, so a page count stays
+in the thousands on any device."""
+
+
+@contextmanager
+def _sized_llm(**kwargs) -> Iterator[LLM]:
+    """An engine in this process whose KV cache core sizes from device memory:
+    no block-count override and no `kv_cache_memory_bytes`, so with the
+    extensible KV cache on, startup profiles, warms up, captures and then
+    extends it as it does in serving. Needs a CUDA device."""
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    _clear_stub_records()
+    engine_kwargs = _engine_kwargs(
+        stub_initial_total=INITIAL_TOTAL, stub_page_elems=PAGE_ELEMS
+    )
+    del engine_kwargs["num_gpu_blocks_override"]
+    engine_kwargs["gpu_memory_utilization"] = SIZED_MEMORY_UTILIZATION
+    with _llm(**{**engine_kwargs, **kwargs}) as llm:
+        yield llm
+
+
+def _skip_without_vmm() -> None:
+    if (reason := vmm_unavailable_reason()) is not None:
+        pytest.skip(f"VMM unavailable: {reason}")
+
+
 def _clear_stub_records() -> None:
     for records in (
         stub.EVENTS,
@@ -107,6 +143,7 @@ def _clear_stub_records() -> None:
         stub.PAGES,
         stub.PROMPTS,
         stub.LAYOUTS_AT_CAPTURE,
+        stub.CAPTURES,
         stub.FORWARDS,
     ):
         records.clear()
@@ -659,3 +696,324 @@ def test_runner_graph_replays_each_row_on_its_own_page(cudagraph_mode):
         f"every one of {num_steps[0]} steps ran the Python model forward, so "
         f"none replayed a graph (resolved {resolved}, forwards {forwards})"
     )
+
+
+# Model-state graphs over state pages
+
+
+def _state_layer(runner) -> stub.StubStateLayer:
+    [layer] = [
+        layer
+        for layer in runner.compilation_config.static_forward_context.values()
+        if isinstance(layer, stub.StubStateLayer)
+    ]
+    return layer
+
+
+def _page_counts(description: tuple) -> tuple[int, ...]:
+    """The page count of each component in `stub.describe_layouts` output."""
+    return tuple(
+        component[2]
+        for _, layers in description
+        for _, components in layers
+        for component in components
+    )
+
+
+def _generate_two_pages(llm: LLM, runner) -> tuple[list[int], list[list[int]]]:
+    """Run `GRAPH_PROMPTS` as two requests and return the block ids of their
+    pages, in prompt order, and each prompt's tokens."""
+    stub.PAGES.clear()
+    stub.PROMPTS.clear()
+    params = SamplingParams(temperature=0, max_tokens=MAX_TOKENS)
+    outputs = llm.generate([{"prompt_token_ids": p} for p in GRAPH_PROMPTS], params)
+    torch.accelerator.synchronize()
+    page_of = {
+        stub.PROMPTS[req_id]: entries[0][0] for req_id, entries in stub.PAGES.items()
+    }
+    assert sorted(page_of) == sorted(tuple(p) for p in GRAPH_PROMPTS)
+    return (
+        [page_of[tuple(p)] for p in GRAPH_PROMPTS],
+        [without_eos(o.outputs[0].token_ids) for o in outputs],
+    )
+
+
+# @spec PSTATE-PREP-009 PSTATE-PREP-010
+@requires_cuda
+@create_new_process_for_each_test("spawn")
+def test_extensible_kv_cache_keeps_the_layout_of_a_block_zero_capture():
+    """With the extensible KV cache on and its size left to core, the model
+    state captures a graph over block id 0 while only the minimum blocks are
+    backed. `extend_kv_cache` then backs every assignable page and rebinds the
+    layers to views of the same pages with the final count; the layout keeps
+    the reservation capacity as its page count, its base address and strides,
+    and the scheduler assigns only block ids below it."""
+    _skip_without_vmm()
+    extend = gpu_worker.extend_kv_cache
+    capture = GPUModelRunner._capture_model_state_cudagraphs
+
+    def recording_extend(runner, kv_cache_config, num_blocks):
+        committed = runner.extensible_kv_cache.num_committed_blocks
+        stub.EVENTS.append(("extend", committed, num_blocks))
+        extend(runner, kv_cache_config, num_blocks)
+
+    def recording_capture(self, profile_only):
+        committed = self.extensible_kv_cache.num_committed_blocks
+        stub.EVENTS.append(("committed_at_capture", committed))
+        capture(self, profile_only)
+
+    with (
+        patch.object(gpu_worker, "extend_kv_cache", recording_extend),
+        patch.object(
+            GPUModelRunner, "_capture_model_state_cudagraphs", recording_capture
+        ),
+        _sized_llm(enable_extensible_kv_cache=True) as llm,
+    ):
+        runner = _runner(llm)
+        kv_cache = runner.extensible_kv_cache
+        assert kv_cache is not None
+        assert runner.cache_config.enable_extensible_kv_cache
+        prompts = [[11 * i + 1, 11 * i + 2, 11 * i + 3] for i in range(4)]
+        params = SamplingParams(temperature=0, max_tokens=MAX_TOKENS)
+        started = len(stub.EVENTS)
+        llm.generate([{"prompt_token_ids": p} for p in prompts], params)
+        torch.accelerator.synchronize()
+
+        events = list(stub.EVENTS)
+        # Profiling captures nothing under the extensible KV cache, which
+        # measures after warmup: the one capture is the serving capture.
+        assert [e for e in events if e[0] == "capture"] == [("capture", False)]
+        [extend_at] = [i for i, e in enumerate(events) if e[0] == "extend"]
+        assert events.index(("capture", False)) < extend_at
+        # Only the minimum is backed at the capture, and still at the extension.
+        assert [e[1] for e in events if e[0] == "committed_at_capture"] == [
+            kv_cache.min_committed_blocks
+        ]
+        assert events[extend_at][1] == kv_cache.min_committed_blocks
+
+        layouts = runner.model_state.state_group_layouts
+        [(profile_only, at_capture)] = stub.LAYOUTS_AT_CAPTURE
+        assert not profile_only
+        # The layout the graph was captured through is the layout now: the
+        # same addresses, dtypes, page counts, shapes and strides.
+        assert stub.describe_layouts(layouts) == at_capture
+        capacity = kv_cache.capacity_blocks
+        assert set(_page_counts(at_capture)) == {capacity}
+        [layout] = layouts
+        [components] = layout.layers.values()
+        layer = _state_layer(runner)
+        num_blocks = runner.kv_cache_config.num_blocks
+        assert num_blocks == kv_cache.num_committed_blocks
+        # Core backs fewer pages than it reserved (it keeps a margin of at
+        # least 1 GiB, about a thousand pages, out of the measured budget), so
+        # a layout refreshed to the final count would fail below.
+        assert num_blocks < capacity
+        for component, view in zip(components, layer.kv_cache, strict=True):
+            # The layer reads the final count, from the same base and stride.
+            assert view.shape[0] == num_blocks
+            assert view.data_ptr() == component.tensor.data_ptr()
+            assert view.stride(0) == component.page_stride
+            assert (view.dtype, tuple(view.shape[1:])) == (
+                component.dtype,
+                component.page_shape,
+            )
+        [(_, block_ids, num_pages)] = stub.CAPTURES
+        assert block_ids == (0,) * runner.max_num_reqs
+        assert num_pages == (capacity,) * len(components)
+
+        scheduler = llm.llm_engine.engine_core.engine_core.scheduler
+        assert scheduler.kv_cache_manager.block_pool.num_gpu_blocks <= capacity
+        assigned = {
+            block_id for entries in stub.PAGES.values() for block_id, _, _ in entries
+        }
+        # Core backed every page before it scheduled the first request: the
+        # extension came before the prompts' requests were added. (Startup's
+        # synthetic warmup requests run earlier, before the capture.)
+        assert extend_at < started
+        assert [e for e in events[started:] if e[0] == "add"] != []
+        # The warmup and the four prompts' requests each held a page.
+        assert assigned and 0 not in assigned
+        assert max(assigned) < capacity
+
+
+# @spec PSTATE-PREP-010
+@requires_cuda
+@create_new_process_for_each_test("spawn")
+def test_profiling_cache_layout_is_captured_over_block_zero_then_replaced():
+    """Without the extensible KV cache, with profiled sizing, no block-count
+    override and a capture size of 0, the profiling cache has one block. The
+    stub captures over block id 0 of it, profiling teardown clears the layout,
+    and the serving capture runs over the serving layout, whose page count is
+    the allocated block count."""
+    teardown = cudagraph_utils._teardown_profiling_state
+
+    def recording_teardown(runner):
+        teardown(runner)
+        stub.EVENTS.append(("teardown", len(runner.model_state.state_group_layouts)))
+
+    with (
+        patch.object(cudagraph_utils, "_teardown_profiling_state", recording_teardown),
+        _sized_llm(
+            enable_extensible_kv_cache=False,
+            compilation_config={
+                "mode": CompilationMode.NONE,
+                "cudagraph_mode": "NONE",
+            },
+        ) as llm,
+    ):
+        runner = _runner(llm)
+        assert getattr(runner, "extensible_kv_cache", None) is None
+        assert not runner.compilation_config.max_cudagraph_capture_size
+        events = list(stub.EVENTS)
+        # The profiling capture, its release, the teardown that leaves no
+        # layout, and then the serving capture.
+        order = [
+            events.index(("capture", True)),
+            events.index(("clear",)),
+            events.index(("teardown", 0)),
+            events.index(("capture", False)),
+        ]
+        assert order == sorted(order)
+        assert [e for e in events if e[0] == "capture"] == [
+            ("capture", True),
+            ("capture", False),
+        ]
+
+        num_blocks = runner.kv_cache_config.num_blocks
+        assert num_blocks > 1
+        layouts = runner.model_state.state_group_layouts
+        [(_, profiling), (_, serving)] = stub.LAYOUTS_AT_CAPTURE
+        assert set(_page_counts(profiling)) == {1}
+        assert set(_page_counts(serving)) == {num_blocks}
+        assert stub.describe_layouts(layouts) == serving
+        for view in _state_layer(runner).kv_cache:
+            assert view.shape[0] == num_blocks
+        rows = (0,) * runner.max_num_reqs
+        assert [(True, rows, (1, 1)), (False, rows, (num_blocks,) * 2)] == stub.CAPTURES
+
+
+# @spec PSTATE-PRES-008 PSTATE-PREP-010
+@requires_cuda
+@create_new_process_for_each_test("spawn")
+def test_block_zero_graph_replays_on_requests_pages_and_spares_witness_pages():
+    """The graph captured over block id 0 before the extensible KV cache was
+    extended replays on the pages two requests used, which `extend_kv_cache`
+    backed: it reads and updates exactly those pages, as an eager run does,
+    leaves the sampled witness pages alone, and is not captured again."""
+    _skip_without_vmm()
+    with _sized_llm(enable_extensible_kv_cache=True) as llm:
+        runner = _runner(llm)
+        # Fail, rather than pass without extending, if core disabled the feature.
+        assert runner.extensible_kv_cache is not None
+        state = runner.model_state
+        graph = state.state_graph
+        assert graph is not None and graph.graph is not None
+        captured = graph.graph
+        [first, second], tokens = _generate_two_pages(llm, runner)
+        vocab_size = llm.llm_engine.model_config.get_vocab_size()
+        turns = [
+            expected_turns([p], vocab_size, initial_total=INITIAL_TOTAL)[0]
+            for p in GRAPH_PROMPTS
+        ]
+        assert tokens == turns
+        assert 0 not in (first, second) and first != second
+
+        tensors = graph.tensors
+        backed = _state_layer(runner).kv_cache[0].shape[0]
+        targets = [first, second]
+        # Sampled witness pages: the null block, low pages, and the middle and
+        # last backed pages.
+        witnesses = sorted({0, 1, 2, 3, backed // 2, backed - 1}.difference(targets))
+
+        def snapshot() -> dict[int, list[torch.Tensor]]:
+            return {i: [t[i].clone() for t in tensors] for i in targets + witnesses}
+
+        before = snapshot()
+        # Each page holds its request's state.
+        for prompt, turn, block_id in zip(GRAPH_PROMPTS, turns, targets, strict=True):
+            assert before[block_id][0][0].item() == (
+                INITIAL_TOTAL + sum(prompt) + sum(turn)
+            )
+            assert before[block_id][1][0].item() == stub.TURN_LEN - 1
+
+        deltas = [3, 5]
+        graph.set_inputs(targets, deltas)
+        graph.replay()
+        torch.accelerator.synchronize()
+        replayed, replayed_out = snapshot(), graph.out.clone()
+
+        # The eager arm: the same update from the same page contents.
+        with torch.inference_mode():
+            for block_id in targets:
+                for tensor, saved in zip(tensors, before[block_id], strict=True):
+                    tensor[block_id].copy_(saved)
+        graph.run()
+        torch.accelerator.synchronize()
+        eager, eager_out = snapshot(), graph.out.clone()
+
+        assert torch.equal(replayed_out, eager_out)
+        for block_id in targets + witnesses:
+            for got, want in zip(replayed[block_id], eager[block_id], strict=True):
+                assert torch.equal(got, want), block_id
+        # Each row read and updated its own page, by the block id it was given.
+        for row, (block_id, delta) in enumerate(zip(targets, deltas, strict=True)):
+            for k in range(len(tensors)):
+                assert torch.equal(replayed[block_id][k], before[block_id][k] + delta)
+                assert replayed_out[k, row].item() == before[block_id][k][0].item()
+        # No sampled witness page changed, including block id 0, which the
+        # capture named.
+        for block_id in witnesses:
+            for got, want in zip(replayed[block_id], before[block_id], strict=True):
+                assert torch.equal(got, want), block_id
+
+        # No recapture or release since startup.
+        assert [e for e in stub.EVENTS if e[0] in ("capture", "clear")] == [
+            ("capture", False)
+        ]
+        assert len(stub.CAPTURES) == 1
+        assert state.state_graph is graph and graph.graph is captured
+
+
+# @spec PSTATE-PREP-010 PSTATE-PREP-006
+@requires_cuda
+@create_new_process_for_each_test("spawn")
+@pytest.mark.parametrize("extensible", [True, False])
+def test_layout_is_unchanged_by_sleep_wake_and_the_recapture(extensible):
+    """With no state held, a level 1 sleep and a full wake remap the KV cache
+    at the same addresses, and the recapture runs over a layout with the
+    startup layout's addresses, dtypes, page counts, shapes and strides."""
+    if extensible:
+        _skip_without_vmm()
+        engine = _sized_llm(enable_extensible_kv_cache=True, enable_sleep_mode=True)
+    else:
+        engine = _in_process_llm(enable_sleep_mode=True)
+    with engine as llm:
+        runner = _runner(llm)
+        if extensible:
+            # Fail, rather than pass without it, if core disabled the feature.
+            assert runner.extensible_kv_cache is not None
+        before = stub.describe_layouts(runner.model_state.state_group_layouts)
+        assert [d for profile_only, d in stub.LAYOUTS_AT_CAPTURE if not profile_only][
+            -1
+        ] == before
+        ready = len(stub.EVENTS)
+        num_captures = len(stub.LAYOUTS_AT_CAPTURE)
+
+        llm.sleep(level=1)
+        assert stub.describe_layouts(runner.model_state.state_group_layouts) == before
+        llm.wake_up(tags=["weights"])
+        # A partial wake keeps the layout and recaptures nothing.
+        assert stub.EVENTS[ready:] == []
+        assert len(stub.LAYOUTS_AT_CAPTURE) == num_captures
+        assert stub.describe_layouts(runner.model_state.state_group_layouts) == before
+        llm.wake_up(tags=["kv_cache"])
+
+        assert stub.EVENTS[ready:] == [("clear",), ("capture", False)]
+        assert len(stub.LAYOUTS_AT_CAPTURE) == num_captures + 1
+        profile_only, at_recapture = stub.LAYOUTS_AT_CAPTURE[-1]
+        assert not profile_only
+        assert at_recapture == before
+        assert stub.describe_layouts(runner.model_state.state_group_layouts) == before
+        # The recapture addressed block id 0 again.
+        assert stub.CAPTURES[-1][1] == (0,) * runner.max_num_reqs
+        assert runner.model_state.state_graph is not None

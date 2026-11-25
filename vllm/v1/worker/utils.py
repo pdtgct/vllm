@@ -306,7 +306,9 @@ class StatePageInitializer:
 @dataclass(frozen=True, eq=False, slots=True)
 class StateComponentLayout:
     """One component of a state layer: `tensor` holds one page per block id
-    along its first dimension, the view the layer itself reads."""
+    along its first dimension. It is the startup view over the full allocation;
+    after `extend_kv_cache` the layer may read a rebound view of the same
+    pages, with the final page count."""
 
     tensor: torch.Tensor
 
@@ -330,8 +332,13 @@ class StateComponentLayout:
 @dataclass(frozen=True, eq=False, slots=True)
 class StateGroupLayout:
     """The pages of one state group: for each layer, its components in the
-    order of its spec's `shapes`. Valid until the runner next binds or
-    releases the KV cache."""
+    order of its spec's `shapes`. Valid from the call that gives it until the
+    runner releases that KV cache allocation (the profiling teardown, or
+    shutdown): `extend_kv_cache` rebinds the layers, not the layout. A
+    component's page count is `tensor.shape[0]` and covers every block id the
+    allocation can address, so the scheduler assigns only block ids below it.
+    A capture through it addresses only block id 0 or memory the model owns,
+    and reaches held pages by block id at replay."""
 
     group_id: int
     layers: Mapping[str, tuple[StateComponentLayout, ...]]

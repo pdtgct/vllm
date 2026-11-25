@@ -17,6 +17,9 @@ The model reads these `hf_overrides` entries:
 - `stub_initial_total`: the first component's initial value (default 0).
 - `stub_reads_positions`: add the token position to what each emitted token
   depends on, so a wrong position changes the output.
+- `stub_page_elems`: elements per state component in a page (default 1).
+  A test that lets core size the KV cache from device memory raises it, so a
+  page is not a few bytes and the block count stays small.
 
 `StubModelState` records its hook calls in `EVENTS` (readable only where the
 engine runs in the test's process), and reports a request whose prompt holds
@@ -25,6 +28,10 @@ engine runs in the test's process), and reports a request whose prompt holds
 The state update breaks a breakable CUDA graph capture and runs eagerly, as a
 model's state kernel does, so a piecewise graph reads each replayed batch's
 metadata.
+
+`StubModelState.capture_cudagraphs` also captures one CUDA graph, over block
+id 0, that reads and updates the state pages a device block-id tensor names,
+as a model's transaction graph does. It never names another page at capture.
 """
 
 from collections.abc import Sequence
@@ -71,6 +78,11 @@ PROMPTS: dict[str, tuple[int, ...]] = {}
 LAYOUTS_AT_CAPTURE: list[tuple] = []
 """(profile_only, `describe_layouts(state_group_layouts)`) at each
 `capture_cudagraphs` call."""
+
+CAPTURES: list[tuple[bool, tuple[int, ...], tuple[int, ...]]] = []
+"""(profile_only, the block ids the captured graph addressed, the page count of
+each component it addressed) at each `capture_cudagraphs` call on a CUDA
+device."""
 
 FORWARDS: list[tuple[int, int]] = []
 """(decode rows, prefill rows) of each model forward that ran eagerly with
@@ -130,7 +142,13 @@ def describe_layouts(layouts) -> tuple:
                 (
                     name,
                     tuple(
-                        (c.tensor.data_ptr(), c.dtype, c.page_shape, c.page_stride)
+                        (
+                            c.tensor.data_ptr(),
+                            c.dtype,
+                            c.tensor.shape[0],
+                            c.page_shape,
+                            c.page_stride,
+                        )
                         for c in components
                     ),
                 )
@@ -152,11 +170,12 @@ class StubStateLayer(MambaBase, nn.Module):
         self.vocab_size = vllm_config.model_config.get_vocab_size()
         hf_config = vllm_config.model_config.hf_config
         self.initial_total = int(getattr(hf_config, "stub_initial_total", 0))
+        self.page_elems = int(getattr(hf_config, "stub_page_elems", 1))
         self.reads_positions = bool(getattr(hf_config, "stub_reads_positions", False))
         vllm_config.compilation_config.static_forward_context[prefix] = self
 
     def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
-        return ((1,), (1,))
+        return ((self.page_elems,), (self.page_elems,))
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         return (torch.int64, torch.int64)
@@ -244,12 +263,67 @@ def _update_stub_state(
     layer.update(input_ids, positions, out)
 
 
+class StateTransactionGraph:
+    """A CUDA graph over the state pages that `block_ids` names, one row per
+    request: it reads each row's page into `out` (the first element of every
+    component) and adds the row's `deltas` entry to the page.
+
+    It is captured with every row on block id 0, with zero deltas, and takes
+    the pages it runs on from `block_ids` at replay, so it needs no recapture
+    when the KV cache grows. `run` is the same update, eagerly.
+    """
+
+    def __init__(self, layouts, num_rows: int, device: torch.device) -> None:
+        self.tensors = [
+            component.tensor
+            for layout in layouts
+            for components in layout.layers.values()
+            for component in components
+        ]
+        self.num_pages = tuple(tensor.shape[0] for tensor in self.tensors)
+        self.block_ids = torch.zeros(num_rows, dtype=torch.int64, device=device)
+        self.deltas = torch.zeros(num_rows, dtype=torch.int64, device=device)
+        self.out = torch.zeros(
+            len(self.tensors), num_rows, dtype=torch.int64, device=device
+        )
+        self.graph: torch.cuda.CUDAGraph | None = None
+
+    def run(self) -> None:
+        with torch.inference_mode():
+            for k, tensor in enumerate(self.tensors):
+                pages = tensor.index_select(0, self.block_ids)
+                self.out[k] = pages[:, 0]
+                tensor.index_copy_(
+                    0, self.block_ids, pages + self.deltas.unsqueeze(1).to(pages.dtype)
+                )
+
+    def capture(self, graph_pool, stream: torch.cuda.Stream) -> None:
+        # Warm up on the capture stream. Block id 0 only, and a zero delta,
+        # leave the null block unchanged.
+        with torch.cuda.stream(stream):
+            self.run()
+        stream.synchronize()
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph, pool=graph_pool, stream=stream):
+            self.run()
+
+    def set_inputs(self, block_ids: Sequence[int], deltas: Sequence[int]) -> None:
+        with torch.inference_mode():
+            self.block_ids.copy_(torch.tensor(block_ids, dtype=torch.int64))
+            self.deltas.copy_(torch.tensor(deltas, dtype=torch.int64))
+
+    def replay(self) -> None:
+        assert self.graph is not None
+        self.graph.replay()
+
+
 class StubModelState(MambaHybridModelState):
     """Records its hook calls and fails the requests that ask for it."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._failed: set[str] = set()
+        self.state_graph: StateTransactionGraph | None = None
         EVENTS.append(("init",))
 
     def add_request(self, req_index, new_req_data) -> None:
@@ -291,12 +365,25 @@ class StubModelState(MambaHybridModelState):
 
     def capture_cudagraphs(self, *, graph_pool, stream, profile_only) -> None:
         EVENTS.append(("capture", profile_only))
-        LAYOUTS_AT_CAPTURE.append(
-            (profile_only, describe_layouts(self.state_group_layouts))
+        layouts = self.state_group_layouts
+        LAYOUTS_AT_CAPTURE.append((profile_only, describe_layouts(layouts)))
+        if self.device.type != "cuda" or not layouts:
+            return
+        graph = StateTransactionGraph(layouts, self.max_num_reqs, self.device)
+        CAPTURES.append(
+            (profile_only, tuple(graph.block_ids.tolist()), graph.num_pages)
         )
+        graph.capture(graph_pool, stream)
+        self.state_graph = graph
 
     def clear_cudagraphs(self) -> None:
         EVENTS.append(("clear",))
+        self.state_graph = None
+
+    def shutdown(self) -> None:
+        # The graph holds views of the KV cache, which shutdown releases.
+        self.state_graph = None
+        super().shutdown()
 
 
 class StubPersistentStateForCausalLM(
