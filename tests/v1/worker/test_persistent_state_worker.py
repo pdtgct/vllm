@@ -85,7 +85,7 @@ def test_mamba_spec_initial_values_default_to_none():
 
 
 # @spec PSTATE-DECL-004
-def test_state_model_declares_three_facts_with_their_defaults():
+def test_state_model_declares_four_facts_with_their_defaults():
     declared = {
         name: getattr(SupportsPersistentState, name)
         for name in dir(SupportsPersistentState)
@@ -95,6 +95,7 @@ def test_state_model_declares_three_facts_with_their_defaults():
         "persistent_state_reads_positions": True,
         "persistent_state_accepts_synthetic_warmup": True,
         "persistent_state_resumable_stops": frozenset({"eos"}),
+        "persistent_state_chunked_prefill": False,
     }
 
 
@@ -769,6 +770,8 @@ def _empty_state_scheduler(monkeypatch):
     return create_scheduler(
         max_model_len=64,
         block_size=16,
+        # @spec PSTATE-DECL-016: the declared facts include no chunked prefill.
+        enable_chunked_prefill=False,
         kv_cache_layer_config=MambaManager.layer_config(spec, recomputable=False),
     )
 
@@ -1116,6 +1119,7 @@ def test_scheduler_request_history_stays_bounded_over_many_turns(monkeypatch):
         max_model_len=512,
         block_size=512,
         num_blocks=3,
+        enable_chunked_prefill=False,
         kv_cache_layer_config=MambaManager.layer_config(spec, recomputable=False),
     )
     for turn in range(MAX_PENDING + 1):

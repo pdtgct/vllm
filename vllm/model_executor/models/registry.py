@@ -1007,6 +1007,7 @@ class _ModelInfo:
     persistent_state_accepts_synthetic_warmup: bool
     # A tuple, so the JSON cache round-trips it; sorted, so it is deterministic.
     persistent_state_resumable_stops: tuple[str, ...]
+    persistent_state_chunked_prefill: bool
     has_noops: bool
     supports_replayssm: bool
     supports_transcription: bool
@@ -1052,6 +1053,9 @@ class _ModelInfo:
                 model, "persistent_state_accepts_synthetic_warmup", True
             ),
             persistent_state_resumable_stops=_resumable_stops(model),
+            persistent_state_chunked_prefill=getattr(
+                model, "persistent_state_chunked_prefill", False
+            ),
             supports_replayssm=supports_replayssm(model),
             supports_transcription=supports_transcription(model),
             supports_transcription_only=(

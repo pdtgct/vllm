@@ -1045,6 +1045,11 @@ class SupportsPersistentState(Protocol):
     `max_tokens` stop below the position limit (`max_model_len`, counting
     the positions compaction dropped)."""
 
+    persistent_state_chunked_prefill: ClassVar[bool] = False
+    """The forward gives the output and page contents of an unsplit input for
+    any split of it into prefill chunks, one-token chunks included, so core
+    may prefill a state request in chunks."""
+
 
 @overload
 def supports_persistent_state(

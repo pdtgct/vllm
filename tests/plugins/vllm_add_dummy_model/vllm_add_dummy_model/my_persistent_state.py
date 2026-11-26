@@ -21,6 +21,12 @@ The model reads these `hf_overrides` entries:
   A test that lets core size the KV cache from device memory raises it, so a
   page is not a few bytes and the block count stays small.
 
+`StubChunkedPrefillPersistentStateForCausalLM` keeps no turns: every row,
+prefill or decode, adds its tokens to the sum and emits from it, and a
+request ends at `max_tokens`. A one-token chunk on the decode path then does
+what finishing its prefill does, so the model declares
+`persistent_state_chunked_prefill`.
+
 `StubModelState` records its hook calls in `EVENTS` (readable only where the
 engine runs in the test's process), and reports a request whose prompt holds
 `FAIL_TOKEN` as failed after its first step.
@@ -126,6 +132,28 @@ def expected_turns(
     return turns
 
 
+def expected_sums(
+    prompt: Sequence[int],
+    vocab_size: int,
+    num_tokens: int,
+    *,
+    initial_total: int = 0,
+    reads_positions: bool = False,
+) -> tuple[list[int], int]:
+    """The tokens a request of `StubChunkedPrefillPersistentStateForCausalLM`
+    produces from `prompt` until it stops at `num_tokens`, and the sum its
+    page then holds: each token feeds the sum, except the last, which no step
+    feeds."""
+    total = initial_total + sum(prompt)
+    position = len(prompt) - 1
+    tokens = [emit(total + position * reads_positions, vocab_size)]
+    for _ in range(num_tokens - 1):
+        total += tokens[-1]
+        position += 1
+        tokens.append(emit(total + position * reads_positions, vocab_size))
+    return tokens, total
+
+
 def without_eos(token_ids: Sequence[int]) -> list[int]:
     token_ids = list(token_ids)
     if token_ids and token_ids[-1] == EOS_TOKEN_ID:
@@ -172,6 +200,7 @@ class StubStateLayer(MambaBase, nn.Module):
         self.initial_total = int(getattr(hf_config, "stub_initial_total", 0))
         self.page_elems = int(getattr(hf_config, "stub_page_elems", 1))
         self.reads_positions = bool(getattr(hf_config, "stub_reads_positions", False))
+        self.counts_turns = True
         vllm_config.compilation_config.static_forward_context[prefix] = self
 
     def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
@@ -220,14 +249,15 @@ class StubStateLayer(MambaBase, nn.Module):
         if num_decodes := metadata.num_decodes:
             assert metadata.state_indices_tensor_d is not None
             slots = metadata.state_indices_tensor_d[:num_decodes, 0]
-            # A single-token input to a row whose turn ended starts a turn.
-            new_turn = counts[slots] >= TURN_LEN - 1
-            counts[slots] = torch.where(new_turn, 0, counts[slots] + 1)
+            if self.counts_turns:
+                # A single-token input to a row whose turn ended starts a turn.
+                new_turn = counts[slots] >= TURN_LEN - 1
+                counts[slots] = torch.where(new_turn, 0, counts[slots] + 1)
             totals[slots] += input_ids[:num_decodes]
             token = emit(totals[slots] + offsets[:num_decodes], self.vocab_size)
-            out[:num_decodes, 0] = torch.where(
-                counts[slots] >= TURN_LEN - 1, EOS_TOKEN_ID, token
-            ).to(out.dtype)
+            if self.counts_turns:
+                token = torch.where(counts[slots] >= TURN_LEN - 1, EOS_TOKEN_ID, token)
+            out[:num_decodes, 0] = token.to(out.dtype)
 
         if num_prefills := metadata.num_prefills:
             assert metadata.state_indices_tensor_p is not None
@@ -245,7 +275,8 @@ class StubStateLayer(MambaBase, nn.Module):
                 + cumsum[bounds[1:]]
                 - cumsum[bounds[:-1]]
             )
-            counts[slots] = 0
+            if self.counts_turns:
+                counts[slots] = 0
             last = bounds[1:] - 1
             out[last, 0] = emit(totals[slots] + offsets[last], self.vocab_size).to(
                 out.dtype
@@ -435,3 +466,16 @@ class StubNoWarmupPersistentStateForCausalLM(StubPersistentStateForCausalLM):
 
     persistent_state_reads_positions = False
     persistent_state_accepts_synthetic_warmup = False
+
+
+class StubChunkedPrefillPersistentStateForCausalLM(StubPersistentStateForCausalLM):
+    """The same model without turns, declaring chunked prefill: every row adds
+    its tokens to the sum, so any split of an input into prefill chunks,
+    including a one-token chunk that runs on the decode path, gives the
+    unsplit output and page (PSTATE-DECL-017)."""
+
+    persistent_state_chunked_prefill = True
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self.state.counts_turns = False

@@ -46,6 +46,7 @@ INPUTS = [[10, 20, 30], [40, 50], [60]]
 MAX_TOKENS = 16
 STUB_ARCH = "StubPersistentStateForCausalLM"
 NO_WARMUP_ARCH = "StubNoWarmupPersistentStateForCausalLM"
+CHUNKED_ARCH = "StubChunkedPrefillPersistentStateForCausalLM"
 INITIAL_TOTAL = 5
 
 requires_cuda = pytest.mark.skipif(
@@ -85,11 +86,12 @@ def _llm(**kwargs) -> Iterator[LLM]:
 
 
 def _register_no_warmup_arch() -> None:
-    if NO_WARMUP_ARCH not in ModelRegistry.get_supported_archs():
-        ModelRegistry.register_model(
-            NO_WARMUP_ARCH,
-            f"vllm_add_dummy_model.my_persistent_state:{NO_WARMUP_ARCH}",
-        )
+    """Register the stub variants the plugin does not."""
+    for arch in (NO_WARMUP_ARCH, CHUNKED_ARCH):
+        if arch not in ModelRegistry.get_supported_archs():
+            ModelRegistry.register_model(
+                arch, f"vllm_add_dummy_model.my_persistent_state:{arch}"
+            )
 
 
 @contextmanager
@@ -163,8 +165,9 @@ def _runner(llm: LLM):
 @pytest.mark.parametrize(
     ("arch", "declared"),
     [
-        (STUB_ARCH, (True, True, frozenset({"eos"}))),
-        (NO_WARMUP_ARCH, (False, False, frozenset({"eos"}))),
+        (STUB_ARCH, (True, True, frozenset({"eos"}), False)),
+        (NO_WARMUP_ARCH, (False, False, frozenset({"eos"}), False)),
+        (CHUNKED_ARCH, (True, True, frozenset({"eos"}), True)),
     ],
 )
 def test_model_config_exposes_the_state_declarations(arch, declared):
@@ -178,6 +181,7 @@ def test_model_config_exposes_the_state_declarations(arch, declared):
         config.persistent_state_reads_positions,
         config.persistent_state_accepts_synthetic_warmup,
         config.persistent_state_resumable_stops,
+        config.persistent_state_chunked_prefill,
     ) == declared
 
 
@@ -1252,12 +1256,24 @@ BI_RUNS: dict[str, dict[str, int]] = {
     "single_alone": {"single": 0},
     "pair": {"stream": 0, "single": 0},
     "four": {"stream": 0, "single": 0, "stream-b": 0, "single-b": 0},
-    "staggered": {"stream": 0, "single-b": 1, "single": 2, "stream-b": 4},
+    "staggered": {"stream": 0, "single-b": 2, "single": 4, "stream-b": 6},
     "singles": {"single": 0, "single-b": 0, "single-c": 0},
 }
 """Each run's requests, by name, and the step of the run before which core
 receives each. A stream's inputs and its close all arrive with its admission,
-so each input after the first folds at the previous turn's stop."""
+so each input after the first folds at the previous turn's stop.
+
+The staggered joins come at even steps, which share steps with the stream in
+both scheduling modes. Without async scheduling every `step_fn` call
+schedules every row. With async scheduling at depth 2, the batch queue holds
+two steps: each call schedules one step and then processes the oldest, and
+the per-request barrier keeps a state request out of a step while its own is
+in flight. A request scheduled at call k is processed at call k + 1, which
+schedules without it, so the stream, which opens at call 0, runs at calls 0,
+2, 4 and so on; a request that joins before an even call runs at the even
+calls with it, and one that joined before an odd call would never share a step
+with it. A deeper queue keeps a request out for more calls, so the test pins
+depth 2."""
 
 
 def _add_bi_request(driver: _CoreDriver, run: str, name: str) -> None:
@@ -1274,7 +1290,10 @@ def _add_bi_request(driver: _CoreDriver, run: str, name: str) -> None:
 # @spec PSTATE-DECL-006
 @requires_cuda
 @create_new_process_for_each_test("spawn")
-def test_batch_invariant_mode_gives_state_requests_the_same_tokens_in_any_batch():
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_batch_invariant_mode_gives_state_requests_the_same_tokens_in_any_batch(
+    async_scheduling,
+):
     """Supplementary evidence, not an arm of PSTATE-ACC-007, which names the
     Nemotron streaming plugin: with batch-invariant mode on, core accepts a
     state model (PSTATE-DECL-006), and one state stream and one single state
@@ -1285,7 +1304,14 @@ def test_batch_invariant_mode_gives_state_requests_the_same_tokens_in_any_batch(
     a batch-variance failure. `BATCH_INVARIANT_SETTINGS` records the
     settings."""
     os.environ["VLLM_BATCH_INVARIANT"] = "1"
-    with _in_process_llm(max_num_seqs=4, num_gpu_blocks_override=5) as llm:
+    with _in_process_llm(
+        max_num_seqs=4,
+        num_gpu_blocks_override=5,
+        async_scheduling=async_scheduling,
+        async_scheduling_depth=2,
+    ) as llm:
+        scheduler_config = llm.llm_engine.vllm_config.scheduler_config
+        assert scheduler_config.async_scheduling is async_scheduling
         assert envs.VLLM_BATCH_INVARIANT
         # Set by the worker's `init_batch_invariance`, in this process.
         assert os.environ["VLLM_USE_AOT_COMPILE"] == "0"
@@ -1296,9 +1322,8 @@ def test_batch_invariant_mode_gives_state_requests_the_same_tokens_in_any_batch(
             "compilation_mode": compilation.mode,
             "cudagraph_mode": compilation.cudagraph_mode,
             "use_breakable_cudagraph": compilation.use_breakable_cudagraph,
-            "async_scheduling": (
-                llm.llm_engine.vllm_config.scheduler_config.async_scheduling
-            ),
+            "async_scheduling": async_scheduling,
+            "async_scheduling_depth": scheduler_config.async_scheduling_depth,
         }
         print(f"batch-invariant settings: {settings}")
         assert not compilation.use_breakable_cudagraph, settings
@@ -1330,7 +1355,10 @@ def test_batch_invariant_mode_gives_state_requests_the_same_tokens_in_any_batch(
     # Each request that joined mid-stream shared a step with the stream.
     for name in ("single-b", "single", "stream-b"):
         pair = {"staggered/stream", f"staggered/{name}"}
-        assert any(pair <= batch for batch in batches["staggered"]), name
+        assert any(pair <= batch for batch in batches["staggered"]), (
+            name,
+            [sorted(batch) for batch in batches["staggered"]],
+        )
 
     stream = driver.tokens("stream_alone/stream")
     single = driver.tokens("single_alone/single")
@@ -1393,80 +1421,224 @@ def test_batch_invariant_mode_is_consistent_for_an_ordinary_model():
         assert tokens(ORDINARY_PROMPTS[::-1]) == alone[::-1]
 
 
-# Chunked prefill of a state request (design Pending question 2; no spec yet)
+# Chunked prefill of a state request
 
-CHUNK_BUDGET = 4
-"""Tokens per step in the chunked engine, so a first input of 9 or 10 tokens
-is prefilled as chunks of 4, 4 and the remainder."""
+CHUNK_CASES = {
+    "tail_2": (10, 4, False),
+    "tail_1": (9, 4, False),
+    "tail_1_async": (9, 4, True),
+    "one_token_chunks": (6, 2, False),
+}
+"""Per case, the first input's length, the chunked engine's token budget and
+whether async scheduling is on. With a budget of 4 the input runs as chunks
+of 4, 4 and the remainder. With a budget of 2 and a one-token companion
+request ahead of it, every chunk is one token, so the intermediate chunks run
+on the decode path too."""
+
+COMPANION = [5]
 
 
+def _chunked_run(
+    prompt: list[int], budget: int | None, companion: bool, async_scheduling: bool
+):
+    """Run `prompt` once on the declaring stub, prefilled in chunks under
+    `budget` (unsplit when None), and return its tokens, its final page, the
+    sizes of the chunks its first input ran as, and the vocabulary size. The
+    companion case runs without async scheduling, under which the barrier
+    would keep the companion's decode out of the chunk's steps."""
+    kwargs: dict = {
+        "enforce_eager": True,
+        "async_scheduling": async_scheduling,
+        "hf_overrides": {
+            "architectures": [CHUNKED_ARCH],
+            "stub_initial_total": INITIAL_TOTAL,
+            "stub_reads_positions": True,
+        },
+    }
+    if budget is not None:
+        kwargs.update(enable_chunked_prefill=True, max_num_batched_tokens=budget)
+    with _in_process_llm(CHUNKED_ARCH, **kwargs) as llm:
+        # @spec PSTATE-DECL-004: the model's declaration reaches core.
+        assert llm.llm_engine.model_config.persistent_state_chunked_prefill
+        assert llm.llm_engine.vllm_config.scheduler_config.enable_chunked_prefill
+        runner = _runner(llm)
+        vocab_size = llm.llm_engine.model_config.get_vocab_size()
+        scheduler = _engine_core(llm).scheduler
+        steps: list[dict[str, int]] = []
+        schedule = scheduler.schedule
+
+        def recording_schedule(*args, **kwargs):
+            output = schedule(*args, **kwargs)
+            steps.append(dict(output.num_scheduled_tokens))
+            return output
+
+        scheduler.schedule = recording_schedule
+        stub.PAGES.clear()
+        stub.PROMPTS.clear()
+        prompts = [COMPANION, prompt] if companion else [prompt]
+        params = SamplingParams(temperature=0, max_tokens=MAX_TOKENS)
+        outputs = llm.generate([{"prompt_token_ids": p} for p in prompts], params)
+        torch.accelerator.synchronize()
+        [req_id] = [r for r, p in stub.PROMPTS.items() if p == tuple(prompt)]
+        block_id = stub.PAGES[req_id][0][0]
+        page = _page_values(runner, [block_id])[block_id]
+    chunks: list[int] = []
+    for step in steps:
+        if req_id in step and sum(chunks) < len(prompt):
+            chunks.append(step[req_id])
+    return list(outputs[-1].outputs[0].token_ids), page, chunks, vocab_size
+
+
+# @spec PSTATE-DECL-017 PSTATE-DECL-004
 @requires_cuda
 @create_new_process_for_each_test("spawn")
-@pytest.mark.parametrize(
-    "prompt_len",
-    [
-        pytest.param(10, id="tail_2"),
-        pytest.param(
-            9,
-            id="tail_1",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "Pending question 2: one-token final prefill chunk takes "
-                    "the decode path"
-                ),
-            ),
-        ),
-    ],
-)
-def test_chunked_first_input_gives_the_unchunked_output_and_page(prompt_len):
-    """A state request whose first input is prefilled in chunks produces the
-    tokens and final page contents of the same request prefilled in one step.
-    The second chunk starts from the state the first chunk wrote, which
-    `PREFILL_STARTS` shows.
-
-    `tail_1` is a strict expected failure until Pending question 2 is
-    decided: core runs a one-token prefill tail on a row
-    with prior state through the state layer's decode path
-    (`BaseMambaAttentionMetadataBuilder._compute_common_metadata`), and the
-    stub's decode path continues the turn where its prefill path starts one,
-    so the turn ends a token early."""
+@pytest.mark.parametrize("case", list(CHUNK_CASES))
+def test_chunked_first_input_gives_the_unchunked_output_and_page(case):
+    """On a state model that declares `persistent_state_chunked_prefill`, a
+    first input prefilled in chunks, including a one-token final or
+    intermediate chunk, which runs on the decode path, produces the tokens and
+    final page contents of the same input prefilled in one step. The oracle
+    is the declaring stub's arithmetic, `expected_sums`, with positions read,
+    so a chunk run at a wrong position or on a reinitialized page differs."""
+    prompt_len, budget, async_scheduling = CHUNK_CASES[case]
     prompt = list(range(1, prompt_len + 1))
-    params = SamplingParams(temperature=0, max_tokens=MAX_TOKENS)
-    results = {}
-    for chunked in (False, True):
-        kwargs: dict = {"enforce_eager": True}
-        if chunked:
-            kwargs.update(
-                enable_chunked_prefill=True, max_num_batched_tokens=CHUNK_BUDGET
-            )
-        with _in_process_llm(**kwargs) as llm:
-            runner = _runner(llm)
-            vocab_size = llm.llm_engine.model_config.get_vocab_size()
-            stub.PAGES.clear()
-            stub.PREFILL_STARTS.clear()
-            [output] = llm.generate([{"prompt_token_ids": prompt}], params)
-            torch.accelerator.synchronize()
-            [entries] = stub.PAGES.values()
-            block_id = entries[0][0]
-            results[chunked] = (
-                without_eos(output.outputs[0].token_ids),
-                _page_values(runner, [block_id])[block_id],
-                list(stub.PREFILL_STARTS),
-            )
+    companion = case == "one_token_chunks"
+    tokens, page, chunks, vocab_size = _chunked_run(
+        prompt, None, False, async_scheduling
+    )
+    split_tokens, split_page, split_chunks, _ = _chunked_run(
+        prompt, budget, companion, async_scheduling
+    )
+    want, total = stub.expected_sums(
+        prompt,
+        vocab_size,
+        MAX_TOKENS,
+        initial_total=INITIAL_TOTAL,
+        reads_positions=True,
+    )
+    assert chunks == [prompt_len]
+    assert tokens == want
+    assert page == (total, stub.TURN_LEN - 1)
+    expected_chunks = {
+        "tail_2": [4, 4, 2],
+        "tail_1": [4, 4, 1],
+        "tail_1_async": [4, 4, 1],
+        "one_token_chunks": [1] * prompt_len,
+    }[case]
+    assert split_chunks == expected_chunks
+    assert split_tokens == tokens
+    assert split_page == page
 
-    (tokens, page, starts), (chunked_tokens, chunked_page, chunked_starts) = (
-        results[False],
-        results[True],
-    )
+
+# @spec PSTATE-DECL-016
+@requires_cuda
+@create_new_process_for_each_test("spawn")
+def test_state_model_without_the_declaration_prefills_a_first_input_whole():
+    """The stub, which does not declare `persistent_state_chunked_prefill`,
+    runs with chunked prefill off and a token budget of at least
+    `max_model_len`, so a first input runs as one prefill row; an explicit
+    request for chunked prefill is refused. (Its decode row continues a turn
+    where finishing a prefill would start one, so chunking would end a
+    one-token final chunk's turn a token early.)"""
+    prompt = list(range(1, 10))
+    with _in_process_llm(enforce_eager=True) as llm:
+        scheduler_config = llm.llm_engine.vllm_config.scheduler_config
+        assert scheduler_config.enable_chunked_prefill is False
+        assert (
+            scheduler_config.max_num_batched_tokens
+            >= llm.llm_engine.model_config.max_model_len
+        )
+        vocab_size = llm.llm_engine.model_config.get_vocab_size()
+        stub.PREFILL_STARTS.clear()
+        params = SamplingParams(temperature=0, max_tokens=MAX_TOKENS)
+        [output] = llm.generate([{"prompt_token_ids": prompt}], params)
+        assert stub.PREFILL_STARTS == [INITIAL_TOTAL]
     assert (
-        tokens == expected_turns([prompt], vocab_size, initial_total=INITIAL_TOTAL)[0]
+        without_eos(output.outputs[0].token_ids)
+        == expected_turns([prompt], vocab_size, initial_total=INITIAL_TOTAL)[0]
     )
-    assert starts == [INITIAL_TOTAL]
-    # The prompt did run in chunks, and the second resumed from the page.
-    assert chunked_starts[:2] == [
-        INITIAL_TOTAL,
-        INITIAL_TOTAL + sum(prompt[:CHUNK_BUDGET]),
-    ]
-    assert chunked_tokens == tokens
-    assert chunked_page == page
+    with (
+        pytest.raises(
+            ValueError, match="enable_chunked_prefill is not supported for this model"
+        ),
+        _in_process_llm(enable_chunked_prefill=True, max_num_batched_tokens=4),
+    ):
+        pass
+
+
+def _tokens_summing_to(total: int, vocab_size: int) -> list[int]:
+    """Valid prompt token ids whose sum is `total`."""
+    tokens = []
+    while total > 0:
+        tokens.append(min(total, vocab_size - 1))
+        total -= tokens[-1]
+    return tokens
+
+
+ONE_TOKEN_INPUT = [7]
+
+
+# @spec PSTATE-DECL-018
+@requires_cuda
+@create_new_process_for_each_test("spawn")
+@pytest.mark.parametrize("path", ["fold", "park"])
+def test_one_token_turn_input_gives_the_output_and_page_of_a_one_token_prefill(
+    path,
+):
+    """With chunked prefill off, a stream's one-token second input, queued so
+    it folds or sent after the stream parks, has prior state and so runs as a
+    decode row; it gives the tokens and page contents of a one-token prefill.
+
+    The oracle is an independent run: a fresh single request whose prompt
+    sums to the state the stream held before the input, minus the initial
+    value, followed by the same token. Its last prompt token runs on the
+    prefill path, from the same sum, so its tokens and final page are what a
+    one-token prefill of the input gives. The stub reads no positions here,
+    so the different prompt length cannot matter. The stub's arithmetic,
+    `expected_turns`, is checked as well."""
+    first = [10, 20, 30]
+    with _in_process_llm(enable_chunked_prefill=False, enforce_eager=True) as llm:
+        runner = _runner(llm)
+        vocab_size = llm.llm_engine.model_config.get_vocab_size()
+        driver = _CoreDriver(_engine_core(llm))
+        scheduler = driver.scheduler
+        stub.PAGES.clear()
+        stub.PREFILL_STARTS.clear()
+
+        driver.admit("s")
+        driver.send("s", first)
+        if path == "fold":
+            driver.send("s", ONE_TOKEN_INPUT)
+        driver.run_until(lambda: driver.num_turns_ended("s") == 1)
+        stream = scheduler.requests["s"]
+        if path == "fold":
+            assert stream.status != RequestStatus.WAITING_FOR_STREAMING_REQ
+            assert not stream.streaming_queue
+        else:
+            assert stream.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+        [[page]] = scheduler.kv_cache_manager.get_block_ids("s")
+        torch.accelerator.synchronize()
+        before = _page_values(runner, [page])[page]
+        if path == "park":
+            driver.send("s", ONE_TOKEN_INPUT)
+        driver.run_until(lambda: driver.num_turns_ended("s") == 2)
+        torch.accelerator.synchronize()
+        after = _page_values(runner, [page])[page]
+        driver.add(_close("s"))
+        driver.run_until_idle()
+        stream_prefill_starts = list(stub.PREFILL_STARTS)
+
+        oracle = _tokens_summing_to(before[0] - INITIAL_TOTAL, vocab_size)
+        driver.add(_core_input("oracle", oracle + ONE_TOKEN_INPUT, resumable=False))
+        driver.run_until_idle()
+        torch.accelerator.synchronize()
+        oracle_page = stub.PAGES["oracle"][0][0]
+        oracle_after = _page_values(runner, [oracle_page])[oracle_page]
+
+    # The stream's only prefill row was its first input's.
+    assert stream_prefill_starts == [INITIAL_TOTAL]
+    assert driver.tokens("s")[1] == driver.tokens("oracle")[0]
+    assert after == oracle_after
+    assert driver.tokens("s") == expected_turns(
+        [first, ONE_TOKEN_INPUT], vocab_size, initial_total=INITIAL_TOTAL
+    )

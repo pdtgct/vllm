@@ -2275,6 +2275,10 @@ class ModelConfig:
         return frozenset(self._model_info.persistent_state_resumable_stops)
 
     @property
+    def persistent_state_chunked_prefill(self) -> bool:
+        return self._model_info.persistent_state_chunked_prefill
+
+    @property
     def speculator_config_class(self) -> str | None:
         """For a speculative decoding draft model, the config class of the
         speculator it's for, if it declares one (see `SpeculativeDraftModel`)."""
@@ -2426,6 +2430,14 @@ class ModelConfig:
     @property
     def is_chunked_prefill_supported(self) -> bool:
         attn_type = self.attn_type
+
+        # @spec PSTATE-DECL-016
+        if self.has_persistent_state and not self.persistent_state_chunked_prefill:
+            logger.debug(
+                "Persistent state without persistent_state_chunked_prefill "
+                "does not support chunked prefill."
+            )
+            return False
 
         if pooler_config := self.pooler_config:
             # for pooling models

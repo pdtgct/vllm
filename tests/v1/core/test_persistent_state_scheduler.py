@@ -65,6 +65,7 @@ STATE_FACTS = {
     "persistent_state_reads_positions": True,
     "persistent_state_accepts_synthetic_warmup": True,
     "persistent_state_resumable_stops": frozenset({"eos"}),
+    "persistent_state_chunked_prefill": False,
 }
 """The `SupportsPersistentState` defaults, as `ModelConfig` exposes them."""
 
@@ -84,7 +85,12 @@ def make_scheduler(
     facts: dict[str, object] | None = None,
     **kwargs,
 ):
-    declare_state_facts(monkeypatch, **(facts or {}))
+    facts = {**STATE_FACTS, **(facts or {})}
+    declare_state_facts(monkeypatch, **facts)
+    # @spec PSTATE-DECL-016: chunked prefill only under the declaration.
+    kwargs.setdefault(
+        "enable_chunked_prefill", bool(facts["persistent_state_chunked_prefill"])
+    )
     if hybrid:
         kwargs["kv_cache_layer_config"] = attention_layer()
         kwargs["mamba_layer_config"] = state_layer()
@@ -463,17 +469,24 @@ def test_state_page_goes_to_another_request_only_after_terminal_finish(
     assert state_pages(scheduler, "other") == pages
 
 
-# Chunked prefill of a state request (design Pending question 2; no spec yet)
+# Chunked prefill of a state request
 
 
+# @spec PSTATE-DECL-017
 @pytest.mark.parametrize("hybrid", [False, True], ids=["state", "hybrid"])
 def test_chunked_first_input_runs_on_one_page_initialized_once(monkeypatch, hybrid):
-    """A first input longer than the step's token budget is prefilled in
-    chunks. Every chunk runs on the page the first chunk allocated, and core
-    initializes that page only in the first chunk's step, so a later chunk
-    continues from the state the earlier chunks wrote. Whether the model's
-    output equals an unchunked run is the stub model's GPU test."""
-    scheduler = make_scheduler(monkeypatch, hybrid=hybrid, max_num_batched_tokens=8)
+    """For a model that declares `persistent_state_chunked_prefill`, a first
+    input longer than the step's token budget is prefilled in chunks. Every
+    chunk runs on the page the first chunk allocated, and core initializes
+    that page only in the first chunk's step, so a later chunk continues from
+    the state the earlier chunks wrote. Whether the model's output equals an
+    unchunked run is the stub model's GPU test."""
+    scheduler = make_scheduler(
+        monkeypatch,
+        hybrid=hybrid,
+        facts={"persistent_state_chunked_prefill": True},
+        max_num_batched_tokens=8,
+    )
     state_groups = [
         group_id
         for group_id, group in enumerate(scheduler.kv_cache_config.kv_cache_groups)
@@ -850,12 +863,16 @@ def test_decode_stops_at_position_limit(
 
 # @spec PSTATE-TURN-010
 def test_running_loop_clamps_a_multi_token_step_to_the_position_length(monkeypatch):
-    """A chunked prefill continuing in the running loop: with 52 dropped
-    positions, 8 computed tokens and one sampled token a step, only 3 more
-    fit below the position limit, although the budget allows 8. Compaction
-    leaves no request this close to the limit mid-prefill, so the offset is
-    set directly."""
-    scheduler = make_scheduler(monkeypatch, max_num_batched_tokens=8)
+    """A chunked prefill, of a model that declares chunked prefill,
+    continuing in the running loop: with 52 dropped positions, 8 computed
+    tokens and one sampled token a step, only 3 more fit below the position
+    limit, although the budget allows 8. Compaction leaves no request this
+    close to the limit mid-prefill, so the offset is set directly."""
+    scheduler = make_scheduler(
+        monkeypatch,
+        facts={"persistent_state_chunked_prefill": True},
+        max_num_batched_tokens=8,
+    )
     request = stream_input("s", 20)
     scheduler.add_request(request)
     first = scheduler.schedule()

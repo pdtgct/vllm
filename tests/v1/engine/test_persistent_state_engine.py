@@ -86,6 +86,7 @@ from vllm.v1.worker.gpu.sample.logits_processor.interface import LogitsProcessor
 DELTA = RequestOutputKind.DELTA
 STUB_ARCH = "StubPersistentStateForCausalLM"
 NO_WARMUP_ARCH = "StubNoWarmupPersistentStateForCausalLM"
+CHUNKED_ARCH = "StubChunkedPrefillPersistentStateForCausalLM"
 
 
 def _engine_kwargs(arch: str = STUB_ARCH, **hf_overrides) -> dict:
@@ -117,11 +118,12 @@ def _load_stub_model_plugin():
     from vllm.plugins import load_general_plugins
 
     load_general_plugins()
-    if NO_WARMUP_ARCH not in ModelRegistry.get_supported_archs():
-        ModelRegistry.register_model(
-            NO_WARMUP_ARCH,
-            f"vllm_add_dummy_model.my_persistent_state:{NO_WARMUP_ARCH}",
-        )
+    # The plugin registers STUB_ARCH; register it too where plugins are off.
+    for arch in (STUB_ARCH, NO_WARMUP_ARCH, CHUNKED_ARCH):
+        if arch not in ModelRegistry.get_supported_archs():
+            ModelRegistry.register_model(
+                arch, f"vllm_add_dummy_model.my_persistent_state:{arch}"
+            )
 
 
 # @spec PSTATE-DECL-011
@@ -244,6 +246,105 @@ def test_state_model_accepts_async_scheduling_and_cuda_graphs():
     ).create_engine_config()
     assert config.scheduler_config.async_scheduling is True
     assert config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+
+
+LONG_MODEL_LEN = 16384
+"""A `max_model_len` above the default token budget `EngineArgs` picks with no
+usage context (2048), so raising an unset budget to `max_model_len` is
+observable."""
+
+
+def _long_engine_kwargs(arch: str = STUB_ARCH) -> dict:
+    return _engine_kwargs(arch, max_position_embeddings=LONG_MODEL_LEN) | dict(
+        max_model_len=LONG_MODEL_LEN
+    )
+
+
+# @spec PSTATE-DECL-016
+def test_state_model_runs_without_chunked_prefill_by_default():
+    """Without the declaration and with no chunked-prefill setting, the state
+    model runs with chunked prefill off, and its unset token budget rises to
+    `max_model_len` so that a whole first input fits one step."""
+    config = EngineArgs(**_long_engine_kwargs()).create_engine_config()
+    assert config.scheduler_config.enable_chunked_prefill is False
+    assert config.scheduler_config.max_num_batched_tokens >= LONG_MODEL_LEN
+
+
+# @spec PSTATE-DECL-016
+def test_state_model_refuses_explicit_chunked_prefill():
+    with pytest.raises(
+        ValueError, match="enable_chunked_prefill is not supported for this model"
+    ):
+        EngineArgs(
+            **STATE_ENGINE_KWARGS, enable_chunked_prefill=True
+        ).create_engine_config()
+
+
+# @spec PSTATE-DECL-016
+@pytest.mark.parametrize("explicit", [True, None], ids=["explicit", "default"])
+def test_vllm_config_refuses_chunked_prefill_for_a_state_model(explicit):
+    """The refusal holds for a config built without `EngineArgs`, whether the
+    `SchedulerConfig` enables chunked prefill explicitly or by its default."""
+    base = EngineArgs(**STATE_ENGINE_KWARGS).create_engine_config()
+    kwargs = {} if explicit is None else {"enable_chunked_prefill": explicit}
+    scheduler_config = SchedulerConfig.default_factory(
+        max_model_len=base.model_config.max_model_len, **kwargs
+    )
+    with pytest.raises(
+        ValueError, match="enable_chunked_prefill is not supported for this model"
+    ):
+        VllmConfig(
+            model_config=base.model_config,
+            cache_config=base.cache_config,
+            scheduler_config=scheduler_config,
+        )
+
+
+# @spec PSTATE-DECL-016
+def test_state_model_accepts_explicit_chunked_prefill_off():
+    config = EngineArgs(
+        **STATE_ENGINE_KWARGS, enable_chunked_prefill=False
+    ).create_engine_config()
+    assert config.scheduler_config.enable_chunked_prefill is False
+
+
+# @spec PSTATE-DECL-004 PSTATE-DECL-016
+@pytest.mark.parametrize(
+    ("arch", "declared"), [(STUB_ARCH, False), (CHUNKED_ARCH, True)]
+)
+def test_model_config_exposes_the_chunked_prefill_declaration(arch, declared):
+    config = EngineArgs(**_engine_kwargs(arch)).create_engine_config()
+    assert config.model_config.persistent_state_chunked_prefill is declared
+
+
+# @spec PSTATE-DECL-016
+@pytest.mark.parametrize("explicit", [None, True, False], ids=["default", "on", "off"])
+def test_declaring_state_model_keeps_upstream_chunked_prefill(explicit):
+    """A state model that declares `persistent_state_chunked_prefill` keeps
+    upstream's default, chunked prefill on, with its token budget below
+    `max_model_len`, and an explicit setting either way is accepted."""
+    config = EngineArgs(
+        **_long_engine_kwargs(CHUNKED_ARCH), enable_chunked_prefill=explicit
+    ).create_engine_config()
+    assert config.model_config.is_chunked_prefill_supported
+    enabled = explicit is not False
+    assert config.scheduler_config.enable_chunked_prefill is enabled
+    if enabled:
+        assert config.scheduler_config.max_num_batched_tokens < LONG_MODEL_LEN
+
+
+# @spec PSTATE-DECL-013 PSTATE-DECL-016
+@pytest.mark.parametrize("explicit", [None, True, False], ids=["default", "on", "off"])
+def test_ordinary_model_keeps_upstream_chunked_prefill(explicit):
+    config = EngineArgs(
+        model="facebook/opt-125m",
+        load_format="dummy",
+        max_model_len=256,
+        enable_chunked_prefill=explicit,
+    ).create_engine_config()
+    assert not config.model_config.has_persistent_state
+    assert config.model_config.is_chunked_prefill_supported
+    assert config.scheduler_config.enable_chunked_prefill is (explicit is not False)
 
 
 def _state_group(spec: MambaSpec | None = None):
@@ -1226,6 +1327,8 @@ async def test_output_generator_ending_early_aborts_the_stream(monkeypatch, endi
 def _state_scheduler(monkeypatch: pytest.MonkeyPatch, **kwargs):
     declare_state_facts(monkeypatch)
     layer_config = MambaManager.layer_config(_state_spec(), recomputable=False)
+    # @spec PSTATE-DECL-016: the stub state model does not declare chunked prefill.
+    kwargs.setdefault("enable_chunked_prefill", False)
     return create_scheduler(
         max_model_len=64, block_size=64, kv_cache_layer_config=layer_config, **kwargs
     )

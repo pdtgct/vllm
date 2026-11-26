@@ -3311,8 +3311,9 @@ class VllmConfig:
         mm_config.validate_mm_processor_device(self.ec_transfer_config)
 
     def _verify_persistent_state_config(self) -> None:
-        # @spec PSTATE-DECL-005: the options that would recompute, share or
-        # move a page of state the model's tokens cannot rebuild.
+        # @spec PSTATE-DECL-005 PSTATE-DECL-016: the options that would
+        # recompute, share or move a page of state the model's tokens cannot
+        # rebuild, and chunked prefill unless the model declares it.
         model_config = self.model_config
         if model_config is None or not model_config.has_persistent_state:
             return
@@ -3324,6 +3325,11 @@ class VllmConfig:
         no_warmup = not model_config.persistent_state_accepts_synthetic_warmup
         unsupported = (
             ("enable_prefix_caching", self.cache_config.enable_prefix_caching),
+            (
+                "enable_chunked_prefill",
+                self.scheduler_config.enable_chunked_prefill
+                and not model_config.persistent_state_chunked_prefill,
+            ),
             ("kv_transfer_config", kv is not None and kv.kv_connector is not None),
             ("ec_transfer_config", ec is not None and ec.ec_connector is not None),
             ("speculative_config", self.speculative_config is not None),
