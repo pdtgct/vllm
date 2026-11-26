@@ -10,7 +10,8 @@ shared, uninitialized or doubly written state changes the tokens.
 import asyncio
 import gc
 import os
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -20,6 +21,7 @@ import torch
 from vllm_add_dummy_model import my_persistent_state as stub
 from vllm_add_dummy_model.my_persistent_state import expected_turns, without_eos
 
+import vllm.envs as envs
 import vllm.v1.worker.gpu.cudagraph_utils as cudagraph_utils
 from tests.utils import create_new_process_for_each_test
 from vllm import LLM, ModelRegistry, SamplingParams
@@ -31,10 +33,12 @@ from vllm.inputs import TokensPrompt
 from vllm.plugins import load_general_plugins
 from vllm.sampling_params import RequestOutputKind
 from vllm.utils.vmm_driver import vmm_unavailable_reason
+from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.engine.core_client import InprocClient
 from vllm.v1.engine.exceptions import StreamAdmissionError
+from vllm.v1.request import RequestStatus
 from vllm.v1.worker import gpu_worker
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
@@ -594,6 +598,210 @@ async def test_stream_keeps_its_page_and_address_until_its_terminal_finish(
     assert third == first
 
 
+# An engine core driven in this process, one step at a time
+
+
+def _engine_core(llm: LLM) -> EngineCore:
+    client = llm.llm_engine.engine_core
+    assert isinstance(client, InprocClient)
+    return client.engine_core
+
+
+def _core_input(
+    request_id: str,
+    prompt: list[int],
+    *,
+    resumable: bool = True,
+    continuation: bool = False,
+) -> EngineCoreRequest:
+    """A greedy input as the engine core receives it: an opener, a
+    continuation, a close (`resumable=False, continuation=True`) or, with
+    neither flag, a single request."""
+    params = SamplingParams(
+        temperature=0, max_tokens=MAX_TOKENS, output_kind=RequestOutputKind.DELTA
+    )
+    params.update_from_generation_config({}, eos_token_id=stub.EOS_TOKEN_ID)
+    return EngineCoreRequest(
+        request_id=request_id,
+        prompt_token_ids=list(prompt),
+        mm_features=None,
+        sampling_params=params,
+        pooling_params=None,
+        arrival_time=time.time(),
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        resumable=resumable,
+        continuation=continuation,
+    )
+
+
+def _close(request_id: str) -> EngineCoreRequest:
+    """The close as `AsyncLLM` sends it: a one-token `[0]` final request."""
+    return _core_input(request_id, [0], resumable=False, continuation=True)
+
+
+class _CoreDriver:
+    """Steps an in-process engine core and collects each request's tokens per
+    turn and the request ids each nonempty step scheduled.
+
+    Streams are routed as `AsyncLLM` routes them: `admit` admits the stream
+    with no prompt, and every input, the first and the close included, is a
+    continuation of it, so the first input resumes the admitted stream and
+    records its row reservation. Because the test adds each input between
+    steps, the order of every input relative to every stop is fixed: an
+    input added while its stream runs queues and folds at the turn's stop,
+    and one added while the stream is parked resumes it. `InprocClient`
+    refuses streaming inputs for a state model because the engine-core
+    process owns the stream guards and terminal outputs; these tests read
+    neither.
+    """
+
+    def __init__(self, core: EngineCore) -> None:
+        self.core = core
+        self.scheduler = core.scheduler
+        self.turns: dict[str, list[list[int]]] = {}
+        self.batches: list[frozenset[str]] = []
+        self.num_steps = 0
+        schedule = self.scheduler.schedule
+
+        def recording_schedule(*args, **kwargs):
+            output = schedule(*args, **kwargs)
+            if output.num_scheduled_tokens:
+                self.batches.append(frozenset(output.num_scheduled_tokens))
+            return output
+
+        self.scheduler.schedule = recording_schedule
+
+    def add(self, request: EngineCoreRequest) -> None:
+        req, wave = self.core.preprocess_add_request(request)
+        self.core.add_request(req, wave)
+
+    def admit(self, request_id: str) -> None:
+        assert self.core.admit_stream(_core_input(request_id, [])) is None
+
+    def send(self, request_id: str, prompt: list[int]) -> None:
+        """The next input of the admitted stream `request_id`."""
+        self.add(_core_input(request_id, prompt, continuation=True))
+
+    def step(self) -> None:
+        outputs, model_executed = self.core.step_fn()
+        self.core.post_step(model_executed)
+        self.num_steps += 1
+        for engine_core_outputs in (outputs or {}).values():
+            for output in engine_core_outputs.outputs:
+                turns = self.turns.setdefault(output.request_id, [[]])
+                turns[-1].extend(output.new_token_ids)
+                if output.finish_reason is not None:
+                    turns.append([])
+
+    def run_until(self, done: Callable[[], bool], max_steps: int = 200) -> None:
+        for _ in range(max_steps):
+            if done():
+                return
+            self.step()
+        raise AssertionError(f"not done after {max_steps} steps")
+
+    def run_until_idle(self) -> None:
+        self.run_until(lambda: not self.scheduler.has_requests())
+
+    def num_turns_ended(self, request_id: str) -> int:
+        return len(self.turns.get(request_id, [[]])) - 1
+
+    def tokens(self, request_id: str) -> list[list[int]]:
+        """Each ended turn's tokens, EOS excluded."""
+        return [without_eos(turn) for turn in self.turns[request_id][:-1]]
+
+
+FOLD_INPUTS = [[10, 20, 30], [40, 50], [60], [70, 80]]
+"""A first turn that parks, a second input that resumes it, and two inputs
+that reach core while the stream runs and so fold."""
+
+
+# @spec PSTATE-PRES-009 PSTATE-ACC-008
+@requires_cuda
+@create_new_process_for_each_test("spawn")
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_stream_keeps_its_page_and_address_through_forced_folds(async_scheduling):
+    """A stream parks after its first turn, resumes, and then folds twice and
+    ends on a close it folds the same way: core adds each later input while
+    the previous turn runs, so the stream never parks between those turns.
+    Every turn, compacted after the first, runs on the block id and device
+    addresses of the first turn; a request running beside the stream gets
+    another page, and the stream's page goes to another request only after
+    the stream's terminal finish."""
+    with _in_process_llm(async_scheduling=async_scheduling) as llm:
+        vocab_size = llm.llm_engine.model_config.get_vocab_size()
+        driver = _CoreDriver(_engine_core(llm))
+        scheduler = driver.scheduler
+        stub.PAGES.clear()
+
+        pool = scheduler.kv_cache_manager.block_pool
+
+        def assert_page_held(block_id: int) -> None:
+            """The stream still references its page, and the pool cannot hand
+            it to another request."""
+            assert scheduler.kv_cache_manager.get_block_ids("s") == ([block_id],)
+            assert pool.blocks[block_id].ref_cnt > 0
+            free = pool.free_block_queue.get_all_free_blocks()
+            assert block_id not in {block.block_id for block in free}
+
+        driver.admit("s")
+        stream = scheduler.requests["s"]
+        driver.send("s", FOLD_INPUTS[0])
+        assert stream in scheduler.resumed_streaming_sessions
+        driver.run_until(lambda: driver.num_turns_ended("s") == 1)
+        assert stream.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+        [[page]] = scheduler.kv_cache_manager.get_block_ids("s")
+        assert_page_held(page)
+
+        driver.send("s", FOLD_INPUTS[1])
+        assert stream.status == RequestStatus.WAITING
+        for prompt in FOLD_INPUTS[2:]:
+            driver.send("s", prompt)
+        assert stream.streaming_queue is not None
+        assert len(stream.streaming_queue) == 2
+        driver.add(_core_input("beside", [1, 2, 3], resumable=False))
+
+        # Each stop folds the next queued input: the stream is waiting to be
+        # scheduled again, not parked, and the queue is one shorter.
+        for turn, num_queued in ((2, 1), (3, 0)):
+            driver.run_until(lambda turn=turn: driver.num_turns_ended("s") == turn)
+            assert stream.status != RequestStatus.WAITING_FOR_STREAMING_REQ
+            assert scheduler.num_waiting_for_streaming_input == 0
+            assert len(stream.streaming_queue) == num_queued
+            assert_page_held(page)
+        driver.add(_close("s"))
+        assert len(stream.streaming_queue) == 1
+        driver.run_until(lambda: "s" not in scheduler.requests)
+        assert stream.status == RequestStatus.FINISHED_STOPPED
+        assert driver.num_turns_ended("s") == len(FOLD_INPUTS)
+        driver.run_until_idle()
+        held = {req_id: list(entries) for req_id, entries in stub.PAGES.items()}
+
+        # Two requests take both pages, so one of them takes the stream's.
+        driver.add(_core_input("after-0", [4, 5], resumable=False))
+        driver.add(_core_input("after-1", [6, 7], resumable=False))
+        driver.run_until_idle()
+        after = {stub.PAGES[r][0][0] for r in ("after-0", "after-1")}
+
+    assert driver.tokens("s") == expected_turns(
+        FOLD_INPUTS, vocab_size, initial_total=INITIAL_TOTAL
+    )
+    assert driver.tokens("beside") == expected_turns(
+        [[1, 2, 3]], vocab_size, initial_total=INITIAL_TOTAL
+    )
+    entries = held["s"]
+    # One entry per turn: the park, the resume and both folds re-add the row.
+    assert len(entries) == len(FOLD_INPUTS)
+    offsets = [offset for _, _, offset in entries]
+    assert offsets[0] == 0 and all(o > 0 for o in offsets[1:]), offsets
+    assert len({(block_id, addresses) for block_id, addresses, _ in entries}) == 1
+    assert entries[0][0] == page
+    assert held["beside"][0][0] != page
+    assert page in after
+
+
 GRAPH_MODES = ("PIECEWISE", "FULL", "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE")
 GRAPH_PROMPTS = [[1, 2, 3], [40, 50]]
 
@@ -1017,3 +1225,248 @@ def test_layout_is_unchanged_by_sleep_wake_and_the_recapture(extensible):
         # The recapture addressed block id 0 again.
         assert stub.CAPTURES[-1][1] == (0,) * runner.max_num_reqs
         assert runner.model_state.state_graph is not None
+
+
+# Batch invariance
+
+BATCH_INVARIANT_SETTINGS = """What `VLLM_BATCH_INVARIANT=1` selects here, from the code.
+
+On a CUDA device of capability 8.x (A40 is 8.6, L40S 8.9) the worker's
+`init_batch_invariance` installs the Triton matmul, linear, softmax,
+log_softmax, mean and bmm overrides, sets `VLLM_USE_AOT_COMPILE=0` and
+inductor's `batch_invariant` flag, and turns TF32 off. The mode changes the
+graph settings only through `VllmConfig._maybe_enable_breakable_cudagraph`,
+which turns breakable CUDA graphs on, and compilation mode NONE, for an
+unquantized bf16 model with a matmul shape in the device family's tuned table
+(none for 8.6, `ada` for 8.9). The stub's dtype is the fp16 of
+facebook/opt-125m's config, so the stub keeps the engine's default
+compilation and graph settings; the test prints what they resolved to. The
+`PERSISTENT_STATE` backend inherits `supports_batch_invariance` from the
+short-conv backend, so the mode does not refuse it."""
+
+BI_STREAMS = {"stream": [[10, 20, 30], [40, 50], [60]], "stream-b": [[1, 2], [3, 4, 5]]}
+BI_SINGLES = {"single": [7, 8, 9], "single-b": [11, 12], "single-c": [13, 14, 15, 16]}
+
+BI_RUNS: dict[str, dict[str, int]] = {
+    "stream_alone": {"stream": 0},
+    "single_alone": {"single": 0},
+    "pair": {"stream": 0, "single": 0},
+    "four": {"stream": 0, "single": 0, "stream-b": 0, "single-b": 0},
+    "staggered": {"stream": 0, "single-b": 1, "single": 2, "stream-b": 4},
+    "singles": {"single": 0, "single-b": 0, "single-c": 0},
+}
+"""Each run's requests, by name, and the step of the run before which core
+receives each. A stream's inputs and its close all arrive with its admission,
+so each input after the first folds at the previous turn's stop."""
+
+
+def _add_bi_request(driver: _CoreDriver, run: str, name: str) -> None:
+    request_id = f"{run}/{name}"
+    if name in BI_SINGLES:
+        driver.add(_core_input(request_id, BI_SINGLES[name], resumable=False))
+        return
+    driver.admit(request_id)
+    for prompt in BI_STREAMS[name]:
+        driver.send(request_id, prompt)
+    driver.add(_close(request_id))
+
+
+# @spec PSTATE-DECL-006
+@requires_cuda
+@create_new_process_for_each_test("spawn")
+def test_batch_invariant_mode_gives_state_requests_the_same_tokens_in_any_batch():
+    """Supplementary evidence, not an arm of PSTATE-ACC-007, which names the
+    Nemotron streaming plugin: with batch-invariant mode on, core accepts a
+    state model (PSTATE-DECL-006), and one state stream and one single state
+    request produce the same token ids alone and in batches of two, three and
+    four rows that mix streams and single requests, including rows that join
+    mid-stream, so each row stays on its own state. The stub computes exact
+    int64 sums, which no reduction order changes, so this test cannot reveal
+    a batch-variance failure. `BATCH_INVARIANT_SETTINGS` records the
+    settings."""
+    os.environ["VLLM_BATCH_INVARIANT"] = "1"
+    with _in_process_llm(max_num_seqs=4, num_gpu_blocks_override=5) as llm:
+        assert envs.VLLM_BATCH_INVARIANT
+        # Set by the worker's `init_batch_invariance`, in this process.
+        assert os.environ["VLLM_USE_AOT_COMPILE"] == "0"
+        compilation = _runner(llm).compilation_config
+        settings = {
+            "device": torch.cuda.get_device_name(),
+            "capability": torch.cuda.get_device_capability(),
+            "compilation_mode": compilation.mode,
+            "cudagraph_mode": compilation.cudagraph_mode,
+            "use_breakable_cudagraph": compilation.use_breakable_cudagraph,
+            "async_scheduling": (
+                llm.llm_engine.vllm_config.scheduler_config.async_scheduling
+            ),
+        }
+        print(f"batch-invariant settings: {settings}")
+        assert not compilation.use_breakable_cudagraph, settings
+        vocab_size = llm.llm_engine.model_config.get_vocab_size()
+        driver = _CoreDriver(_engine_core(llm))
+        batches: dict[str, list[frozenset[str]]] = {}
+        for run, starts in BI_RUNS.items():
+            pending = dict(starts)
+            first_batch = len(driver.batches)
+            for step in range(200):
+                for name in [n for n, at in pending.items() if at <= step]:
+                    _add_bi_request(driver, run, name)
+                    del pending[name]
+                if not pending and not driver.scheduler.has_requests():
+                    break
+                driver.step()
+            else:
+                raise AssertionError(f"run {run} did not finish")
+            batches[run] = driver.batches[first_batch:]
+
+    def rows(run: str) -> list[int]:
+        return [len(batch) for batch in batches[run]]
+
+    # The rows really shared steps, so each run is the batch it names.
+    assert max(rows("pair")) == 2
+    assert max(rows("four")) == 4
+    assert max(rows("singles")) == 3
+    assert len(set(rows("staggered"))) > 1, rows("staggered")
+    # Each request that joined mid-stream shared a step with the stream.
+    for name in ("single-b", "single", "stream-b"):
+        pair = {"staggered/stream", f"staggered/{name}"}
+        assert any(pair <= batch for batch in batches["staggered"]), name
+
+    stream = driver.tokens("stream_alone/stream")
+    single = driver.tokens("single_alone/single")
+    assert stream == expected_turns(
+        BI_STREAMS["stream"], vocab_size, initial_total=INITIAL_TOTAL
+    )
+    assert single == expected_turns(
+        [BI_SINGLES["single"]], vocab_size, initial_total=INITIAL_TOTAL
+    )
+    for run, starts in BI_RUNS.items():
+        if "stream" in starts:
+            assert driver.tokens(f"{run}/stream") == stream, run
+        if "single" in starts:
+            assert driver.tokens(f"{run}/single") == single, run
+
+
+ORDINARY_PROMPTS = [
+    list(range(100, 105)),
+    list(range(200, 217)),
+    list(range(300, 333)),
+    list(range(400, 409)),
+]
+
+
+# @spec PSTATE-DECL-013
+@requires_cuda
+@create_new_process_for_each_test("spawn")
+def test_batch_invariant_mode_is_consistent_for_an_ordinary_model():
+    """An internal-consistency check, not the upstream regression: with
+    batch-invariant mode on, an ordinary model (facebook/opt-125m with dummy
+    weights) gives each prompt the same greedy token ids alone and in batches
+    of two and four in either order, and no persistent-state check is active.
+    It pins no upstream token ids. Prefix caching is off, as in the upstream
+    batch-invariance tests; the upstream regression arm is
+    `tests/v1/determinism/test_batch_invariance.py`."""
+    os.environ["VLLM_BATCH_INVARIANT"] = "1"
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    with _llm(
+        model="facebook/opt-125m",
+        load_format="dummy",
+        max_model_len=256,
+        max_num_seqs=4,
+        enable_prefix_caching=False,
+        gpu_memory_utilization=SIZED_MEMORY_UTILIZATION,
+    ) as llm:
+        assert envs.VLLM_BATCH_INVARIANT
+        assert not llm.llm_engine.model_config.has_persistent_state
+        assert not _engine_core(llm).scheduler.has_unrecomputable_state
+        params = SamplingParams(temperature=0, max_tokens=MAX_TOKENS, ignore_eos=True)
+
+        def tokens(prompts: list[list[int]]) -> list[list[int]]:
+            outputs = llm.generate(
+                [{"prompt_token_ids": p} for p in prompts], params, use_tqdm=False
+            )
+            return [list(output.outputs[0].token_ids) for output in outputs]
+
+        alone = [tokens([prompt])[0] for prompt in ORDINARY_PROMPTS]
+        assert tokens(ORDINARY_PROMPTS[:2]) == alone[:2]
+        assert tokens(ORDINARY_PROMPTS) == alone
+        assert tokens(ORDINARY_PROMPTS[::-1]) == alone[::-1]
+
+
+# Chunked prefill of a state request (design Pending question 2; no spec yet)
+
+CHUNK_BUDGET = 4
+"""Tokens per step in the chunked engine, so a first input of 9 or 10 tokens
+is prefilled as chunks of 4, 4 and the remainder."""
+
+
+@requires_cuda
+@create_new_process_for_each_test("spawn")
+@pytest.mark.parametrize(
+    "prompt_len",
+    [
+        pytest.param(10, id="tail_2"),
+        pytest.param(
+            9,
+            id="tail_1",
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "Pending question 2: one-token final prefill chunk takes "
+                    "the decode path"
+                ),
+            ),
+        ),
+    ],
+)
+def test_chunked_first_input_gives_the_unchunked_output_and_page(prompt_len):
+    """A state request whose first input is prefilled in chunks produces the
+    tokens and final page contents of the same request prefilled in one step.
+    The second chunk starts from the state the first chunk wrote, which
+    `PREFILL_STARTS` shows.
+
+    `tail_1` is a strict expected failure until Pending question 2 is
+    decided: core runs a one-token prefill tail on a row
+    with prior state through the state layer's decode path
+    (`BaseMambaAttentionMetadataBuilder._compute_common_metadata`), and the
+    stub's decode path continues the turn where its prefill path starts one,
+    so the turn ends a token early."""
+    prompt = list(range(1, prompt_len + 1))
+    params = SamplingParams(temperature=0, max_tokens=MAX_TOKENS)
+    results = {}
+    for chunked in (False, True):
+        kwargs: dict = {"enforce_eager": True}
+        if chunked:
+            kwargs.update(
+                enable_chunked_prefill=True, max_num_batched_tokens=CHUNK_BUDGET
+            )
+        with _in_process_llm(**kwargs) as llm:
+            runner = _runner(llm)
+            vocab_size = llm.llm_engine.model_config.get_vocab_size()
+            stub.PAGES.clear()
+            stub.PREFILL_STARTS.clear()
+            [output] = llm.generate([{"prompt_token_ids": prompt}], params)
+            torch.accelerator.synchronize()
+            [entries] = stub.PAGES.values()
+            block_id = entries[0][0]
+            results[chunked] = (
+                without_eos(output.outputs[0].token_ids),
+                _page_values(runner, [block_id])[block_id],
+                list(stub.PREFILL_STARTS),
+            )
+
+    (tokens, page, starts), (chunked_tokens, chunked_page, chunked_starts) = (
+        results[False],
+        results[True],
+    )
+    assert (
+        tokens == expected_turns([prompt], vocab_size, initial_total=INITIAL_TOTAL)[0]
+    )
+    assert starts == [INITIAL_TOTAL]
+    # The prompt did run in chunks, and the second resumed from the page.
+    assert chunked_starts[:2] == [
+        INITIAL_TOTAL,
+        INITIAL_TOTAL + sum(prompt[:CHUNK_BUDGET]),
+    ]
+    assert chunked_tokens == tokens
+    assert chunked_page == page

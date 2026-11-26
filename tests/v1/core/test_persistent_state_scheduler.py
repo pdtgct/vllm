@@ -463,6 +463,60 @@ def test_state_page_goes_to_another_request_only_after_terminal_finish(
     assert state_pages(scheduler, "other") == pages
 
 
+# Chunked prefill of a state request (design Pending question 2; no spec yet)
+
+
+@pytest.mark.parametrize("hybrid", [False, True], ids=["state", "hybrid"])
+def test_chunked_first_input_runs_on_one_page_initialized_once(monkeypatch, hybrid):
+    """A first input longer than the step's token budget is prefilled in
+    chunks. Every chunk runs on the page the first chunk allocated, and core
+    initializes that page only in the first chunk's step, so a later chunk
+    continues from the state the earlier chunks wrote. Whether the model's
+    output equals an unchunked run is the stub model's GPU test."""
+    scheduler = make_scheduler(monkeypatch, hybrid=hybrid, max_num_batched_tokens=8)
+    state_groups = [
+        group_id
+        for group_id, group in enumerate(scheduler.kv_cache_config.kv_cache_groups)
+        if not group.manager_config.recomputable
+    ]
+    request = stream_input("s", 20)
+    scheduler.add_request(request)
+
+    chunks, initialized = [], []
+    pages = None
+    for _ in range(8):
+        if request.num_output_tokens:
+            break
+        output = scheduler.schedule()
+        chunks.append(output.num_scheduled_tokens.get("s", 0))
+        initialized.append(output.new_state_block_ids)
+        if pages is None:
+            pages = state_pages(scheduler, "s")
+            assert new_request_data(output, "s").num_computed_tokens == 0
+        else:
+            assert "s" in output.scheduled_cached_reqs.req_ids
+            assert sent_state_pages(scheduler, output, "s") in (
+                None,
+                [[] for _ in pages],
+            )
+        assert state_pages(scheduler, "s") == pages
+        # A partial prefill samples nothing.
+        sampled = [[] if request.is_prefill_chunk else [TOKEN]]
+        scheduler.update_from_output(
+            output, ModelRunnerOutput(req_ids=["s"], sampled_token_ids=sampled)
+        )
+    else:
+        raise AssertionError(f"no output after chunks {chunks}")
+
+    assert chunks == [8, 8, 4]
+    assert pages is not None and all(len(group) == 1 for group in pages)
+    assert initialized[0] == {
+        group_id: group for group_id, group in zip(state_groups, pages, strict=True)
+    }
+    assert initialized[1:] == [None, None]
+    assert list(request.output_token_ids) == [TOKEN]
+
+
 # Per-request barrier
 
 
