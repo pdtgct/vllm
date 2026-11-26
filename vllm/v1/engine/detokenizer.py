@@ -140,6 +140,9 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
         else:
             self.stop_buffer_length = 0
         self._last_output_text_offset: int = 0
+        # An admitted state stream opens with no prompt; its first input
+        # initializes the decoding state (PSTATE-HIST-005).
+        self._awaiting_first_prompt = not request.prompt_token_ids
 
         # Generation data
         self.output_text = ""
@@ -208,6 +211,14 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
     @abstractmethod
     def decode_next(self, next_token_id: int) -> str:
         raise NotImplementedError
+
+    def take_first_prompt(self) -> bool:
+        """Whether the turn about to start is the stream's first input, which
+        initializes the decoding state: nothing was seeded and nothing decoded.
+        Only the first call can return True."""
+        first = self._awaiting_first_prompt and not self.token_ids
+        self._awaiting_first_prompt = False
+        return first
 
     def start_turn(self, prompt_token_ids: list[int] | None) -> None:
         super().start_turn(prompt_token_ids)
@@ -281,11 +292,17 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
         )
 
     def start_turn(self, prompt_token_ids: list[int] | None) -> None:
+        # @spec PSTATE-HIST-005 PSTATE-HIST-010
+        """Carry the stream, its pending bytes and `last_special` into the
+        turn. Only the stream's first input seeds them, when the stream opened
+        without a prompt."""
+        first = self.take_first_prompt()
         super().start_turn(prompt_token_ids)
-        # The old stream held every id it ever stepped.
-        self._seed_stream(prompt_token_ids)
-        if not self.spaces_between_special_tokens:
-            self.last_special = False
+        if first:
+            self._seed_stream(prompt_token_ids)
+        # As in upstream streaming input, which never touches the detokenizer
+        # between chunks, the carried `DecodeStream` grows during a run of
+        # steps that produce no text and drains on the next step that does.
 
     def decode_next(self, next_token_id: int) -> str:
         token = self._protected_step(next_token_id)
@@ -371,20 +388,32 @@ class SlowIncrementalDetokenizer(BaseIncrementalDetokenizer):
         return len(self.token_ids) - self.prompt_len
 
     def start_turn(self, prompt_token_ids: list[int] | None) -> None:
+        # @spec PSTATE-HIST-005 PSTATE-HIST-010
+        """Keep the tail of the tokens that decoding the next token reads,
+        with the offsets rebased to it. Only the stream's first input seeds
+        them, when the stream opened without a prompt."""
+        first = self.take_first_prompt()
+        num_kept = len(self.tokens) - self.prefix_offset
+        kept_ids = self.token_ids[max(len(self.token_ids) - num_kept, 0) :]
+        del self.tokens[: self.prefix_offset]
+        self.read_offset -= self.prefix_offset
+        self.prefix_offset = 0
         super().start_turn(prompt_token_ids)
-        # Keep the prompt window convert_prompt_ids_to_tokens reads.
-        num_kept = INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET + 2
-        window = (prompt_token_ids or [])[-num_kept:]
-        self.tokens, self.prefix_offset, self.read_offset = (
-            convert_prompt_ids_to_tokens(
-                tokenizer=self.tokenizer,
-                prompt_ids=window,
-                skip_special_tokens=self.skip_special_tokens,
+        if first:
+            # The window `convert_prompt_ids_to_tokens` reads.
+            kept_ids = (prompt_token_ids or [])[
+                -(INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET + 2) :
+            ]
+            self.tokens, self.prefix_offset, self.read_offset = (
+                convert_prompt_ids_to_tokens(
+                    tokenizer=self.tokenizer,
+                    prompt_ids=kept_ids,
+                    skip_special_tokens=self.skip_special_tokens,
+                )
             )
-        )
-        gc_untrack(self.tokens)
-        self.prompt_len = len(window)
-        self.token_ids.extend(window)
+            gc_untrack(self.tokens)
+        self.token_ids.extend(kept_ids)
+        self.prompt_len = len(kept_ids)
 
     def decode_next(self, next_token_id: int) -> str:
         new_tokens, decoded_text, prefix_offset, read_offset = detokenize_incrementally(

@@ -293,7 +293,7 @@ class RequestState:
 
     def _start_turn(self, update: StreamingUpdate) -> None:
         """The new input replaces the prompt; per-turn output state restarts."""
-        # @spec PSTATE-HIST-005
+        # @spec PSTATE-HIST-005 PSTATE-HIST-010
         self.prompt = update.prompt
         self.prompt_token_ids = gc_untrack(update.prompt_token_ids or [])
         if self.detokenizer is not None:
