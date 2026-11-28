@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Literal, TypeVar
 
 from pydantic import Field
 
+from vllm import envs
 from vllm.config import utils as config_utils
 from vllm.config.diffusion import DiffusionConfig, DiffusionModelOptions
 from vllm.logger import init_logger
@@ -600,7 +601,11 @@ class Gemma4Config(VerifyAndUpdateConfig):
 
         max_head_dim = max(head_dims.values())
 
-        if is_fa_version_supported(4) and max_head_dim <= 512:
+        if (
+            not envs.VLLM_BATCH_INVARIANT
+            and is_fa_version_supported(4)
+            and max_head_dim <= 512
+        ):
             if (
                 vllm_config.attention_config.flash_attn_version is None
                 and vllm_config.attention_config.backend
@@ -638,7 +643,7 @@ class Gemma4Config(VerifyAndUpdateConfig):
             vllm_config.attention_config.backend = backend
             logger.info(
                 "Gemma4 model has heterogeneous head dimensions "
-                "%s. FA4 not available, forcing %s backend.",
+                "%s. FA4 is unavailable for this configuration, forcing %s backend.",
                 head_dims,
                 backend.name,
             )
@@ -904,6 +909,12 @@ class NemotronLabsDiffusionForBlockDiffusionConfig(VerifyAndUpdateConfig):
             if "max_new_tokens" not in model_config.override_generation_config:
                 model_config.override_generation_config["max_new_tokens"] = None
             return
+
+        if vllm_config.parallel_config.pipeline_parallel_size > 1:
+            raise ValueError(
+                "Nemotron Labs Diffusion supports pipeline parallelism only in "
+                "AR mode; use PP=1 for diffusion mode."
+            )
 
         attention_config = vllm_config.attention_config
         if attention_config.backend == AttentionBackendEnum.FLASHINFER:
