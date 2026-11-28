@@ -15,7 +15,6 @@ from typing import Any, cast
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_events import BlockRemoved, BlockStored, KVCacheEvent
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -31,14 +30,14 @@ from vllm.v1.core.kv_cache_utils import (
     KVCacheBlock,
     get_block_hash,
     get_group_id,
-    is_mamba_align_group,
     is_mamba_group,
+    is_mamba_prefix_caching_group,
     make_block_hash_with_group_id,
     maybe_convert_block_hash,
     resolve_dcp_kv_block_size,
     resolve_kv_cache_block_sizes,
 )
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.output import KVConnectorBlockState, SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import (
     FullAttentionManager,
     SlidingWindowManager,
@@ -151,6 +150,10 @@ class _LookupContext:
     objects: dict[int, list[tuple[bytes, tuple[str, ...]]]]
     keys: list[str]
 
+    @property
+    def object_keys(self) -> list[tuple[str, ...]]:
+        return [keys for group in self.objects.values() for _, keys in group]
+
 
 @dataclass(frozen=True, slots=True)
 class _PendingLookup:
@@ -236,15 +239,15 @@ class UMBPStoreConnectorScheduler:
             group_id: resolve_dcp_kv_block_size(group, dcp_size)
             for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
         }
-        # Mamba "align" block tables are not append-only: a position may hold
-        # the live state the next step writes, or a speculative block core will
+        # Mamba block tables are not append-only: a position may hold the live
+        # state the next step writes, or a speculative block core will
         # relocate, so positional stores would read or pin the wrong block.
         # Core hands off each committed boundary state instead
         # (_add_boundary_state_plans).
         self._boundary_handoff_groups = frozenset(
             group_id
             for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
-            if is_mamba_align_group(group)
+            if is_mamba_prefix_caching_group(group)
         )
         self.runtime = runtime
         self.enable_kv_cache_events = bool(
@@ -285,34 +288,23 @@ class UMBPStoreConnectorScheduler:
         self.lazy_offload = self.store_enabled and bool(
             extra.get("lazy_offload", False)
         )
-        self.enable_partial_hash_hits = bool(
-            extra.get("enable_partial_hash_hits", False)
-        )
         # Request.block_hashes are computed at this size; keys index into them.
         self.hash_block_size = resolved_hash_block_size
+        # Mamba checkpoints sit on prompt-tail hash boundaries, which
+        # block-granular lookups almost never reach.
+        self.enable_partial_hash_hits = bool(
+            extra.get(
+                "enable_partial_hash_hits",
+                bool(self._boundary_handoff_groups)
+                and self.hash_block_size < self.block_size,
+            )
+        )
         lookup_groups = [
             kv_cache_config.kv_cache_groups[group_id]
             for group_id in kv_cache_config.prefix_cacheable_group_ids
         ]
         model_config = getattr(vllm_config, "model_config", None)
-        speculative_config = getattr(vllm_config, "speculative_config", None)
         self.num_hash_lookahead_tokens = vllm_config.num_hash_lookahead_tokens
-        use_eagle = bool(
-            speculative_config is not None
-            and speculative_config.use_eagle_block_drop()
-            and not self.num_hash_lookahead_tokens
-        )
-        self.use_eagle = use_eagle
-        explicit_eagle_groups = {
-            group_id
-            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
-            if group.is_eagle_group
-        }
-        self._eagle_store_groups = (
-            (explicit_eagle_groups or set(kv_cache_config.prefix_cacheable_group_ids))
-            if use_eagle
-            else set()
-        )
         max_model_len = getattr(
             model_config,
             "max_model_len",
@@ -328,19 +320,11 @@ class UMBPStoreConnectorScheduler:
                 kv_cache_config=lookup_config,
                 max_model_len=max_model_len,
                 max_in_flight_tokens=vllm_config.max_in_flight_tokens,
-                use_eagle=use_eagle,
                 enable_caching=True,
                 enable_kv_cache_events=False,
                 dcp_world_size=dcp_size,
-                pcp_world_size=getattr(
-                    vllm_config.parallel_config,
-                    "prefill_context_parallel_size",
-                    1,
-                ),
                 scheduler_block_size=self.block_size,
                 hash_block_size=self.hash_block_size,
-                # As core's scheduler builds its coordinator.
-                num_prefill_lookahead=vllm_config.num_prefill_lookahead_tokens,
                 allow_partial_hash_hits=self.enable_partial_hash_hits,
             )
             if lookup_groups
@@ -519,7 +503,9 @@ class UMBPStoreConnectorScheduler:
             if self.lookup_async:
                 self._pending_lookups[request.request_id] = _PendingLookup(
                     context,
-                    self._lookup_executor.submit(self.runtime.lookup, context.keys),
+                    self._lookup_executor.submit(
+                        self._lookup_all_ranks, context.object_keys
+                    ),
                 )
                 return None, False
         else:
@@ -531,7 +517,7 @@ class UMBPStoreConnectorScheduler:
                 for hit in (
                     pending.future.result()
                     if pending is not None
-                    else self.runtime.lookup(context.keys)
+                    else self._lookup_all_ranks(context.object_keys)
                 )
             ]
         except Exception as exc:
@@ -581,9 +567,6 @@ class UMBPStoreConnectorScheduler:
                 if group_hits[index]:
                     matched_units = index + 1
                     break
-            if self.use_eagle:
-                # As core's coordinator: the drafter recomputes the last block.
-                matched_units = max(0, matched_units - units_per_block)
             need_to_load = matched_units * self._lookup_units[group_id]
             block_hashes_by_group: tuple[tuple[bytes | None, ...], ...] = ()
         else:
@@ -629,8 +612,6 @@ class UMBPStoreConnectorScheduler:
         objects: dict[int, list[tuple[bytes, tuple[str, ...]]]] = {}
         keys: list[str] = []
         lookup_limit = min(request.num_tokens - 1, len(hashes) * self.hash_block_size)
-        if self.use_eagle and self._lookup_coordinator is not None:
-            lookup_limit = min(request.num_tokens, len(hashes) * self.hash_block_size)
         for group_id, unit in self._lookup_units.items():
             group_objects = []
             for token_end in range(local_tokens + unit, lookup_limit + 1, unit):
@@ -642,6 +623,42 @@ class UMBPStoreConnectorScheduler:
         return _LookupContext(
             request, local_tokens, request.num_tokens, hashes, objects, keys
         )
+
+    def _lookup_all_ranks(self, objects: Sequence[Sequence[str]]) -> list[bool | None]:
+        """Look up each object's rank keys, first rank first, as one flat list.
+
+        Callers only use whether every rank holds an object. Ranks store an
+        object together, and a hash-granular lookup probes far more positions
+        than hold anything, so the first rank is asked about every object and
+        the other ranks only about the objects it holds. Every key of any other
+        object repeats the first rank's answer: missing, or `None` when that
+        rank is unavailable.
+        """
+        assert self.runtime is not None
+        if not objects:
+            return []
+        first = list(self.runtime.lookup([keys[0] for keys in objects]))
+        if len(first) != len(objects):
+            raise ValueError("lookup returned an invalid result length")
+        others = [
+            key
+            for keys, held in zip(objects, first, strict=True)
+            if held
+            for key in keys[1:]
+        ]
+        rest = list(self.runtime.lookup(others)) if others else []
+        if len(rest) != len(others):
+            raise ValueError("lookup returned an invalid result length")
+        hits: list[bool | None] = []
+        position = 0
+        for keys, held in zip(objects, first, strict=True):
+            if held:
+                hits.append(held)
+                hits.extend(rest[position : position + len(keys) - 1])
+                position += len(keys) - 1
+            else:
+                hits.extend([held] * len(keys))
+        return hits
 
     def _coordinate_external_hits(
         self,
@@ -741,7 +758,7 @@ class UMBPStoreConnectorScheduler:
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
-    ) -> KVConnectorMetadata:
+    ) -> UMBPConnectorMetadata:
         meta = UMBPConnectorMetadata(async_load=self.load_async)
         reserved_store_keys = {
             key for event in self._store_events.values() for key in event.iter_keys()
@@ -867,6 +884,28 @@ class UMBPStoreConnectorScheduler:
             if load_plans:
                 meta.load_requests[request_id] = load_plans
 
+        if not self.load_async and scheduler_output.new_block_ids_to_zero:
+            # Zeroing is queued on the forward stream, which a transfer is not
+            # ordered behind, so it could wipe a synchronous load. The load
+            # overwrites its blocks whole, as core relies on for async loads.
+            # Blocks a load fails to fill need no zeroing either: core zeroes
+            # them when it reallocates them, and with one cache group (the only
+            # layout loaded synchronously) their bytes never change precision.
+            loaded = {
+                block_id
+                for plans in meta.load_requests.values()
+                for block_id in (
+                    plans.block_ids
+                    if isinstance(plans, BlockLoadBatch)
+                    else (plan.block_id for plan in plans)
+                )
+            }
+            scheduler_output.new_block_ids_to_zero = [
+                block_id
+                for block_id in scheduler_output.new_block_ids_to_zero
+                if block_id not in loaded
+            ]
+
         for request_id in scheduler_output.preempted_req_ids or set():
             meta.preempted_request_ids.add(request_id)
             self._load_specs.pop(request_id, None)
@@ -879,7 +918,7 @@ class UMBPStoreConnectorScheduler:
             and block_state.boundary_state_offloads
         ):
             self._add_boundary_state_plans(
-                block_state.boundary_state_offloads,
+                block_state,
                 meta,
                 set(scheduler_output.finished_req_ids),
                 set(scheduler_output.preempted_req_ids or ()),
@@ -1238,7 +1277,7 @@ class UMBPStoreConnectorScheduler:
 
     def _add_boundary_state_plans(
         self,
-        offloads: dict[str, list[tuple[int, int, int]]],
+        block_state: KVConnectorBlockState,
         meta: UMBPConnectorMetadata,
         finished: set[str],
         preempted: set[str],
@@ -1247,7 +1286,7 @@ class UMBPStoreConnectorScheduler:
         if self.codec is None:
             return
         prefix_groups = set(self.kv_cache_config.prefix_cacheable_group_ids)
-        for request_id, entries in offloads.items():
+        for request_id, entries in block_state.boundary_state_offloads.items():
             if request_id in finished or request_id in preempted:
                 logger.debug(
                     "UMBP boundary offloads dropped request=%s entries=%d: %s",
@@ -1265,8 +1304,27 @@ class UMBPStoreConnectorScheduler:
                     len(entries),
                 )
                 continue
+            boundaries = sorted({boundary for _, _, boundary in entries})
+            # Core hands off only state pages; a boundary inside an attention
+            # block also needs that block's page. It comes from core's current
+            # table: the tracker's grows only with eager stores.
+            pages: list[tuple[int, int, int]] = []
+            block_ids: tuple[list[int], ...] | None = None
+            for group_id in self.kv_cache_config.prefix_cacheable_group_ids:
+                group = self.kv_cache_config.kv_cache_groups[group_id]
+                if not issubclass(group.manager_cls, FullAttentionManager):
+                    continue
+                block_size = self.group_block_sizes[group_id]
+                for boundary in boundaries:
+                    if not boundary % block_size:
+                        continue
+                    if block_ids is None:
+                        block_ids = block_state.get_block_ids(request_id) or ()
+                    index = boundary // block_size
+                    if group_id < len(block_ids) and index < len(block_ids[group_id]):
+                        pages.append((group_id, block_ids[group_id][index], boundary))
             plans: list[BlockTransferPlan] = []
-            for group_id, block_id, boundary_tokens in entries:
+            for group_id, block_id, boundary_tokens in [*entries, *pages]:
                 if group_id not in prefix_groups or block_id == NULL_BLOCK_ID:
                     continue
                 if boundary_tokens <= 0:
@@ -1295,7 +1353,7 @@ class UMBPStoreConnectorScheduler:
                 request_id,
                 len(entries),
                 len(plans),
-                sorted({entry[2] for entry in entries}),
+                boundaries,
             )
             if plans:
                 meta.store_plans.extend(plans)
@@ -1506,11 +1564,8 @@ class UMBPStoreConnectorScheduler:
             ]
             for group_id, indices in block_ranges.items()
         }
-        keys = [
-            key
-            for group_id, indices in candidates.items()
-            for index in indices
-            for key in _rank_keys(
+        objects = [
+            _rank_keys(
                 self.codec,
                 self.topology,
                 self._object_hash_at_token_end(
@@ -1518,15 +1573,15 @@ class UMBPStoreConnectorScheduler:
                 ),
                 group_id,
             )
+            for group_id, indices in candidates.items()
+            for index in indices
         ]
-        if not keys:
+        if not objects:
             return {}
         try:
-            hits = list(self.runtime.lookup(keys))
+            hits = self._lookup_all_ranks(objects)
         except Exception as exc:
             logger.debug("UMBP store residency check failed: %s", exc)
-            return {}
-        if len(hits) != len(keys):
             return {}
         offset = 0
         resident = {}
@@ -1558,8 +1613,6 @@ class UMBPStoreConnectorScheduler:
             if num_prompt_tokens is None
             else replay_boundaries(
                 num_prompt_tokens,
-                self.block_size,
-                use_eagle=self.use_eagle,
                 num_hash_lookahead_tokens=self.num_hash_lookahead_tokens,
             )
         )
@@ -1569,7 +1622,6 @@ class UMBPStoreConnectorScheduler:
             alignment_tokens=self.block_size,
             block_size=group.block_size,
             manager_config=group.manager_config,
-            use_eagle=group_id in self._eagle_store_groups,
             retention_interval=self._retention_interval,
             reachable_boundaries=reachable_boundaries,
             dcp_world_size=self._dcp_size,
@@ -1970,14 +2022,13 @@ class UMBPStoreConnectorScheduler:
         )
         if not candidates:
             return
-        keys = [
-            key
+        objects = [
+            _rank_keys(self.codec, self.topology, block_hash, group_id)
             for (group_id, block_hash), _ in candidates
-            for key in _rank_keys(self.codec, self.topology, block_hash, group_id)
         ]
         self._event_lookup = _EventLookup(
             tuple(candidates),
-            self._lookup_executor.submit(self.runtime.lookup, keys),
+            self._lookup_executor.submit(self._lookup_all_ranks, objects),
         )
 
     def take_events(self) -> list[KVCacheEvent]:
