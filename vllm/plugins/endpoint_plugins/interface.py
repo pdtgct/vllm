@@ -346,8 +346,8 @@ class _PluginLifecycle:
             is then started and the caller must stop it.
 
         Raises:
-            The exception raised by `start`, or `asyncio.CancelledError` if
-            `start` or the caller was cancelled.
+            asyncio.CancelledError: If `start` or the caller was cancelled.
+            Exception: The exception that `start` raised.
 
         """
         caller_cancelled = False
