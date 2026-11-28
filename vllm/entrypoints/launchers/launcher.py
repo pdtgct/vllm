@@ -233,7 +233,7 @@ async def serve_http(
     config.load()
     server = NoSignalServer(config, peer_loads=peer_loads)
     app.state.server = server
-    app.state.shutting_down = False
+    app.state.draining = False
 
     loop = asyncio.get_running_loop()
 
@@ -262,7 +262,7 @@ async def serve_http(
         if shutdown_event.is_set():
             return
         logger.info_once("[shutdown] API server: shutdown triggered")
-        app.state.shutting_down = True
+        app.state.draining = True
         shutdown_event.set()
 
     async def dummy_shutdown() -> None:

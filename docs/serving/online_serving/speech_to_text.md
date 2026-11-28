@@ -239,6 +239,8 @@ Audio must be sent as base64-encoded PCM16 audio at 16kHz sample rate, mono chan
 9. Optionally, client sends input_audio_buffer.commit with final=True
     to signal audio input is finished. Useful when streaming audio files
 
+After the server receives SIGINT or SIGTERM, it accepts each new connection and closes it at once with WebSocket close code 1001 (Going Away) and reason `Server shutting down`, without sending `session.created`. Sessions opened before the signal stay connected, but the engine aborts requests that reach it after its shutdown begins.
+
 ### Client → Server Events
 
 | Event | Description |

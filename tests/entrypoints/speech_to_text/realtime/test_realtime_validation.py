@@ -374,8 +374,10 @@ async def _connect_until_refused(ws_url: str, timeout: float = 30.0):
 async def test_realtime_shutdown_refuses_new_sessions(
     model_name, mary_had_lamb_audio_chunks
 ):
-    """After SIGTERM, new sessions are closed with 1001 (Going Away), and a
-    session opened before SIGTERM is still served."""
+    """After SIGTERM, a real server closes new sessions with 1001 (Going Away).
+
+    The open session keeps a request in flight, so the server is still
+    draining when the test connects again."""
     server_args = [
         "--enforce-eager",
         "--max-model-len",
@@ -404,16 +406,6 @@ async def test_realtime_shutdown_refuses_new_sessions(
 
             code, reason = await _connect_until_refused(ws_url)
             assert (code, reason) == (1001, "Server shutting down")
-
-            await send_event(open_ws, {"type": "not.an.event"})
-            event = await receive_event(open_ws, timeout=30.0)
-            while event["type"] == "transcription.delta":
-                event = await receive_event(open_ws, timeout=30.0)
-            assert event == {
-                "type": "error",
-                "error": "Unknown event type: not.an.event",
-                "code": "unknown_event",
-            }
 
 
 class _DrainingEngineClient:
@@ -478,8 +470,12 @@ async def _wait_for(condition, timeout: float = 10.0) -> None:
 @pytest.mark.asyncio
 @pytest.mark.skip_global_cleanup
 async def test_realtime_refuses_new_sessions_while_draining():
-    """After SIGTERM, a new session is closed with 1001 (Going Away) while a
-    session opened before the drain keeps transcribing until it finishes."""
+    """After SIGTERM, a new session is closed with 1001 (Going Away), and the
+    refusal does not close a session opened before the signal.
+
+    The engine stand-in does not reject requests during shutdown, so this
+    test does not show whether the open session can still transcribe; a real
+    engine aborts requests that reach it after its shutdown begins."""
     engine_client = _DrainingEngineClient()
     app = FastAPI()
     app.include_router(realtime_router)
@@ -489,7 +485,6 @@ async def test_realtime_refuses_new_sessions_while_draining():
     sock = create_server_socket(("127.0.0.1", 0), reuse_port=False)
     port = sock.getsockname()[1]
     url = f"ws://127.0.0.1:{port}/v1/realtime"
-    audio = base64.b64encode(np.ones(160, dtype=np.int16).tobytes()).decode()
 
     loop = asyncio.get_running_loop()
     serve_task = asyncio.create_task(
@@ -513,17 +508,13 @@ async def test_realtime_refuses_new_sessions_while_draining():
                 assert new_ws.close_code == 1001
                 assert new_ws.close_reason == "Server shutting down"
 
-            await send_event(
-                open_ws, {"type": "input_audio_buffer.append", "audio": audio}
-            )
-            await send_event(
-                open_ws, {"type": "input_audio_buffer.commit", "final": True}
-            )
-            delta = await receive_event(open_ws)
-            done = await receive_event(open_ws)
-            assert delta == {"type": "transcription.delta", "delta": " lamb"}
-            assert done["type"] == "transcription.done"
-            assert done["text"] == " lamb"
+            # The connection handles unknown events without the engine.
+            await send_event(open_ws, {"type": "not.an.event"})
+            assert await receive_event(open_ws) == {
+                "type": "error",
+                "error": "Unknown event type: not.an.event",
+                "code": "unknown_event",
+            }
 
         engine_client.drain_released.set()
         await (await asyncio.wait_for(serve_task, timeout=10))

@@ -33,7 +33,7 @@ async def realtime_endpoint(websocket: WebSocket):
     Audio format: PCM16, 16kHz, mono, base64-encoded
     """
     app = websocket.app
-    if getattr(app.state, "shutting_down", False):
+    if getattr(app.state, "draining", False):
         # Accept first so the client gets a close code rather than an HTTP 403.
         await websocket.accept()
         await websocket.close(
