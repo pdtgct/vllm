@@ -40,9 +40,12 @@ from ..common.hyperconnection import (
 from .ops.cute_dsl.hc_down_silu import MAX_FUSED_M, hc_down_silu
 from .ops.hc import (
     MIN_FUSED_UP_M,
+    SM100_DOWN_MIN_M,
     grouped_gemma_rmsnorm,
     hc_combine,
     hc_combine_norm,
+    hc_down_silu_sm100,
+    hc_down_silu_sm100_supported,
     hc_gate_mix,
     hc_silu,
     hc_up_gate_mix,
@@ -102,8 +105,8 @@ class GatedResidual(nn.Module):
         if use_combine:
             self.input_mix_weight_down_block_inject = MergedColumnParallelLinear(
                 self.hyper_hidden_size,
-                [self.hc_lowrank, self.hc_count]
-                + ([self.pad_size] if self.pad_size else []),
+                [self.hc_lowrank, self.hc_count],
+                padding_size=self.pad_size,
                 bias=False,
                 params_dtype=config.params_dtype,
                 quant_config=None,
@@ -111,15 +114,18 @@ class GatedResidual(nn.Module):
                 return_bias=False,
                 disable_tp=True,
             )
-            # Checkpoints carry no padding rows, and their output is discarded.
-            self.input_mix_weight_down_block_inject.shard_ids = (0, 1)
             weight = self.input_mix_weight_down_block_inject.weight
             self._use_hc_down_silu = (
                 weight.shape[1] % 8 == 0
                 and weight.dtype == torch.bfloat16
                 and current_platform.has_device_capability(90)
             )
+            self._use_hc_down_silu_sm100 = (
+                not envs.VLLM_BATCH_INVARIANT
+                and hc_down_silu_sm100_supported(weight, self.hc_lowrank, self.hc_count)
+            )
         else:
+            self._use_hc_down_silu_sm100 = False
             self.input_mix_weight_down = ReplicatedLinear(
                 self.hyper_hidden_size,
                 self.hc_lowrank,
@@ -149,12 +155,20 @@ class GatedResidual(nn.Module):
         if not self.use_combine:
             return hc_silu(self.input_mix_weight_down(xn), self.hc_count), None
 
-        use_fused = (
+        num_tokens = xn.shape[0]
+        use_sm100 = self._use_hc_down_silu_sm100 and isinstance(
+            self.input_mix_weight_down_block_inject, MergedColumnParallelLinear
+        )
+        if use_sm100 and num_tokens >= SM100_DOWN_MIN_M:
+            return hc_down_silu_sm100(
+                xn, self.input_mix_weight_down_block_inject.weight
+            )
+        cutedsl_max_m = SM100_DOWN_MIN_M - 1 if use_sm100 else MAX_FUSED_M
+        if (
             self._use_hc_down_silu
             and not envs.VLLM_BATCH_INVARIANT
-            and 1 <= xn.shape[0] <= MAX_FUSED_M
-        )
-        if use_fused:
+            and 1 <= num_tokens <= cutedsl_max_m
+        ):
             return hc_down_silu(
                 xn,
                 self.input_mix_weight_down_block_inject.weight,
